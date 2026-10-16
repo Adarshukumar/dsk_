@@ -21,8 +21,8 @@
        IGAgent.stop()  ·  .status() ·  .history('user') ·  .memory('user')
 
    WHAT IT DOES
-   · Polls the GraphQL inbox on a fixed 0.5-second cadence, per-thread debounce
-   · TRUE multi-thread: independent cooldown / retry queue / MEMORY per chat
+   · Polls the GraphQL inbox every 0.5 seconds and starts matching DM work immediately
+   · TRUE multi-thread: independent in-flight / retry queue / MEMORY per chat
    · Learns about each contact, stores profile in localStorage, injects it
      into every future reply
    · Self-healing: server model-fallback chain + client retry queue +
@@ -79,12 +79,9 @@
     TEMPERATURE: 0.9,
     LLM_TIMEOUT_MS: 120_000,
 
-    // Start one inbox check every 0.5 s. The loop never overlaps requests:
-    // if a request takes longer than this, the next check starts immediately after it finishes.
+    // Check every 0.5 s. A slow inbox request is never overlapped; the next
+    // check starts as soon as the previous one completes.
     POLL_INTERVAL_MS: 500,
-    DEBOUNCE_MIN_MS: 5_000, DEBOUNCE_MAX_MS: 12_000,
-    DEBOUNCE_MAX_WAIT_MS: 35_000,
-    THREAD_COOLDOWN_MS: 60_000,
 
     MAX_REPLIES_PER_HOUR: 20,
     MAX_REPLIES_PER_DAY: 100,
@@ -121,11 +118,10 @@
     usernameCache: new Map(),    // threadFbid -> username
     lastActivity: {},            // threadFbid -> last_activity_timestamp_ms seen
     handled: new Set(),          // message_ids already answered/considered
-    cooldownUntil: {},
     sentHour: [], sentDay: [],
     startedAt: null, lastPollAt: null,
     logs: [],
-    pending: {}, busy: {}, tries: {},
+    pending: {}, busy: {}, rerun: {}, tries: {},
     llmFailStreak: 0, circuitUntil: 0,
     memory: {},
     ws: null, wsReady: false, wsWaiters: [],
@@ -486,19 +482,24 @@
 
   /* ──────────────────── PER-THREAD QUEUE + PROCESSING ──────────────────── */
 
-  function queueThread(tid, user, ms, reason) {
+  function queueThread(tid, user, ms = 0, reason) {
     let p = S.pending[tid];
-    if (!p) p = S.pending[tid] = { firstAt: now(), timer: null };
+    if (!p) p = S.pending[tid] = { timer: null };
     if (p.timer) clearTimeout(p.timer);
     if (reason) log(C.dim, 'queue', `@${user}: ${reason} — retry in ${Math.round(ms / 1000)}s`);
     p.timer = setTimeout(() => {
       delete S.pending[tid];
       processThread(tid, user).catch(e => log(C.err, 'proc', `@${user}: ${e.message}`));
-    }, Math.max(1000, ms));
+    }, Math.max(0, ms));
   }
 
   async function processThread(tid, user) {
-    if (S.busy[tid]) return queueThread(tid, user, 4000, 'reply already in progress');
+    // Never generate two replies for one thread at once. If a new message arrives
+    // while one is generating, drain it immediately after the current send ends.
+    if (S.busy[tid]) {
+      S.rerun[tid] = user;
+      return;
+    }
     S.busy[tid] = true;
     try {
       if (S.circuitUntil > now()) {
@@ -513,8 +514,6 @@
       if (!inWorkingHours()) {
         return queueThread(tid, user, 10 * 60e3, 'outside working hours');
       }
-      const cool = (S.cooldownUntil[tid] || 0) - now();
-      if (cool > 0) return queueThread(tid, user, cool + rand(2e3, 6e3), 'thread cooldown');
 
       const nodes = await fetchMessages(tid, CFG.HISTORY_MESSAGES + 10);
       const unanswered = nodes.filter(n => !isMine(n) && !S.handled.has(n.message_id));
@@ -543,9 +542,7 @@
         log(C.ok, 'sent', `@${user} ← [${model}] "${reply}" (${sent.message_id.slice(0, 24)}…)`);
       }
       nodes.forEach(n => S.handled.add(n.message_id));
-      if (!CFG.DRY_RUN) S.handled.add('own:'); // (ids of own sends not tracked — cooldown covers it)
       saveState();
-      S.cooldownUntil[tid] = now() + CFG.THREAD_COOLDOWN_MS;
       updateMemory(tid, user, nodes, reply);
 
     } catch (e) {
@@ -572,6 +569,10 @@
       }
     } finally {
       S.busy[tid] = false;
+      const nextUser = S.rerun[tid];
+      delete S.rerun[tid];
+      // An error path may already have scheduled its normal backoff retry.
+      if (nextUser && S.running && !S.pending[tid]) queueThread(tid, nextUser, 0);
     }
   }
 
@@ -611,12 +612,9 @@
             !CFG.TARGETS.map(x => String(x).toLowerCase().replace(/^@/, '')).includes(user.toLowerCase())) continue;
 
         log(C.info, 'new', `@${user}: activity bump (${new Date(act).toLocaleTimeString()})`);
-        const p = S.pending[tid] || (S.pending[tid] = { firstAt: now(), timer: null });
-        const wait = Math.min(
-          rand(CFG.DEBOUNCE_MIN_MS, CFG.DEBOUNCE_MAX_MS),
-          Math.max(2000, p.firstAt + CFG.DEBOUNCE_MAX_WAIT_MS - now())
-        );
-        queueThread(tid, user, wait, null);
+        // No debounce: fetch the thread and generate/send as soon as this poll
+        // sees new activity. Per-thread busy/rerun handling prevents duplicates.
+        queueThread(tid, user, 0);
       }
       S.lastPollAt = now();
     } catch (e) {
@@ -663,6 +661,7 @@
     if (S.timer) { clearTimeout(S.timer); S.timer = null; }
     Object.values(S.pending).forEach(p => p.timer && clearTimeout(p.timer));
     S.pending = {};
+    S.rerun = {};
     log(C.warn, 'main', 'stopped' + (S.startedAt ? ` · uptime ${Math.round((now() - S.startedAt) / 1000)}s` : ''));
   }
 

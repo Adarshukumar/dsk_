@@ -73,8 +73,9 @@ IGAgent.stop()
 
 - **Replies like a chatbot** — persona "Adu", an honest AI agent answering
   Adarsh's DMs. Edit `IGAgent.config.SYSTEM_PROMPT` / `OWNER_BIO`.
-- **True multi-thread** — every chat independent and parallel: own cooldown,
-  own retry queue, own debounce (5–12s quiet-window, 35s max).
+- **Immediate parallel replies** — new text is queued as soon as the next
+  500 ms poll detects it; each chat has independent in-flight, retry, and
+  memory state, while bridge reply jobs run concurrently.
 - **Memory per contact** — after each reply it silently extracts/updates a
   profile (name, work, wants, language, follow-ups owed) in `localStorage`
   and injects it into future replies. `IGAgent.memory('user')` / `.forget()`.
@@ -113,7 +114,7 @@ send `{"id","type":"reply","messages":[...]}` → `{"id","ok":true,"text","model
 ## Risk note
 
 Uses Instagram's private GraphQL endpoints from your own logged-in session,
-mimicking the web app's own calls. The inbox is checked every 500 ms; the
-reply limits remain conservative (20 replies/hour, 100/day, 60s thread
-cooldown). Frequent polling can trigger Instagram rate limits, which cause the
-bot to stop automatically on HTTP 429/403.
+mimicking the web app's own calls. The inbox is checked every 500 ms and
+new messages have no intentional debounce or per-thread cooldown. Reply limits
+remain at 20/hour and 100/day. Frequent polling can trigger Instagram rate
+limits, which cause the bot to stop automatically on HTTP 429/403.

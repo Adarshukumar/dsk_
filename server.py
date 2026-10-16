@@ -32,6 +32,7 @@ import json
 import re
 import struct
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -142,6 +143,9 @@ class _WSConn:
 
     def __init__(self, rfile, wfile):
         self.rfile, self.wfile = rfile, wfile
+        # Reply workers may complete out of order; serialize physical writes so
+        # their WebSocket frames can never interleave on the same socket.
+        self._write_lock = threading.Lock()
 
     def _read_exact(self, n: int) -> bytes:
         buf = b""
@@ -188,15 +192,35 @@ class _WSConn:
             header += bytes([126]) + struct.pack(">H", n)
         else:
             header += bytes([127]) + struct.pack(">Q", n)
-        self.wfile.write(header + data)
-        self.wfile.flush()
+        with self._write_lock:
+            self.wfile.write(header + data)
+            self.wfile.flush()
 
     def send_text(self, s: str):
         self.send_frame(s.encode("utf-8"))
 
 
+def _serve_ws_reply(conn: _WSConn, req: dict) -> None:
+    """Generate one reply in its own worker so independent chats run in parallel."""
+    rid = req.get("id")
+    try:
+        messages = req.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("'messages' must be a non-empty list")
+        text, model = generate_with_fallback(
+            messages, req.get("model"), req.get("max_tokens"), req.get("temperature"))
+        resp = {"id": rid, "ok": True, "text": text, "model": model}
+    except Exception as e:
+        resp = {"id": rid, "ok": False, "error": str(e)[:300]}
+    try:
+        conn.send_text(json.dumps(resp))
+    except (BrokenPipeError, ConnectionError, OSError, ValueError):
+        # The browser can close/reload while an LLM is still generating.
+        pass
+
+
 def handle_ws(handler) -> None:
-    """Upgrade + serve one WebSocket client forever (bridging to /reply logic)."""
+    """Upgrade + serve one WebSocket client; reply jobs run independently."""
     key = handler.headers.get("Sec-WebSocket-Key", "")
     handler.close_connection = True     # socket is ours now, not the HTTP loop's
     handler.send_response(101, "Switching Protocols")
@@ -216,21 +240,14 @@ def handle_ws(handler) -> None:
             except Exception:
                 conn.send_text(json.dumps({"ok": False, "error": "bad json"}))
                 continue
-            rid = req.get("id")
-            try:
-                if req.get("type") == "health":
-                    resp = {"id": rid, "ok": True, "default_model": DEFAULT_MODEL,
-                            "chain": FALLBACK_CHAIN, "uptime_s": round(time.time() - START)}
-                else:
-                    messages = req.get("messages")
-                    if not isinstance(messages, list) or not messages:
-                        raise ValueError("'messages' must be a non-empty list")
-                    text, model = generate_with_fallback(
-                        messages, req.get("model"), req.get("max_tokens"), req.get("temperature"))
-                    resp = {"id": rid, "ok": True, "text": text, "model": model}
-            except Exception as e:
-                resp = {"id": rid, "ok": False, "error": str(e)[:300]}
-            conn.send_text(json.dumps(resp))
+            if req.get("type") == "health":
+                resp = {"id": req.get("id"), "ok": True, "default_model": DEFAULT_MODEL,
+                        "chain": FALLBACK_CHAIN, "uptime_s": round(time.time() - START)}
+                conn.send_text(json.dumps(resp))
+                continue
+            # Do not block this connection while an LLM streams. The browser's
+            # request ids let responses safely arrive in whichever order finishes first.
+            threading.Thread(target=_serve_ws_reply, args=(conn, req), daemon=True).start()
     except (ConnectionError, OSError, ValueError) as e:
         print(f"[ws] client left ({e})", flush=True)
 
