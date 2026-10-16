@@ -47,6 +47,8 @@ through the DM UI, read the POST bodies).
 | `llmchat_provider.py` | Async llmchat.in provider (unchanged, the engine) |
 | `server.py` | Bridge: WS channel + `POST /reply` + OpenAI alias, model fallback, think-strip |
 | `ig-agent-chat.js` | The Instagram bot — paste into DevTools console (v3) |
+| `benchmark_models.py` | Reproducible live latency/reasoning/compliance benchmark for every registered model |
+| `BENCHMARKING.md` | Benchmark methodology, commands, and result-history workflow |
 | `README.md` | This file |
 
 ## Run it
