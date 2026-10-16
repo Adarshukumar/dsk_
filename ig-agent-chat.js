@@ -1,13 +1,20 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   IG AGENT · ig-agent-chat.js  v3 — llmchat.in edition (NO API KEY)
+   IG AGENT · ig-agent-chat.js  v4 — llmchat.in edition (NO API KEY)
    ─────────────────────────────────────────────────────────────────────────
    Reverse-engineered Instagram web DM layer (GraphQL /api/graphql):
-     · inbox list    PolarisDirectInboxQuery      doc 27909866362025854
-     · thread msgs   IGDMessageListOffMsysQuery   doc 28798548116496168
-     · send text     IGDirectTextSendMutation     doc 26911679871773184
-     · thread meta   IGDInboxHeaderOffMsysQuery   doc 28784987187762419
+     · inbox list    PolarisDirectInboxQuery           doc 27909866362025854
+     · thread msgs   IGDMessageListOffMsysQuery        doc 28798548116496168
+     · send text     IGDirectTextSendMutation          doc 26911679871773184
+     · thread meta   IGDInboxHeaderOffMsysQuery        doc 28784987187762419
+     · mark read     useIGDMarkThreadAsReadMutation    doc 27399783383056109
+     · mark read #2  …ValidationMutation               doc 35211594988486314
+   Typing indicator: the site's OWN module IGDMAPISendTypingIndicator over its
+   MqttBypassDGWClient (gateway.instagram.com realtime stream) — captured from
+   the page bundles; no hand-rolled protocol needed.
    LLM bridge: server.py over WebSocket (ws://localhost) — Instagram's CSP
    blocks http://localhost fetches but allows ws://localhost sockets.
+   Transcripts: complete per-contact history + persona + memory is kept locally
+   (localStorage) and mirrored as JSON files by server.py → ./transcripts/.
 
    Paste into DevTools CONSOLE on any instagram.com tab where you're logged
    in, then:
@@ -16,13 +23,22 @@
        IGAgent.threads()            ← list your DM threads
        IGAgent.targets('user1')     ← who gets auto-replies (or .allTargets())
        IGAgent.start()              ← begin monitoring + auto-replying (DRY_RUN)
-       IGAgent.dryRun(false)        ← enable REAL sending
+       IGAgent.dryRun(false)        ← enable REAL sending (+ seen + typing)
        IGAgent.say('user','hi')     ← manual real send
+       IGAgent.typingDemo('user')   ← show the typing trail for 4s (test)
+       IGAgent.markSeenNow('user')  ← mark that chat read right now (test)
+       IGAgent.transcripts()        ← list saved JSON transcripts
        IGAgent.stop()  ·  .status() ·  .history('user') ·  .memory('user')
 
    WHAT IT DOES
-   · Polls the GraphQL inbox every 0.5 seconds and starts matching DM work immediately
-   · TRUE multi-thread: independent in-flight / retry queue / MEMORY per chat
+   · Polls the GraphQL inbox with human-like jitter, per-thread debounce
+   · TRUE multi-thread: independent cooldown / retry queue / MEMORY per chat
+   · MARKS INCOMING MESSAGES SEEN (real read receipt — "Seen just now" on
+     the other phone) and shows the real TYPING trail for a human-length
+     time before every reply
+   · Complete per-contact transcript (persona + memory + full history) kept
+     locally and saved as JSON by the bridge — new messages fetched
+     INCREMENTALLY (newer_than_message_id), never full re-pulls
    · Learns about each contact, stores profile in localStorage, injects it
      into every future reply
    · Self-healing: server model-fallback chain + client retry queue +
@@ -30,7 +46,7 @@
    · Safety: text→text only (media detected + skipped), never replies to
      itself or groups, hourly/daily caps, auto-stop on rate-limit signals,
      never replies to backlog from before startup.
-   ═════════════════════════════════════════════════════════════════════════ */
+   ═══════════════════════════════════════════════════════════════════════════ */
 
 (() => {
   'use strict';
@@ -46,6 +62,12 @@
     TARGETS: [],                  // usernames (no @), or 'all'
     DRY_RUN: true,
     MEMORY: true,
+
+    SEEN: true,                   // auto read-receipts on incoming messages
+    TYPING: true,                 // real typing trail before each reply
+    TRANSCRIPTS: true,            // per-contact JSON history via the bridge
+    TRANSCRIPT_CAP: 300,          // messages kept per contact locally
+    BACKFILL_ON_START: 40,        // pull N msgs of history per target at start
 
     SYSTEM_PROMPT:
       'You are "Adu" — the AI agent that runs this Instagram DM for Adarsh. ' +
@@ -79,9 +101,21 @@
     TEMPERATURE: 0.9,
     LLM_TIMEOUT_MS: 120_000,
 
-    // Check every 0.5 s. A slow inbox request is never overlapped; the next
-    // check starts as soon as the previous one completes.
-    POLL_INTERVAL_MS: 500,
+    // FAST-REACT mode: the inbox is checked every few seconds so a new
+    // message is SEEN almost immediately after it lands. 429/403 still
+    // auto-stops everything (Instagram's own web client polls in this
+    // range when its realtime push is idle).
+    POLL_MIN_MS: 5_000,  POLL_MAX_MS: 9_000,
+    // near-zero quiet window — seen + drafting start the instant a bump is
+    // detected; texts arriving mid-draft requeue and get their own reply
+    DEBOUNCE_MIN_MS: 300, DEBOUNCE_MAX_MS: 900,
+    DEBOUNCE_MAX_WAIT_MS: 8_000,
+    THREAD_COOLDOWN_MS: 60_000,
+
+    // typing trail: ON for the WHOLE draft (seen → reply sent). The trail
+    // lasts exactly the generation time; the floor only keeps it visible
+    // when the LLM answers near-instantly.
+    TYPING_MIN_MS: 1_500, TYPING_MAX_MS: 7_000, TYPING_MS_PER_CHAR: 55,
 
     MAX_REPLIES_PER_HOUR: 20,
     MAX_REPLIES_PER_DAY: 100,
@@ -96,10 +130,12 @@
 
     // reverse-engineered GraphQL doc ids (do not change)
     GQL: {
-      inbox: '27909866362025854',
-      msgs:  '28798548116496168',
-      send:  '26911679871773184',
-      header:'28784987187762419',
+      inbox:   '27909866362025854',
+      msgs:    '28798548116496168',
+      send:    '26911679871773184',
+      header:  '28784987187762419',
+      seen:    '27399783383056109',   // useIGDMarkThreadAsReadMutation
+      seenVal: '35211594988486314',   // useIGDMarkThreadAsReadValidationMutation
     },
     APP_ID: '936619743392459',
     ASBD: '359341',
@@ -109,6 +145,7 @@
 
   const LS_STATE = 'ig_agent_state_v3';
   const LS_MEM = 'ig_agent_mem_v1';
+  const LS_TRANSCRIPTS = 'ig_agent_transcripts_v1';
 
   const S = {
     running: false,
@@ -118,12 +155,16 @@
     usernameCache: new Map(),    // threadFbid -> username
     lastActivity: {},            // threadFbid -> last_activity_timestamp_ms seen
     handled: new Set(),          // message_ids already answered/considered
+    cooldownUntil: {},
     sentHour: [], sentDay: [],
     startedAt: null, lastPollAt: null,
     logs: [],
-    pending: {}, busy: {}, rerun: {}, tries: {},
+    pending: {}, busy: {}, tries: {},
     llmFailStreak: 0, circuitUntil: 0,
     memory: {},
+    transcripts: {},             // threadFbid -> {user, messages[], lastMessageId, dirty}
+    typingAvailable: undefined,  // undefined = not checked yet
+    typingThreads: new Set(),    // threads whose typing indicator is currently ON
     ws: null, wsReady: false, wsWaiters: [],
     wsPending: new Map(), wsSeq: 0,
   };
@@ -137,11 +178,20 @@
       if (p.model !== undefined) CFG.MODEL = p.model;
       if (p.wsUrl) CFG.WS_URL = p.wsUrl;
       if (p.systemPrompt) CFG.SYSTEM_PROMPT = p.systemPrompt;
+      if (typeof p.seen === 'boolean') CFG.SEEN = p.seen;
+      if (typeof p.typing === 'boolean') CFG.TYPING = p.typing;
       if (Array.isArray(p.handled)) p.handled.forEach(x => S.handled.add(x));
       if (p.lastActivity) S.lastActivity = p.lastActivity;
     } catch (_) {}
     try { S.memory = JSON.parse(localStorage.getItem(LS_MEM) || '{}'); }
     catch (_) { S.memory = {}; }
+    try {
+      const t = JSON.parse(localStorage.getItem(LS_TRANSCRIPTS) || '{}');
+      for (const [tid, T] of Object.entries(t)) {
+        T.dirty = false; T.saveTimer = null;
+        S.transcripts[tid] = T;
+      }
+    } catch (_) { S.transcripts = {}; }
   }
 
   function saveState() {
@@ -151,12 +201,31 @@
         sentHour: S.sentHour, sentDay: S.sentDay,
         dryRun: CFG.DRY_RUN, targets: CFG.TARGETS, model: CFG.MODEL,
         wsUrl: CFG.WS_URL, systemPrompt: CFG.SYSTEM_PROMPT,
+        seen: CFG.SEEN, typing: CFG.TYPING,
         handled, lastActivity: S.lastActivity,
       }));
     } catch (_) {}
   }
   function saveMem() {
     try { localStorage.setItem(LS_MEM, JSON.stringify(S.memory)); } catch (_) {}
+  }
+  let _trSaveTimer = null;
+  function saveTranscriptsLocal() {
+    if (_trSaveTimer) return;
+    _trSaveTimer = setTimeout(() => {
+      _trSaveTimer = null;
+      try {
+        const out = {};
+        for (const [tid, T] of Object.entries(S.transcripts)) {
+          out[tid] = {
+            user: T.user, threadFbid: T.threadFbid,
+            messages: T.messages.slice(-CFG.TRANSCRIPT_CAP),
+            lastMessageId: T.lastMessageId, updated: T.updated,
+          };
+        }
+        localStorage.setItem(LS_TRANSCRIPTS, JSON.stringify(out));
+      } catch (_) {}
+    }, 3000);
   }
 
   /* ──────────────────────────── HELPERS ──────────────────────────── */
@@ -234,7 +303,7 @@
   }
   function resetTokens() { TOK = null; }
 
-  async function gql(name, docId, variables, retried = false) {
+  async function gql(name, docId, variables, opts = {}, retried = false) {
     const T = extractTokens();
     const body = new URLSearchParams({
       av: T.av, __user: '0', __a: '1', dpr: '1', __ccg: 'EXCELLENT', __comet_req: '7',
@@ -262,7 +331,9 @@
       throw Object.assign(new Error('network: ' + e.message), { fatal: false });
     }
     if (res.status === 429 || res.status === 403) {
-      throw Object.assign(new Error('IG_RATE_LIMIT status=' + res.status), { fatal: true });
+      // rate-limit on a non-critical op (seen) shouldn't halt the whole bot
+      throw Object.assign(new Error('IG_RATE_LIMIT status=' + res.status),
+        { fatal: !!opts.fatalOnRL });
     }
     const txt = await res.text();
     let j = null;
@@ -272,7 +343,7 @@
       if (/missing_required_variable|went wrong/i.test(msg) && !retried) {
         // stale fb_dtsg — tokens rotate; refresh once and retry
         resetTokens();
-        return gql(name, docId, variables, true);
+        return gql(name, docId, variables, opts, true);
       }
       throw Object.assign(new Error('IG GQL: ' + msg), { fatal: res.status === 400 || res.status === 401 });
     }
@@ -307,10 +378,10 @@
     return t;
   }
 
-  async function fetchMessages(threadFbid, first = 30) {
+  async function fetchMessages(threadFbid, first = 30, newerThanId = null) {
     const data = await gql('IGDMessageListOffMsysQuery', CFG.GQL.msgs, {
       after: null, before: null, first, last: null,
-      newer_than_message_id: null, older_than_message_id: null,
+      newer_than_message_id: newerThanId, older_than_message_id: null,
       id: String(threadFbid),
       __relay_internal__pv__IGDInitialMessagePageCountrelayprovider: first,
     });
@@ -342,6 +413,57 @@
     return r;
   }
 
+  // ── SEEN: real read receipt ("Seen just now" on the other phone) ──
+  // Two-step, exactly what the site does when you open a thread:
+  //   1. useIGDMarkThreadAsReadMutation      → sets the watermark
+  //   2. useIGDMarkThreadAsReadValidationMutation → confirms it
+  async function markSeen(threadFbid, messageId, tsMs) {
+    await gql('useIGDMarkThreadAsReadMutation', CFG.GQL.seen, {
+      data: { item_id: '', message_id: String(messageId) },
+      metadata: { ig_thread_igid: String(threadFbid) },
+    }, { fatalOnRL: false });
+    await gql('useIGDMarkThreadAsReadValidationMutation', CFG.GQL.seenVal, {
+      data: { message_id: String(messageId), message_timestamp_ms: String(tsMs || now()) },
+      metadata: { ig_thread_igid: String(threadFbid) },
+    }, { fatalOnRL: false });
+  }
+
+  // ── TYPING: the site's own IGDMAPISendTypingIndicator over its DGW client ──
+  // {action:"indicate_activity", activity_status: 1|0, client_context:"", thread_id}
+  function typingFn() {
+    if (S.typingAvailable !== undefined) return S.typingAvailable;
+    try {
+      if (typeof window.require === 'function') {
+        S.typingAvailable = window.require('IGDMAPISendTypingIndicator');
+      }
+    } catch (_) { S.typingAvailable = null; }
+    if (!S.typingAvailable) {
+      S.typingAvailable = null;
+      log(C.warn, 'typing', 'IGDMAPISendTypingIndicator unavailable — typing trail disabled');
+    }
+    return S.typingAvailable;
+  }
+  async function sendTyping(threadFbid, on) {
+    const f = typingFn();
+    if (!f) return false;
+    await f(String(threadFbid), !!on);
+    return true;
+  }
+  async function typingOn(threadFbid) {
+    if (!CFG.TYPING || CFG.DRY_RUN) return false;
+    try {
+      const ok = await sendTyping(threadFbid, true);
+      if (ok) S.typingThreads.add(String(threadFbid));
+      return ok;
+    } catch (e) { log(C.warn, 'typing', 'typing on failed: ' + e.message); return false; }
+  }
+  async function typingOff(threadFbid) {
+    try {
+      await sendTyping(threadFbid, false);
+      S.typingThreads.delete(String(threadFbid));
+    } catch (_) {}
+  }
+
   /* ──────────── MESSAGE CLASSIFICATION (Slide content types) ──────────── */
 
   function classifyMsg(node) {
@@ -366,6 +488,92 @@
   const isMine = (n) => S.myInteropId
     ? String(n.sender_fbid) === S.myInteropId
     : String(n.sender_fbid || '') === String(getCookie('ds_user_id') || '');
+
+  // normalized message kept in transcripts
+  function normMsg(n) {
+    const c = classifyMsg(n);
+    return {
+      id: String(n.message_id || ''),
+      ts: msgTs(n),
+      mine: isMine(n),
+      kind: c.kind,
+      label: c.label,
+      text: (c.kind === 'text' ? c.text : '') || '',
+    };
+  }
+
+  /* ──────────── TRANSCRIPTS (per-contact full history) ──────────── */
+
+  function mergeIntoTranscript(tid, user, igNodes) {
+    let T = S.transcripts[tid];
+    if (!T) T = S.transcripts[tid] = { user, threadFbid: String(tid), messages: [], lastMessageId: null, updated: 0, dirty: false };
+    if (user && T.user !== user) T.user = user;
+    const byId = new Map(T.messages.map(m => [m.id, m]));
+    let added = 0;
+    for (const n of igNodes) {
+      const m = normMsg(n);
+      if (!m.id) continue;
+      if (!byId.has(m.id)) { byId.set(m.id, m); T.messages.push(m); added++; }
+    }
+    T.messages.sort((a, b) => a.ts - b.ts);
+    if (T.messages.length > CFG.TRANSCRIPT_CAP * 2) T.messages = T.messages.slice(-CFG.TRANSCRIPT_CAP);
+    T.lastMessageId = T.messages.length ? T.messages[T.messages.length - 1].id : null;
+    T.updated = now();
+    if (added) { T.dirty = true; saveTranscriptsLocal(); }
+    return T;
+  }
+
+  // incremental: only messages newer than what we already have (falls back to full page)
+  async function fetchThreadNodes(tid, user) {
+    const T = S.transcripts[tid];
+    if (T && T.lastMessageId) {
+      const inc = await fetchMessages(tid, 20, T.lastMessageId);
+      if (inc.length) return mergeIntoTranscript(tid, user, inc);
+      T.updated = now();
+      return T;
+    }
+    const nodes = await fetchMessages(tid, CFG.HISTORY_MESSAGES + 10);
+    return mergeIntoTranscript(tid, user, nodes);
+  }
+
+  function scheduleTranscriptSave(tid, ms = 30_000) {
+    const T = S.transcripts[tid];
+    if (!T || !CFG.TRANSCRIPTS || !T.dirty) return;
+    if (T.saveTimer) return;                       // already scheduled
+    T.saveTimer = setTimeout(async () => {
+      T.saveTimer = null;
+      if (!T.dirty || !S.wsReady) return;
+      T.dirty = false;
+      try {
+        const r = await wsRequest({
+          type: 'save',
+          transcript: {
+            user: T.user, thread_fbid: T.threadFbid,
+            updated_at: new Date().toISOString(),
+            persona: CFG.SYSTEM_PROMPT,
+            owner_bio: CFG.OWNER_BIO,
+            memory_profile: (S.memory[tid] && S.memory[tid].profile) || '',
+            messages: T.messages.slice(-1000),
+          },
+        }, 15_000);
+        log(C.dim, 'save', `@${T.user}: transcript saved → ${r.file} (${r.total_messages} msgs)`);
+      } catch (e) {
+        T.dirty = true;
+        log(C.warn, 'save', `@${T.user}: transcript save failed (${e.message}) — will retry`);
+      }
+    }, Math.max(1000, ms));
+  }
+
+  async function backfillThread(tid, user) {
+    try {
+      const nodes = await fetchMessages(tid, CFG.BACKFILL_ON_START);
+      const T = mergeIntoTranscript(tid, user, nodes);
+      scheduleTranscriptSave(tid, 2_000);
+      log(C.dim, 'transcript', `@${user}: ${T.messages.length} msgs on file`);
+    } catch (e) {
+      log(C.warn, 'transcript', `@${user}: backfill failed (${e.message})`);
+    }
+  }
 
   /* ──────────── LLM BRIDGE OVER WEBSOCKET (CSP-proof) ──────────── */
 
@@ -433,7 +641,7 @@
 
   /* ──────────────────── HISTORY + MEMORY ──────────────────── */
 
-  function buildHistory(nodes, tid, user) {
+  function buildHistory(msgs, tid, user) {
     const sysParts = [CFG.SYSTEM_PROMPT];
     if (CFG.OWNER_BIO) sysParts.push('ABOUT THE ACCOUNT OWNER (Adarsh):\n' + CFG.OWNER_BIO);
     if (CFG.MEMORY) {
@@ -444,26 +652,23 @@
           'Use it naturally — never recite it, never mention that you keep notes.');
       }
     }
-    const msgs = [{ role: 'system', content: sysParts.join('\n\n') }];
-    for (const n of nodes.slice(-CFG.HISTORY_MESSAGES)) {
-      const c = classifyMsg(n);
-      const content = c.kind === 'text' ? c.text : `[sent ${c.label}]`;
+    const out = [{ role: 'system', content: sysParts.join('\n\n') }];
+    for (const m of msgs.slice(-CFG.HISTORY_MESSAGES)) {
+      const content = m.kind === 'text' ? m.text : `[sent ${m.label}]`;
       if (!content || !content.trim()) continue;
-      msgs.push({ role: isMine(n) ? 'assistant' : 'user', content });
+      out.push({ role: m.mine ? 'assistant' : 'user', content });
     }
-    return msgs;
+    return out;
   }
 
-  function updateMemory(tid, user, nodes, replyText) {
+  function updateMemory(tid, user, msgs, replyText) {
     if (!CFG.MEMORY) return;
     (async () => {
       try {
         const known = (S.memory[tid] && S.memory[tid].profile) || '(none)';
-        const convo = nodes.slice(-16).map(n => {
-          const c = classifyMsg(n);
-          return (isMine(n) ? 'agent: ' : 'them: ') +
-            (c.kind === 'text' ? c.text : '[' + c.label + ']');
-        }).join('\n').slice(-3000);
+        const convo = msgs.slice(-16).map(m =>
+          (m.mine ? 'agent: ' : 'them: ') +
+          (m.kind === 'text' ? m.text : '[' + m.label + ']')).join('\n').slice(-3000);
         const { text } = await llm([
           { role: 'system', content: CFG.MEMORY_PROMPT },
           { role: 'user', content: 'KNOWN PROFILE:\n' + known + '\n\nCONVERSATION:\n' + convo +
@@ -482,24 +687,19 @@
 
   /* ──────────────────── PER-THREAD QUEUE + PROCESSING ──────────────────── */
 
-  function queueThread(tid, user, ms = 0, reason) {
+  function queueThread(tid, user, ms, reason) {
     let p = S.pending[tid];
-    if (!p) p = S.pending[tid] = { timer: null };
+    if (!p) p = S.pending[tid] = { firstAt: now(), timer: null };
     if (p.timer) clearTimeout(p.timer);
     if (reason) log(C.dim, 'queue', `@${user}: ${reason} — retry in ${Math.round(ms / 1000)}s`);
     p.timer = setTimeout(() => {
       delete S.pending[tid];
       processThread(tid, user).catch(e => log(C.err, 'proc', `@${user}: ${e.message}`));
-    }, Math.max(0, ms));
+    }, Math.max(150, ms));
   }
 
   async function processThread(tid, user) {
-    // Never generate two replies for one thread at once. If a new message arrives
-    // while one is generating, drain it immediately after the current send ends.
-    if (S.busy[tid]) {
-      S.rerun[tid] = user;
-      return;
-    }
+    if (S.busy[tid]) return queueThread(tid, user, 4000, 'reply already in progress');
     S.busy[tid] = true;
     try {
       if (S.circuitUntil > now()) {
@@ -514,38 +714,73 @@
       if (!inWorkingHours()) {
         return queueThread(tid, user, 10 * 60e3, 'outside working hours');
       }
+      const cool = (S.cooldownUntil[tid] || 0) - now();
+      if (cool > 0) return queueThread(tid, user, cool + rand(2e3, 6e3), 'thread cooldown');
 
-      const nodes = await fetchMessages(tid, CFG.HISTORY_MESSAGES + 10);
-      const unanswered = nodes.filter(n => !isMine(n) && !S.handled.has(n.message_id));
-      const newest = nodes[nodes.length - 1];
-      if (!unanswered.length || !newest || isMine(newest)) {
-        nodes.forEach(n => S.handled.add(n.message_id));
+      const T = await fetchThreadNodes(tid, user);       // incremental fetch + merge
+      const msgs = T.messages;
+      const unanswered = msgs.filter(m => !m.mine && !S.handled.has(m.id));
+      const newest = msgs[msgs.length - 1];
+      if (!unanswered.length || !newest || newest.mine) {
+        msgs.forEach(m => m.id && S.handled.add(m.id));
         saveState();
         return log(C.dim, 'skip', `@${user}: nothing new to answer`);
       }
-      const lastC = classifyMsg(newest);
+
+      // read receipt — real "Seen just now" on their phone (skipped in DRY_RUN)
+      if (CFG.SEEN && !CFG.DRY_RUN && !newest.mine) {
+        try {
+          await markSeen(tid, newest.id, newest.ts);
+          log(C.dim, 'seen', `@${user}: marked seen (up to ${new Date(newest.ts).toLocaleTimeString()})`);
+        } catch (e) {
+          log(C.warn, 'seen', `@${user}: seen skipped (${e.message})`);
+        }
+      }
+      const lastC = newest;
       if (lastC.kind !== 'text') {
-        nodes.forEach(n => S.handled.add(n.message_id)); saveState();
-        return log(C.dim, 'media', `@${user}: newest is ${lastC.emoji} ${lastC.label} — detected, NOT replying`);
+        msgs.forEach(m => m.id && S.handled.add(m.id)); saveState();
+        scheduleTranscriptSave(tid, 5_000);
+        return log(C.dim, 'media', `@${user}: newest is ${lastC.label} — detected, NOT replying`);
       }
 
-      const history = buildHistory(nodes, tid, user);
+      // typing trail ON from the first moment of drafting — it stays on for
+      // the entire LLM generation and switches off exactly when we send
+      const typing = await typingOn(tid);
+      const t0 = now();
+      const history = buildHistory(msgs, tid, user);
       const { text: reply, model } = await llm(history);
       if (!reply) throw new Error('empty reply from bridge');
       S.llmFailStreak = 0; S.tries[tid] = 0;
+
+      if (typing) {
+        // trail = full draft time; only floor it so an instant LLM answer
+        // still flashes a visible "typing…" before the message lands
+        const elapsed = now() - t0;
+        const floor = rand(CFG.TYPING_MIN_MS, CFG.TYPING_MIN_MS * 1.6);
+        if (elapsed < floor) await sleep(floor - elapsed);
+        await typingOff(tid);
+      }
 
       if (CFG.DRY_RUN) {
         log(C.bot, 'dry', `@${user} ← (NOT SENT) [${model}] "${reply}"`);
       } else {
         const sent = await sendText(tid, reply);
         S.sentHour.push(now()); S.sentDay.push(now());
-        log(C.ok, 'sent', `@${user} ← [${model}] "${reply}" (${sent.message_id.slice(0, 24)}…)`);
+        // our own reply goes into the transcript the moment IG confirms it
+        T.messages.push({ id: String(sent.message_id), ts: now(), mine: true, kind: 'text', label: 'text', text: reply });
+        T.lastMessageId = String(sent.message_id);
+        T.dirty = true; saveTranscriptsLocal();     // own reply must reach the JSON file
+        log(C.ok, 'sent', `@${user} ← [${model}] "${reply}" (${String(sent.message_id).slice(0, 24)}…)`);
       }
-      nodes.forEach(n => S.handled.add(n.message_id));
+      msgs.forEach(m => m.id && S.handled.add(m.id));
       saveState();
-      updateMemory(tid, user, nodes, reply);
+      S.cooldownUntil[tid] = now() + CFG.THREAD_COOLDOWN_MS;
+      updateMemory(tid, user, msgs, reply);
+      scheduleTranscriptSave(tid, 5_000);
 
     } catch (e) {
+      // never leave a stuck "typing…" if the draft failed
+      if (S.typingThreads.has(String(tid))) await typingOff(tid);
       if (e.fatal) {
         log(C.err, 'halt', 'Instagram error — auto-stopping for safety:', e.message);
         stop();
@@ -569,21 +804,13 @@
       }
     } finally {
       S.busy[tid] = false;
-      const nextUser = S.rerun[tid];
-      delete S.rerun[tid];
-      // An error path may already have scheduled its normal backoff retry.
-      if (nextUser && S.running && !S.pending[tid]) queueThread(tid, nextUser, 0);
     }
   }
 
-  /* ──────────────────────────── MAIN LOOP ──────────────────── */
+  /* ──────────────────────────── MAIN LOOP ──────────────────────────── */
 
   async function pollTick() {
     if (!S.running) return;
-    // Measure from the beginning of this poll so the normal cadence is one
-    // inbox request every 500 ms. Because the next timeout is armed only after
-    // await fetchInbox() settles, slow/network-stalled polls can never overlap.
-    const pollStartedAt = now();
     try {
       const threads = await fetchInbox();
       const baseline = !(S.startedPolls > 0);
@@ -594,27 +821,29 @@
         if (!tid) continue;
         const user = (th.users && th.users[0] && th.users[0].username) || tid;
         S.usernameCache.set(tid, user);
-        if (th.users && th.users[0] && th.users[0].interop_messaging_user_fbid) {
-          S.partnerInterop = S.partnerInterop || {};
-          S.partnerInterop[tid] = String(th.users[0].interop_messaging_user_fbid);
-        }
         const act = Number(th.last_activity_timestamp_ms || 0);
         if (!act) continue;
 
         if (baseline || !(tid in S.lastActivity)) {        // first sight: baseline
-          S.lastActivity[tid] = act; saveState(); continue;
+          S.lastActivity[tid] = act; saveState();
+          // backfill transcript for target threads so their JSON files exist
+          if (!th.is_group && isTarget(user) && CFG.TRANSCRIPTS &&
+              !S.transcripts[tid]) backfillThread(tid, user);
+          continue;
         }
         if (act <= (S.lastActivity[tid] || 0)) continue;
         S.lastActivity[tid] = act; saveState();
 
         if (th.is_group && !CFG.REPLY_TO_GROUPS) continue;
-        if (CFG.TARGETS !== 'all' &&
-            !CFG.TARGETS.map(x => String(x).toLowerCase().replace(/^@/, '')).includes(user.toLowerCase())) continue;
+        if (!isTarget(user)) continue;
 
         log(C.info, 'new', `@${user}: activity bump (${new Date(act).toLocaleTimeString()})`);
-        // No debounce: fetch the thread and generate/send as soon as this poll
-        // sees new activity. Per-thread busy/rerun handling prevents duplicates.
-        queueThread(tid, user, 0);
+        const p = S.pending[tid] || (S.pending[tid] = { firstAt: now(), timer: null });
+        const wait = Math.min(
+          rand(CFG.DEBOUNCE_MIN_MS, CFG.DEBOUNCE_MAX_MS),
+          Math.max(2000, p.firstAt + CFG.DEBOUNCE_MAX_WAIT_MS - now())
+        );
+        queueThread(tid, user, wait, null);
       }
       S.lastPollAt = now();
     } catch (e) {
@@ -625,10 +854,13 @@
       }
       log(C.warn, 'poll', 'non-fatal error:', e.message);
     }
-    if (S.running) {
-      const delay = Math.max(0, CFG.POLL_INTERVAL_MS - (now() - pollStartedAt));
-      S.timer = setTimeout(pollTick, delay);
-    }
+    if (S.running) S.timer = setTimeout(pollTick, rand(CFG.POLL_MIN_MS, CFG.POLL_MAX_MS));
+  }
+
+  function isTarget(user) {
+    if (CFG.TARGETS === 'all') return true;
+    if (!Array.isArray(CFG.TARGETS)) return false;
+    return CFG.TARGETS.includes(String(user).toLowerCase());
   }
 
   /* ──────────────────────────── PUBLIC API ──────────────────────────── */
@@ -650,7 +882,7 @@
     if (solo) await fetchThreadMeta(solo.thread_fbid || solo.id);   // resolve my interop id
     S.running = true; S.startedAt = now(); S.startedPolls = 0;
     log(C.ok, 'main',
-      `started · bridge=${h.default_model} (${h.chain.length}-model chain) · dryRun=${CFG.DRY_RUN} · memory=${CFG.MEMORY} · targets=${
+      `started · bridge=${h.default_model} (${h.chain.length}-model chain) · dryRun=${CFG.DRY_RUN} · memory=${CFG.MEMORY} · seen=${CFG.SEEN} · typing=${typingFn() ? 'ready' : 'unavailable'} · targets=${
         Array.isArray(CFG.TARGETS) ? CFG.TARGETS.join(',') : CFG.TARGETS}` +
       (S.myInteropId ? ` · me=${S.myInteropId}` : ''));
     pollTick();
@@ -661,7 +893,9 @@
     if (S.timer) { clearTimeout(S.timer); S.timer = null; }
     Object.values(S.pending).forEach(p => p.timer && clearTimeout(p.timer));
     S.pending = {};
-    S.rerun = {};
+    // clear any typing trails still showing
+    for (const tid of [...S.typingThreads]) typingOff(tid);
+    S.typingThreads.clear();
     log(C.warn, 'main', 'stopped' + (S.startedAt ? ` · uptime ${Math.round((now() - S.startedAt) / 1000)}s` : ''));
   }
 
@@ -669,12 +903,16 @@
     const out = {
       running: S.running,
       dryRun: CFG.DRY_RUN,
+      seen: CFG.SEEN,
+      typing: CFG.TYPING && (S.typingAvailable !== undefined ? !!S.typingAvailable : 'unchecked'),
       model: CFG.MODEL || '(server default)',
       targets: CFG.TARGETS,
       me: { ig: S.viewerIgId || getCookie('ds_user_id'), interop: S.myInteropId },
       repliesSentToday: dayCount() + '/' + CFG.MAX_REPLIES_PER_DAY,
       repliesLastHour: hourCount() + '/' + CFG.MAX_REPLIES_PER_HOUR,
       memories: Object.keys(S.memory).length,
+      transcripts: Object.entries(S.transcripts).map(([tid, T]) =>
+        ({ user: T.user, msgs: T.messages.length, dirty: T.dirty })),
       circuitOpen: S.circuitUntil > now() ? ('until ' + new Date(S.circuitUntil).toLocaleTimeString()) : false,
       queuedThreads: Object.keys(S.pending),
       lastPollAt: S.lastPollAt ? new Date(S.lastPollAt).toLocaleTimeString() : null,
@@ -717,16 +955,13 @@
   async function history(username, limit = 30) {
     const th = await findThread(username);
     if (!S.myInteropId) await fetchThreadMeta(th.thread_fbid || th.id);
-    const nodes = await fetchMessages(th.thread_fbid || th.id, limit);
-    const rows = nodes.map(n => {
-      const c = classifyMsg(n);
-      return {
-        time: msgTs(n) ? new Date(msgTs(n)).toLocaleString() : '',
-        from: isMine(n) ? 'ME' : username,
-        type: `${c.emoji} ${c.label}`,
-        text: c.kind === 'text' ? c.text : `[${c.label}]`,
-      };
-    });
+    const T = await fetchThreadNodes(th.thread_fbid || th.id, username);
+    const rows = T.messages.slice(-limit).map(m => ({
+      time: m.ts ? new Date(m.ts).toLocaleString() : '',
+      from: m.mine ? 'ME' : username,
+      type: m.label,
+      text: m.kind === 'text' ? m.text : `[${m.label}]`,
+    }));
     console.table(rows);
     return rows;
   }
@@ -738,6 +973,55 @@
     S.sentHour.push(now()); S.sentDay.push(now()); saveState();
     log(C.ok, 'say', `@${username} ← "${text}"`);
     return r;
+  }
+
+  // manual test helpers — bypass DRY_RUN on purpose (they are visible actions)
+  async function typingDemo(username, ms = 4000) {
+    const th = await findThread(username);
+    const tid = String(th.thread_fbid || th.id);
+    const on = await sendTyping(tid, true);
+    if (!on) throw new Error('typing indicator unavailable in this session');
+    log(C.ok, 'typing', `@${username}: TYPING ON — watch the other phone (${ms}ms)`);
+    await sleep(ms);
+    await sendTyping(tid, false);
+    log(C.ok, 'typing', `@${username}: typing off`);
+    return true;
+  }
+
+  async function markSeenNow(username) {
+    const th = await findThread(username);
+    if (!S.myInteropId) await fetchThreadMeta(th.thread_fbid || th.id);
+    const tid = String(th.thread_fbid || th.id);
+    const T = await fetchThreadNodes(tid, username);
+    const newest = T.messages[T.messages.length - 1];
+    if (!newest) throw new Error('no messages in thread');
+    if (newest.mine) { log(C.warn, 'seen', `@${username}: newest message is mine — nothing to mark`); return null; }
+    await markSeen(tid, newest.id, newest.ts);
+    log(C.ok, 'seen', `@${username}: marked seen up to "${String(newest.text).slice(0, 40)}" — check the other phone for "Seen"`);
+    return true;
+  }
+
+  function transcripts() {
+    const rows = Object.entries(S.transcripts).map(([tid, T]) => ({
+      user: T.user, thread: tid, messages: T.messages.length,
+      last_msg: T.messages.length ? new Date(T.messages[T.messages.length - 1].ts).toLocaleString() : '',
+      unsaved: T.dirty,
+    }));
+    console.table(rows);
+    console.log('%cJSON files live in server.py\'s ./transcripts/ folder', C.dim);
+    return rows;
+  }
+
+  async function saveTranscriptsNow() {
+    const out = [];
+    for (const [tid, T] of Object.entries(S.transcripts)) {
+      T.dirty = true;
+      T.saveTimer = null;
+      scheduleTranscriptSave(tid, 500);
+      out.push(T.user);
+    }
+    if (!out.length) log(C.warn, 'save', 'no transcripts to save yet');
+    return out;
   }
 
   function memory(user) {
@@ -771,7 +1055,7 @@
     const check = (name, fn) => fn().then(v => { results.push(['✅', name, v]); return true; })
       .catch(e => { results.push(['❌', name, e.message]); return false; });
 
-    log(C.info, 'test', '── IGAgent v3 self-test ──');
+    log(C.info, 'test', '── IGAgent v4 self-test ──');
     let ok = true;
     ok &= await check('session · csrftoken', async () => {
       const t = getCookie('csrftoken');
@@ -793,6 +1077,11 @@
       if (!text) throw new Error('empty reply');
       return `[${model}] "${text.slice(0, 50)}"`;
     });
+    ok &= await check('typing · IGDMAPISendTypingIndicator available', async () => {
+      const f = typingFn();
+      if (!f) throw new Error('require() path missing — typing trail disabled');
+      return 'ready (site DGW client)';
+    });
     let inbox = null;
     ok &= await check('inbox · PolarisDirectInboxQuery', async () => {
       inbox = await fetchInbox();
@@ -809,12 +1098,25 @@
           return `me=${S.myInteropId || '?'} · partner=${(t.users && t.users[0] && t.users[0].username) || '?'}`;
         });
         ok &= await check('messages · IGDMessageListOffMsysQuery', async () => {
-          const nodes = await fetchMessages(tid, 20);
-          if (!nodes.length) throw new Error('no message nodes');
-          return `${nodes.length} messages · newest: ${classifyMsg(nodes[nodes.length - 1]).label}`;
+          const T = await fetchThreadNodes(tid, (solo.users && solo.users[0] && solo.users[0].username) || tid);
+          if (!T.messages.length) throw new Error('no message nodes');
+          return `${T.messages.length} msgs · newest: ${T.messages[T.messages.length - 1].label}`;
         });
       }
     }
+    ok &= await check('seen · doc ids present', async () => {
+      if (!/^\d+$/.test(CFG.GQL.seen) || !/^\d+$/.test(CFG.GQL.seenVal)) throw new Error('doc ids missing');
+      return `main=${CFG.GQL.seen} · validation=${CFG.GQL.seenVal}`;
+    });
+    ok &= await check('transcripts · bridge save roundtrip', async () => {
+      if (!CFG.TRANSCRIPTS) return 'disabled';
+      const r = await wsRequest({ type: 'save', transcript: {
+        user: '_selftest', thread_fbid: '0', updated_at: new Date().toISOString(),
+        persona: 'test', owner_bio: 'test', memory_profile: '',
+        messages: [{ id: 'test:' + now(), ts: now(), mine: false, kind: 'text', label: 'text', text: 'selftest' }],
+      } }, 10_000);
+      return r.file + ' (' + r.total_messages + ' msgs)';
+    });
     ok &= await check('caps · counters sane', async () => {
       if (hourCount() > CFG.MAX_REPLIES_PER_HOUR) throw new Error('hourly cap already hit');
       return `today=${dayCount()}/${CFG.MAX_REPLIES_PER_DAY} hour=${hourCount()}/${CFG.MAX_REPLIES_PER_HOUR}`;
@@ -829,9 +1131,10 @@
   /* expose */
   const api = {
     start, stop, status, test, threads, history, memory, forget, memories, say,
+    typingDemo, markSeenNow, transcripts, saveTranscriptsNow,
     config: CFG,
     // debug hooks (used to drive the pipeline manually when needed)
-    _debug: { processThread, fetchMessages, fetchInbox, fetchThreadMeta, sendText,
+    _debug: { processThread, fetchMessages, fetchInbox, fetchThreadMeta, sendText, markSeen, sendTyping,
               get S() { return S; } },
     targets(...users) {
       CFG.TARGETS = users.map(u => String(u).toLowerCase().replace(/^@/, ''));
@@ -841,26 +1144,31 @@
     },
     allTargets() { CFG.TARGETS = 'all'; saveState(); log(C.warn, 'main', 'TARGETS = ALL 1:1 chats'); },
     dryRun(v) { CFG.DRY_RUN = v; saveState(); log(C.warn, 'main', 'DRY_RUN =', v); },
+    seen(v) { CFG.SEEN = !!v; saveState(); log(C.ok, 'main', 'SEEN =', CFG.SEEN); },
+    typing(v) { CFG.TYPING = !!v; saveState(); log(C.ok, 'main', 'TYPING =', CFG.TYPING); },
     model(m) { CFG.MODEL = String(m || ''); saveState(); log(C.ok, 'main', 'model =', CFG.MODEL || '(server default)'); },
     prompt(p) { CFG.SYSTEM_PROMPT = String(p); saveState(); log(C.ok, 'main', 'persona replaced (' + p.length + ' chars)'); },
     wsUrl(u) { CFG.WS_URL = String(u); saveState(); log(C.ok, 'main', 'WS =', CFG.WS_URL); },
     clearState() {
       localStorage.removeItem(LS_STATE);
       localStorage.removeItem(LS_MEM);
-      S.handled.clear(); S.lastActivity = {}; S.memory = {};
-      log(C.warn, 'main', 'stored state + ALL memories cleared');
+      localStorage.removeItem(LS_TRANSCRIPTS);
+      S.handled.clear(); S.lastActivity = {}; S.memory = {}; S.transcripts = {};
+      log(C.warn, 'main', 'stored state + ALL memories + transcripts cleared');
     },
     get logs() { return S.logs; },
   };
   loadState();
   window.IGAgent = api;
 
-  console.log('%cIGAgent v3 loaded ✅  (GraphQL DM layer + llmchat.in over WebSocket)', C.ok,
+  console.log('%cIGAgent v4 loaded ✅  (GraphQL DM + seen receipts + typing trail + JSON transcripts)', C.ok,
     '\n0) python server.py            ← start the local bridge first' +
-    '\n1) IGAgent.test()              ← verify session + inbox + messages + bridge' +
+    '\n1) IGAgent.test()              ← verify session + inbox + bridge + typing' +
     '\n2) IGAgent.targets("user1")    ← who gets replies (or IGAgent.allTargets())' +
     '\n3) IGAgent.start()             ← runs in DRY_RUN; replies logged not sent' +
-    '\n4) IGAgent.dryRun(false)       ← flip when you trust it · IGAgent.stop() to halt' +
-    '\n   IGAgent.say("user","text")  ← manual real send · .memory("user1") to peek');
+    '\n4) IGAgent.dryRun(false)       ← live: real sends + seen receipts + typing trail' +
+    '\n   IGAgent.typingDemo("user")  ← test the typing trail on demand' +
+    '\n   IGAgent.markSeenNow("user") ← test the seen receipt on demand' +
+    '\n   IGAgent.transcripts()       ← per-contact JSON history (server ./transcripts/)');
   return api;
 })();

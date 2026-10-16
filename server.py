@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 ══════════════════════════════════════════════════════════════════════
-  🌉  IG-Agent LLM Bridge  ·  server.py
+  🌉  IG-Agent LLM Bridge  ·  server.py  (v2)
 
   Turns llmchat_provider.py (llmchat.in — 23 free models, no API key)
-  into a tiny local HTTP API the Instagram console bot can call.
+  into a tiny local HTTP+WS API the Instagram console bot can call,
+  and keeps a complete JSON transcript per contact on disk.
 
   Run:      python server.py            (default http://127.0.0.1:8787)
 
@@ -14,12 +15,27 @@
     POST /reply                 → {messages, model?, max_tokens?, temperature?}
                                   ← {text, model, elapsed_ms, fallback_index}
     POST /v1/chat/completions   → OpenAI-style alias of /reply
+    POST /save                  → {transcript:{user, messages, persona, …}}
+                                  ← {file, total_messages}  (merged on disk)
+    GET  /transcripts           → list of saved contact JSONs
+    GET  /transcripts/<user>    → one contact's full transcript JSON
+
+  WebSocket protocol (ws://localhost:8787/ws) — JSON text frames:
+    {"id","type":"reply","messages":[…]}   → {"id","ok":true,"text","model"}
+    {"id","type":"health"}                 → {"id","ok":true,…}
+    {"id","type":"save","transcript":{…}}  → {"id","ok":true,"file",…}
 
   Self-healing:
     · model fallback chain — if a model errors/times out, next one is tried
     · unknown model names silently fall back to the default (never a 400)
     · <think>…</think> blocks from thinking models are stripped from output
-    · CORS + Private-Network headers so https://instagram.com can call it
+    · reply workers run in parallel threads so one slow chat never blocks
+      another; socket writes are serialized so frames can't interleave
+  Transcripts:
+    · ./transcripts/<user>.json — complete merged message history per
+      contact + the agent persona + memory profile; the client only sends
+      its recent window, the server merges by message id so nothing is
+      ever lost (the client's cap only limits its local cache).
 ══════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -29,13 +45,15 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import re
 import struct
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 try:
     from llmchat_provider import LLMChatProvider, MODELS
@@ -78,6 +96,11 @@ _THINKING = {
 
 TIMEOUT = 90          # per-model HTTP timeout (s), set by --timeout
 START = time.time()
+
+# transcripts live next to server.py
+TRANSCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcripts")
+TRANSCRIPT_MAX_MSGS = 5000          # per file
+_SAVE_LOCK = threading.Lock()       # one writer at a time — merges must not race
 
 # ═══════════════════════════ HELPERS ═══════════════════════════
 
@@ -125,11 +148,125 @@ def _generate(messages: list, model: str, max_tokens: int, temperature: float) -
     return asyncio.run(run())
 
 
+def generate_with_fallback(messages, model_query, max_tokens=512, temperature=0.9):
+    """Shared by POST /reply and the WebSocket channel."""
+    max_tokens = int(max_tokens or 512)
+    temperature = float(temperature if temperature is not None else 0.9)
+    first = resolve_model(model_query)
+    chain: list[str] = []
+    for name in ([first] if first else []) + FALLBACK_CHAIN:
+        if name not in chain:
+            chain.append(name)
+    errors = []
+    for i, name in enumerate(chain):
+        t0 = time.time()
+        budget = max(max_tokens, 2500) if name in _THINKING else max_tokens
+        try:
+            raw = _generate(messages, name, budget, temperature)
+            text = strip_think(raw)
+            if not text:
+                raise RuntimeError("empty output")
+            dt = time.time() - t0
+            print(f"[reply] {name}  {dt:.1f}s  {len(text)} chars"
+                  + (f"  (fallback #{i})" if i else ""), flush=True)
+            return text, name
+        except Exception as e:
+            errors.append(f"{name}: {str(e)[:160]}")
+            print(f"[fall]  {errors[-1]}", flush=True)
+    raise RuntimeError("all models failed: " + " | ".join(errors[:2]))
+
+
+# ═══════════════════ TRANSCRIPTS (per-contact JSON files) ═══════════════════
+
+
+def _safe_user(user: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", str(user or "").lstrip("@").strip())
+    return name or "unknown"
+
+
+def _transcript_path(user: str) -> str:
+    return os.path.join(TRANSCRIPT_DIR, _safe_user(user) + ".json")
+
+
+def save_transcript(tr: dict) -> dict:
+    """Merge a client transcript window into the on-disk file (by message id)
+    and refresh persona / memory / timestamps. Atomic write."""
+    user = str(tr.get("user") or "").strip() or "unknown"
+    path = _transcript_path(user)
+    with _SAVE_LOCK:
+        old_msgs: dict[str, dict] = {}
+        keep: dict = {}
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    old = json.load(f)
+                for m in old.get("messages", []):
+                    if isinstance(m, dict) and m.get("id"):
+                        old_msgs[str(m["id"])] = m
+                keep = {k: old.get(k) for k in ("persona", "owner_bio", "memory_profile")}
+            except Exception:
+                old_msgs, keep = {}, {}
+
+        incoming = tr.get("messages") or []
+        for m in incoming:
+            if isinstance(m, dict) and m.get("id"):
+                old_msgs[str(m["id"])] = m          # client state is fresher
+
+        msgs = sorted(old_msgs.values(), key=lambda m: m.get("ts") or 0)
+        doc = {
+            "user": user,
+            "thread_fbid": tr.get("thread_fbid"),
+            "updated_at": tr.get("updated_at")
+                          or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "message_count": len(msgs),
+            "persona": tr.get("persona") or keep.get("persona") or "",
+            "owner_bio": tr.get("owner_bio") or keep.get("owner_bio") or "",
+            "memory_profile": tr.get("memory_profile") or keep.get("memory_profile") or "",
+            "messages": msgs[-TRANSCRIPT_MAX_MSGS:],
+        }
+        os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    total = len(doc["messages"])
+    print(f"[save] @{_safe_user(user)}  {total} msgs  →  {os.path.basename(path)}", flush=True)
+    return {"file": path, "total_messages": total}
+
+
+def list_transcripts() -> list[dict]:
+    out = []
+    if os.path.isdir(TRANSCRIPT_DIR):
+        for fn in sorted(os.listdir(TRANSCRIPT_DIR)):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(TRANSCRIPT_DIR, fn), encoding="utf-8") as f:
+                    d = json.load(f)
+                out.append({
+                    "user": d.get("user", fn[:-5]),
+                    "file": fn,
+                    "message_count": d.get("message_count", len(d.get("messages", []))),
+                    "updated_at": d.get("updated_at", ""),
+                })
+            except Exception:
+                out.append({"user": fn[:-5], "file": fn, "message_count": None, "updated_at": "unreadable"})
+    return out
+
+
+def load_transcript(user: str) -> dict | None:
+    path = _transcript_path(user)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 # ═══════════════════════════ WEBSOCKET (CSP bypass) ═══════════════════════════
 # Instagram's CSP blocks fetch() to http://127.0.0.1 but ALLOWS ws://localhost:*.
 # So the page-side bot talks to the bridge over a tiny hand-rolled WebSocket.
-# Protocol (JSON text frames): {"id","type":"reply"|"health","messages",...}
-# → {"id","ok":true,"text","model"} / {"id","ok":false,"error"}
+# Protocol (JSON text frames): {"id","type":"reply"|"health"|"save",...}
+# → {"id","ok":true,...} / {"id","ok":false,"error"}
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -245,6 +382,21 @@ def handle_ws(handler) -> None:
                         "chain": FALLBACK_CHAIN, "uptime_s": round(time.time() - START)}
                 conn.send_text(json.dumps(resp))
                 continue
+            if req.get("type") == "save":
+                rid = req.get("id")
+                try:
+                    tr = req.get("transcript")
+                    if not isinstance(tr, dict) or not tr.get("user"):
+                        raise ValueError("'transcript' with 'user' is required")
+                    r = save_transcript(tr)
+                    resp = {"id": rid, "ok": True, **r}
+                except Exception as e:
+                    resp = {"id": rid, "ok": False, "error": str(e)[:300]}
+                try:
+                    conn.send_text(json.dumps(resp))
+                except (BrokenPipeError, ConnectionError, OSError, ValueError):
+                    pass
+                continue
             # Do not block this connection while an LLM streams. The browser's
             # request ids let responses safely arrive in whichever order finishes first.
             threading.Thread(target=_serve_ws_reply, args=(conn, req), daemon=True).start()
@@ -252,39 +404,11 @@ def handle_ws(handler) -> None:
         print(f"[ws] client left ({e})", flush=True)
 
 
-def generate_with_fallback(messages, model_query, max_tokens=512, temperature=0.9):
-    """Shared by POST /reply and the WebSocket channel."""
-    max_tokens = int(max_tokens or 512)
-    temperature = float(temperature if temperature is not None else 0.9)
-    first = resolve_model(model_query)
-    chain: list[str] = []
-    for name in ([first] if first else []) + FALLBACK_CHAIN:
-        if name not in chain:
-            chain.append(name)
-    errors = []
-    for i, name in enumerate(chain):
-        t0 = time.time()
-        budget = max(max_tokens, 2500) if name in _THINKING else max_tokens
-        try:
-            raw = _generate(messages, name, budget, temperature)
-            text = strip_think(raw)
-            if not text:
-                raise RuntimeError("empty output")
-            dt = time.time() - t0
-            print(f"[reply] {name}  {dt:.1f}s  {len(text)} chars"
-                  + (f"  (fallback #{i})" if i else ""), flush=True)
-            return text, name
-        except Exception as e:
-            errors.append(f"{name}: {str(e)[:160]}")
-            print(f"[fall]  {errors[-1]}", flush=True)
-    raise RuntimeError("all models failed: " + " | ".join(errors[:2]))
-
-
 # ═══════════════════════════ HTTP ═══════════════════════════
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "IGAgentBridge/1.0"
+    server_version = "IGAgentBridge/2.0"
 
     # -- CORS incl. Private Network Access (https page → http://127.0.0.1)
     def _cors(self) -> None:
@@ -295,7 +419,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Private-Network", "true")
 
     def _json(self, code: int, obj: dict) -> None:
-        body = json.dumps(obj).encode()
+        body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -327,16 +451,27 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/models":
             self._json(200, {"models": [m.name for m in MODELS], "default": DEFAULT_MODEL})
+        elif path == "/transcripts":
+            self._json(200, {"transcripts": list_transcripts()})
+        elif path.startswith("/transcripts/"):
+            user = unquote(path[len("/transcripts/"):])
+            doc = load_transcript(user)
+            if doc is None:
+                self._json(404, {"error": "no transcript for " + user})
+            else:
+                self._json(200, doc)
         else:
             self._json(200, {
                 "ok": True,
                 "service": "ig-agent-llm-bridge",
-                "endpoints": ["GET /health", "GET /models", "POST /reply", "POST /v1/chat/completions"],
+                "endpoints": ["GET /health", "GET /models", "POST /reply",
+                              "POST /v1/chat/completions", "POST /save",
+                              "GET /transcripts", "GET /transcripts/<user>"],
             })
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in ("/reply", "/v1/chat/completions"):
+        if path not in ("/reply", "/v1/chat/completions", "/save"):
             return self._json(404, {"error": "unknown endpoint " + path})
 
         try:
@@ -344,6 +479,15 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception as e:
             return self._json(400, {"error": f"bad JSON body: {e}"})
+
+        if path == "/save":
+            tr = body.get("transcript")
+            if not isinstance(tr, dict) or not tr.get("user"):
+                return self._json(400, {"error": "'transcript' with 'user' is required"})
+            try:
+                return self._json(200, save_transcript(tr))
+            except Exception as e:
+                return self._json(500, {"error": str(e)[:300]})
 
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -376,11 +520,13 @@ def main():
     args = ap.parse_args()
     TIMEOUT = args.timeout
 
+    os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
     print(f"IG-Agent LLM bridge  ->  http://{args.host}:{args.port}")
     print(f"default model : {DEFAULT_MODEL}")
     print(f"fallback chain: {len(FALLBACK_CHAIN)} models, auto-rotate on failure")
+    print(f"transcripts   : {TRANSCRIPT_DIR}")
     print("waiting for calls from ig-agent-chat.js ...  (Ctrl+C to stop)")
     try:
         httpd.serve_forever()
