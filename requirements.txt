@@ -1,0 +1,2 @@
+# Browser-like streaming HTTP client required by llmchat_provider.py.
+curl_cffi==0.16.3

@@ -1,0 +1,4 @@
+# Local Python sandbox and interpreter cache
+.venv/
+__pycache__/
+*.py[cod]

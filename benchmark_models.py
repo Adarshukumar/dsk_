@@ -142,7 +142,10 @@ class ProbeResult:
     raw_chars: int
     visible_chars: int
     reasoning_chars: int
+    # `response` is the user-visible answer with <think> blocks removed;
+    # `raw_response` preserves every streamed token for the audit report.
     response: str
+    raw_response: str
     error: str | None = None
 
 
@@ -196,6 +199,7 @@ async def run_probe(
             visible_chars=len(visible),
             reasoning_chars=reasoning_chars,
             response=visible,
+            raw_response=raw,
             error=error,
         )
 
@@ -213,6 +217,7 @@ async def run_probe(
         visible_chars=len(visible),
         reasoning_chars=reasoning_chars,
         response=visible,
+        raw_response=raw,
         error=None,
     )
 
@@ -285,7 +290,7 @@ def choose_models(all_models: Sequence[Any], selector: str | None) -> list[Any]:
 def rank_models(results: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     # Quality/compliance comes first; speed breaks ties. This prevents a model
     # that immediately returns a wrong answer from being called "best".
-    def key(item: dict[str, Any]) -> tuple[float, float, float, str]:
+    def key(item: dict[str, Any]) -> tuple[float, float, float, float, str]:
         summary = item["summary"]
         first = summary["median_first_chunk_s"]
         completion = summary["median_completion_s"]
@@ -336,6 +341,24 @@ def markdown_report(payload: dict[str, Any]) -> str:
                 f"{seconds(probe['elapsed_s'])} | {detail} |"
             )
         lines.append("")
+
+    # Keep every actual answer in the human-readable report as well as JSON.
+    # Raw output includes <think> blocks whenever the upstream provider emitted
+    # them, which makes the result auditable instead of hiding reasoning data.
+    lines.extend(["## Captured streamed answers", ""])
+    for item in rows:
+        lines.append(f"### `{item['model']}`")
+        lines.append("")
+        for probe in item["probes"]:
+            lines.append(
+                f"#### {probe['key']} — {probe['status']} "
+                f"(first chunk {seconds(probe['first_chunk_s'])}; total {seconds(probe['elapsed_s'])})"
+            )
+            answer = probe.get("raw_response") or probe.get("response") or "(no streamed output)"
+            if probe.get("error"):
+                answer += f"\n\nERROR: {probe['error']}"
+            lines.extend("    " + line for line in answer.splitlines() or ["(empty output)"])
+            lines.append("")
     return "\n".join(lines) + "\n"
 
 

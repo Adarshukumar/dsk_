@@ -22,7 +22,8 @@ For every probe, the tool records:
 - full completion time,
 - number of chunks and output characters,
 - reasoning-character count when an upstream model emits reasoning,
-- concise output and any error text in the JSON report.
+- both user-visible and raw streamed output (including `<think>` blocks),
+- every answer and any error text in the JSON **and** Markdown report.
 
 The Markdown rank prioritises probe correctness/availability before timing.
 The *fastest* result is the successful model with the lowest median time to
@@ -35,7 +36,15 @@ Use Python 3.10+ and install the project's only runtime dependency:
 
 ```bash
 cd /path/to/dsk_
-python3 -m pip install curl_cffi
+./run_model_benchmark.sh --concurrency 1 --timeout 75 --retries 0
+```
+
+The launcher creates an isolated `.venv` sandbox and installs the pinned
+`curl_cffi` dependency from `requirements.txt` before it starts the benchmark.
+You can also use an existing environment with:
+
+```bash
+python3 -m pip install -r requirements.txt
 python3 benchmark_models.py --concurrency 1 --timeout 75 --retries 0
 ```
 

@@ -48,6 +48,7 @@ through the DM UI, read the POST bodies).
 | `server.py` | Bridge: WS channel + `POST /reply` + OpenAI alias, model fallback, think-strip |
 | `ig-agent-chat.js` | The Instagram bot — paste into DevTools console (v3) |
 | `benchmark_models.py` | Reproducible live latency/reasoning/compliance benchmark for every registered model |
+| `run_model_benchmark.sh` | One-command isolated virtual-environment launcher for the model benchmark |
 | `BENCHMARKING.md` | Benchmark methodology, commands, and result-history workflow |
 | `README.md` | This file |
 
