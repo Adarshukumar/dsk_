@@ -19,6 +19,7 @@ make latency figures less comparable.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import json
 import re
@@ -82,7 +83,56 @@ def _score_json(text: str) -> tuple[bool, str]:
     return ok, "valid requested JSON" if ok else f"expected {{'sum': 17, 'status': 'ok'}}; got {value!r}"
 
 
-PROBES: tuple[Probe, ...] = (
+def _score_pen_reasoning(text: str) -> tuple[bool, str]:
+    # The familiar Rs.110 / Rs.100-difference problem catches shallow "Rs.10"
+    # pattern matching. A correct answer is Rs.5.
+    ok = bool(re.search(r"ANSWER\s*:\s*(?:Rs\.?\s*)?5(?:\.0+)?\b", text, flags=re.I))
+    return ok, "contains ANSWER: Rs.5" if ok else "missing required final answer ANSWER: Rs.5"
+
+
+def _extract_python_source(text: str) -> str:
+    fenced = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.S | re.I)
+    if fenced:
+        return fenced.group(1).strip()
+    start = text.find("def clamp")
+    return text[start:].strip() if start >= 0 else text.strip()
+
+
+def _score_python_syntax(text: str) -> tuple[bool, str]:
+    """Safely inspect model-generated Python without executing untrusted code."""
+    source = _extract_python_source(text)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        return False, f"invalid Python syntax: {exc.msg}"
+    function = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "clamp"), None)
+    if function is None:
+        return False, "no clamp(value, lower, upper) function found"
+    args = [arg.arg for arg in function.args.args]
+    if args != ["value", "lower", "upper"]:
+        return False, f"clamp arguments were {args!r}"
+    if not any(isinstance(node, ast.Return) for node in ast.walk(function)):
+        return False, "clamp has no return statement"
+    return True, "valid Python with clamp(value, lower, upper); not executed for safety"
+
+
+def _score_hinglish(text: str) -> tuple[bool, str]:
+    words = re.findall(r"[\w']+", text, flags=re.UNICODE)
+    has_hindi_marker = bool(re.search(r"\b(aap|aapka|hai|ka|ki|kar|raha|rahi|bilkul)\b", text, flags=re.I))
+    ok = 4 <= len(words) <= 18 and has_hindi_marker and not re.search(r"\b(price|pricing)\b", text, flags=re.I)
+    if ok:
+        return True, "short Hinglish response with a Hindi marker"
+    return False, "expected 4–18 words, a Hinglish marker, and no pricing claim"
+
+
+def _score_fact_extraction(text: str) -> tuple[bool, str]:
+    compact = re.sub(r"\s+", "", text).lower()
+    expected = "name=riya;city=jaipur;need=portfoliowebsite"
+    ok = compact == expected
+    return ok, "exact extracted facts" if ok else f"expected {expected!r}"
+
+
+CORE_PROBES: tuple[Probe, ...] = (
     Probe(
         key="latency",
         label="Instruction / first-token latency",
@@ -111,6 +161,60 @@ PROBES: tuple[Probe, ...] = (
         scorer=_score_json,
     ),
 )
+
+# The default capability suite adds questions that exercise deeper reasoning,
+# source-code construction, Hinglish tone, and exact fact extraction. Answers
+# are retained in the report for manual review; automatic scores are useful
+# indicators, not a substitute for reading the model outputs.
+CAPABILITY_PROBES: tuple[Probe, ...] = CORE_PROBES + (
+    Probe(
+        key="logic",
+        label="Reasoning trap / algebra",
+        prompt=(
+            "A notebook and a pen cost Rs.110 together. The notebook costs Rs.100 more than "
+            "the pen. Work it out briefly, then make your final line exactly: ANSWER: Rs.5"
+        ),
+        max_tokens=128,
+        scorer=_score_pen_reasoning,
+    ),
+    Probe(
+        key="python",
+        label="Python code construction",
+        prompt=(
+            "Return only valid Python source code, with no Markdown. Define exactly "
+            "def clamp(value, lower, upper): which returns lower when value is below lower, "
+            "upper when value is above upper, and value otherwise."
+        ),
+        max_tokens=160,
+        scorer=_score_python_syntax,
+    ),
+    Probe(
+        key="hinglish",
+        label="Short Hinglish client reply",
+        prompt=(
+            "Reply to a client in one friendly Hinglish sentence of 4 to 18 words: their "
+            "website demo is ready. Do not mention any price, do not use Markdown, and do not use quotes."
+        ),
+        max_tokens=64,
+        scorer=_score_hinglish,
+    ),
+    Probe(
+        key="extraction",
+        label="Precise fact extraction",
+        prompt=(
+            "Read these facts: Riya lives in Jaipur and wants a portfolio website; she does not "
+            "want a mobile app. Return exactly this one line and nothing else: "
+            "name=Riya; city=Jaipur; need=portfolio website"
+        ),
+        max_tokens=64,
+        scorer=_score_fact_extraction,
+    ),
+)
+
+SUITES: dict[str, tuple[Probe, ...]] = {
+    "core": CORE_PROBES,
+    "capability": CAPABILITY_PROBES,
+}
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
 _THINK_OPEN = re.compile(r"<think>.*$", re.S | re.I)
@@ -226,11 +330,12 @@ async def benchmark_model(
     provider_class: type,
     model: Any,
     *,
+    probes: Sequence[Probe],
     timeout: int,
     retries: int,
 ) -> dict[str, Any]:
     results: list[ProbeResult] = []
-    for probe in PROBES:
+    for probe in probes:
         result = await run_probe(
             provider_class,
             model.name,
@@ -258,7 +363,7 @@ async def benchmark_model(
         "probes": [asdict(result) for result in results],
         "summary": {
             "passed": passed,
-            "probe_count": len(PROBES),
+            "probe_count": len(probes),
             "responses_received": response_count,
             "median_first_chunk_s": median_or_none(first_chunks),
             "median_completion_s": median_or_none(completions),
@@ -308,6 +413,7 @@ def markdown_report(payload: dict[str, Any]) -> str:
         f"- Started (UTC): `{payload['started_at_utc']}`",
         f"- Finished (UTC): `{payload['finished_at_utc']}`",
         f"- Models tested: **{len(rows)}**",
+        f"- Suite: **{payload['settings'].get('suite', 'unspecified')}**",
         f"- Per-model timeout: **{payload['settings']['timeout_s']} s**",
         f"- Retries per request: **{payload['settings']['retries']}**",
         f"- Concurrency: **{payload['settings']['concurrency']}**",
@@ -351,7 +457,7 @@ def markdown_report(payload: dict[str, Any]) -> str:
         lines.append("")
         for probe in item["probes"]:
             lines.append(
-                f"#### {probe['key']} — {probe['status']} "
+                f"#### {probe['key']} — {probe.get('label', probe['key'])} — {probe['status']} "
                 f"(first chunk {seconds(probe['first_chunk_s'])}; total {seconds(probe['elapsed_s'])})"
             )
             answer = probe.get("raw_response") or probe.get("response") or "(no streamed output)"
@@ -387,8 +493,9 @@ async def async_main(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
+    probes = SUITES[args.suite]
     print(
-        f"Benchmarking {len(selected)} model(s), {len(PROBES)} probe(s) each; "
+        f"Benchmarking {len(selected)} model(s), {len(probes)} {args.suite} probe(s) each; "
         f"concurrency={args.concurrency}, timeout={args.timeout}s, retries={args.retries}",
         flush=True,
     )
@@ -397,7 +504,9 @@ async def async_main(args: argparse.Namespace) -> int:
 
     async def guarded(model: Any) -> dict[str, Any]:
         async with semaphore:
-            return await benchmark_model(LLMChatProvider, model, timeout=args.timeout, retries=args.retries)
+            return await benchmark_model(
+                LLMChatProvider, model, probes=probes, timeout=args.timeout, retries=args.retries
+            )
 
     # as_completed prints live progress while preserving a complete JSON report.
     tasks = [asyncio.create_task(guarded(model)) for model in selected]
@@ -410,15 +519,16 @@ async def async_main(args: argparse.Namespace) -> int:
         "started_at_utc": started.isoformat(),
         "finished_at_utc": finished.isoformat(),
         "settings": {
+            "suite": args.suite,
             "timeout_s": args.timeout,
             "retries": args.retries,
             "concurrency": args.concurrency,
-            "probe_keys": [probe.key for probe in PROBES],
+            "probe_keys": [probe.key for probe in probes],
         },
         "models": results,
     }
     ranked = rank_models(results)
-    complete = [item for item in ranked if item["summary"]["passed"] == len(PROBES)]
+    complete = [item for item in ranked if item["summary"]["passed"] == len(probes)]
     fastest = min(
         complete or [item for item in ranked if item["summary"]["responses_received"]],
         key=lambda item: item["summary"]["median_first_chunk_s"] or float("inf"),
@@ -428,7 +538,7 @@ async def async_main(args: argparse.Namespace) -> int:
     print("\n=== Summary ===")
     if ranked:
         best = ranked[0]
-        print(f"Best probe score: {best['model']} ({best['summary']['passed']}/{len(PROBES)})")
+        print(f"Best probe score: {best['model']} ({best['summary']['passed']}/{len(probes)})")
     if fastest:
         print(
             f"Fastest first chunk: {fastest['model']} "
@@ -454,6 +564,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         help="comma-separated exact names or unique substrings; default tests every registered model",
+    )
+    parser.add_argument(
+        "--suite",
+        choices=sorted(SUITES),
+        default="capability",
+        help="question set to run: capability=7 varied probes, core=3 quick probes (default: capability)",
     )
     parser.add_argument("--timeout", type=int, default=75, help="per-request timeout in seconds (default: 75)")
     parser.add_argument("--retries", type=int, default=0, help="provider retries per probe (default: 0)")

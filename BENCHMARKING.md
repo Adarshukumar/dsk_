@@ -7,13 +7,25 @@ be reviewed and committed to Git history.
 
 ## What it measures
 
-Each registered model receives the same three short probes:
+By default, each registered model receives the same seven varied capability
+probes:
 
 1. **Instruction and first-token latency** — must return exactly
    `BENCHMARK_OK`.
-2. **Arithmetic reasoning** — must calculate the orange total and finish with
+2. **Arithmetic reasoning** — calculates the orange total and finishes with
    `ANSWER: 28`.
-3. **Structured output** — must return exactly the requested JSON object.
+3. **Structured output** — returns exactly the requested JSON object.
+4. **Reasoning trap / algebra** — solves the Rs.110 notebook-and-pen problem,
+   where a shallow answer is often wrong.
+5. **Python construction** — returns syntax-valid Python defining a requested
+   `clamp(value, lower, upper)` function. Generated code is parsed but never
+   executed.
+6. **Hinglish client reply** — makes a concise, friendly website-demo reply;
+   the heuristic score and captured answer make it easy to review tone.
+7. **Fact extraction** — extracts name, city, and a web-project requirement in
+   a strict one-line format.
+
+Use `--suite core` for the original three quickest probes only.
 
 For every probe, the tool records:
 
@@ -48,9 +60,10 @@ python3 -m pip install -r requirements.txt
 python3 benchmark_models.py --concurrency 1 --timeout 75 --retries 0
 ```
 
-`--concurrency 1` is recommended for a fair latency measurement. It makes
-three requests per registered model, one model at a time, and avoids creating
-artificial contention between free upstream endpoints.
+`--concurrency 1` is recommended for a fair latency measurement. The default
+capability suite makes seven requests per registered model (currently
+**168 requests** across all 24 models), one model at a time, and avoids
+creating artificial contention between free upstream endpoints.
 
 The command writes files such as:
 
