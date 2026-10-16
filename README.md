@@ -84,6 +84,8 @@ IGAgent.stop()
 - **Safety** — text→text only (media/reel/voice detected + skipped), never
   replies to itself or groups, backlog ignored (baseline on first poll),
   hourly/daily caps (20/100), working hours option, auto-stop on 429/403.
+- **Fast inbox checks** — checks the inbox every 500 ms without overlapping
+  requests; slow requests finish before the next check begins.
 
 ## Bridge API (curl-friendly)
 
@@ -111,5 +113,7 @@ send `{"id","type":"reply","messages":[...]}` → `{"id","ok":true,"text","model
 ## Risk note
 
 Uses Instagram's private GraphQL endpoints from your own logged-in session,
-mimicking the web app's own calls. Defaults are conservative (20 replies/hour,
-100/day, 60s thread cooldown, human-like jitter). Don't crank the caps.
+mimicking the web app's own calls. The inbox is checked every 500 ms; the
+reply limits remain conservative (20 replies/hour, 100/day, 60s thread
+cooldown). Frequent polling can trigger Instagram rate limits, which cause the
+bot to stop automatically on HTTP 429/403.

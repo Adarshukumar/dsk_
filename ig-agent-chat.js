@@ -21,7 +21,7 @@
        IGAgent.stop()  ·  .status() ·  .history('user') ·  .memory('user')
 
    WHAT IT DOES
-   · Polls the GraphQL inbox with human-like jitter, per-thread debounce
+   · Polls the GraphQL inbox on a fixed 0.5-second cadence, per-thread debounce
    · TRUE multi-thread: independent cooldown / retry queue / MEMORY per chat
    · Learns about each contact, stores profile in localStorage, injects it
      into every future reply
@@ -79,7 +79,9 @@
     TEMPERATURE: 0.9,
     LLM_TIMEOUT_MS: 120_000,
 
-    POLL_MIN_MS: 15_000,  POLL_MAX_MS: 30_000,
+    // Start one inbox check every 0.5 s. The loop never overlaps requests:
+    // if a request takes longer than this, the next check starts immediately after it finishes.
+    POLL_INTERVAL_MS: 500,
     DEBOUNCE_MIN_MS: 5_000, DEBOUNCE_MAX_MS: 12_000,
     DEBOUNCE_MAX_WAIT_MS: 35_000,
     THREAD_COOLDOWN_MS: 60_000,
@@ -577,6 +579,10 @@
 
   async function pollTick() {
     if (!S.running) return;
+    // Measure from the beginning of this poll so the normal cadence is one
+    // inbox request every 500 ms. Because the next timeout is armed only after
+    // await fetchInbox() settles, slow/network-stalled polls can never overlap.
+    const pollStartedAt = now();
     try {
       const threads = await fetchInbox();
       const baseline = !(S.startedPolls > 0);
@@ -621,7 +627,10 @@
       }
       log(C.warn, 'poll', 'non-fatal error:', e.message);
     }
-    if (S.running) S.timer = setTimeout(pollTick, rand(CFG.POLL_MIN_MS, CFG.POLL_MAX_MS));
+    if (S.running) {
+      const delay = Math.max(0, CFG.POLL_INTERVAL_MS - (now() - pollStartedAt));
+      S.timer = setTimeout(pollTick, delay);
+    }
   }
 
   /* ──────────────────────────── PUBLIC API ──────────────────────────── */
