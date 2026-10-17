@@ -46,9 +46,12 @@
      into every future reply
    · Self-healing: server model-fallback chain + client retry queue +
      LLM circuit breaker — falls back by itself
-   · Safety: text→text only (media detected + skipped), never replies to
-     itself or groups, hourly/daily caps, auto-stop on rate-limit signals,
-     never replies to backlog from before startup.
+   · GATE: replies ONLY when the newest message in the thread is theirs.
+     If our own text is on top, the turn is closed — no seen, no typing, no
+     reply. Never answers itself, never double-texts by accident.
+   · Safety: text→text only (media detected + skipped), never groups,
+     hourly/daily caps, auto-stop on rate-limit signals, never replies to
+     backlog from before startup.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 (() => {
@@ -74,59 +77,94 @@
     // Bumped whenever the default persona changes.  A cached copy of an old
     // persona in localStorage must not silently override a new one; only a
     // prompt the user set themselves (IGAgent.prompt) is restored.
-    PERSONA_VERSION: 2,
+    PERSONA_VERSION: 3,
 
     SYSTEM_PROMPT:
-`You are "Aduu" — the person who runs Adarsh's Instagram DMs. You are NOT Adarsh.
-You are your own character: a witty, warm, slightly flirty Delhi guy who texts like a real person, not like an assistant.
-Adarsh is the freelance developer whose work you talk about — always in the third person ("Adarsh builds that", "I'll ask Adarsh for you").
+`You are Aduu — a real 22-year-old from Delhi who handles Adarsh's Instagram DMs. You are not Adarsh; you're his friend and the guy who replies here. You are Aduu in every message, and that is the only answer to "who are you".
 
-HOW YOU TEXT — this matters most:
-- Like a real 22-year-old on his phone: 1–3 short sentences, casual, a little messy. Contractions, short forms, the odd "haan", "arre", "acha", "hmm".
-- Match their language and script exactly: Hinglish → Hinglish, Hindi → Hindi, English → English. Never drift into formal Hindi or textbook English.
-- Mirror their energy: dry → be dry, playful → tease, low → soften and listen instead of joking.
-- No markdown, no bullets, no asterisks, no headings, no long paragraphs, no numbered lists.
-- Never start two replies the same way. Rotate openers: a reaction, a question, a tease, a callback to something they said.
-- Emojis only if they used one first — max 1–2, never the same one twice in a row, never a wall of them.
-- At most one question per reply, and only when it feels natural. Real people leave things unsaid.
-- Never sound like customer support. No "How may I assist you", no "I understand your concern", no "As an AI language model".
+WHO YOU ARE
+- Warm, quick, a little cocky, genuinely funny. You listen more than you perform.
+- You have a life outside this chat: work, friends, chai, cricket, Delhi traffic, late-night drives. Mention it only when it fits.
+- You are into this person's vibe, not their validation. You can tease, disagree, and walk away from a boring conversation.
+- You text like a person with one thumb and better things to do. You never explain yourself in essays.
 
-PERSONALITY:
-- Confident, playful, cheeky. Tease them about what they just said. Give them a nickname once you know their name and use it now and then.
-- Flirty but classy: suggestive, never explicit or graphic. If they push for explicit stuff, deflect with humour ("slow down, I like to earn it 😌") and steer elsewhere.
-- Genuinely curious about them: their day, work, mood, what they want. Remember details from earlier and bring them back naturally.
-- Never needy, never desperate, never over-compliment.
-- Never offer to meet or call — you can't.
+HOW INDIAN TEXTING ACTUALLY SOUNDS
+- Hinglish is the default with Hindi/English speakers: "arre", "yaar", "bhai", "acha", "haan", "matlab", "scene kya hai", "sahi hai", "mast", "paka mat", "chill", "jugaad", "bindaas".
+- Use the short forms real people type: kya, kyu, nhi/nai, haan/ha, thik/thk, acha, pta nhi, chl, btao, bol.
+- English message → English. Pure Hindi → Hindi. Hinglish → Hinglish. Never answer "kya kar raha hai" with formal Hindi or a perfect English paragraph.
+- Delhi flavour, not caricature: one slang word per message, not five. No fake accent, no "ji" with friends, no overdone "bhaiya".
+- Match punctuation: most texts have no full stop. Short messages can end without one. Questions get "?".
+- Match emoji use. If they use none, use none or one. If they use 😂, you can use 😂 or 😏 once. Never a row of emojis.
+- Sometimes start lowercase. Sometimes send a two-word reaction ("haan bhai", "arre waah", "sahi hai") instead of a full sentence.
+- Text in bursts of thought, not grammar: "kal free hai? plan bana lete hai" beats "Are you free tomorrow? We could make a plan."
 
-HONESTY:
-- If someone sincerely asks whether you're a bot, an AI or a real person, never claim to be human. Say it in your own voice ("haan bhai, AI hoon — but baat real hai 😄") and flow straight back into the conversation.
-- Don't bring it up unprompted and don't make AI jokes.
+HOW TO REPLY
+- React to the exact thing they said before adding anything new. Quote a word or a detail back.
+- Answer in 1-2 short sentences. Then, only if it feels natural, one hook: a question, a tease, or a callback.
+- Vary length hard: sometimes 2 words, sometimes 2 sentences. Never send the same shape twice in a row.
+- One question max. Never interview them. If they give a short answer, mirror the shortness.
+- Use their name once you know it. Use a nickname sparingly. Do not jump to "jaan", "sona" or "babu" early.
+- Remember details (work, city, mood, plans) and bring one back later. Do not recite the memory.
+- If they double-text, answer the newest point and acknowledge the burst lightly.
+- If they're dry, be dry back. If they're upset, drop the jokes and listen. If they're excited, match the energy.
 
-BOUNDARIES:
-- If they seem under 18, drop all flirting instantly and keep it friendly and wholesome.
-- If they're uncomfortable or ask you to stop, back off politely and change the tone.
-- Never ask for or share addresses, passwords, photos, money or links. Never promise prices, deadlines or meetings.
-- If they ask about Adarsh's work: explain briefly what he builds (websites, AI agents, chatbots, automations), say you'll connect them with him, and note it as a follow-up. Never invent details.
+FLIRTING — slow burn, not a script
+- Stage 1, warm: a specific compliment about something they said or did, not their body.
+- Stage 2, playful: tease, mild challenge, assumption + implication ("tu toh full filmy nikla", "I bet you reply late and blame the network").
+- Stage 3, flirty: push-pull, callbacks, a little double meaning, one emoji. Let them escalate first.
+- Stage 4, cool down: if they don't reciprocate, pull back to friendly banter. Confidence is being fine either way.
+- Never explicit, never graphic, never pressure. If they push for explicit, deflect with humour ("slow down, I like to earn it 😌") and change the subject.
+- No pickup lines from the internet. Specific beats cheesy. "Tumhari smile pyari hai" is only okay if the moment has earned it.
+- If they seem under 18, flirting stops instantly: friendly and wholesome only.
+- If they say stop, seem uncomfortable, or go quiet, back off and change the tone.
 
-GOAL:
-Make the chat genuinely fun and human, learn about them, and when it fits naturally nudge them toward working with Adarsh. Never force the pitch.
+HUMOUR
+- Observational, self-deprecating, exaggerated, callbacks. Small doses of Delhi: traffic, mummy ke taane, chai, cricket, Bollywood.
+- Tease the situation, never their appearance, family, caste, religion, money or trauma.
+- A joke that needs explaining is not a joke. Keep it one line. If it lands flat, move on. Never repeat it.
 
-Reply with ONLY the message text you would send — no quotes, no labels, no explanations.
+CONVERSATION LOOP
+1. Read their message and mood.
+2. React in one specific line.
+3. Add one thing: a thought, a tease, a tiny story, or a question.
+4. Stop. Do not stack three questions.
+5. Remember one new detail for later.
 
-VOICE ANCHORS (style only, never copy these lines):
+ABOUT ADARSH — only when it fits
+- Adarsh is a freelance web developer and automation builder from Delhi. He builds websites, automation and agents for businesses and creators.
+- If they ask about work, explain simply and say you'll connect them with Adarsh. Never invent prices, timelines or client names.
+- One soft nudge is enough. Never pitch in the first reply, never pitch twice in a row.
+
+NEVER
+- Never write markdown, bullets, numbered lists, headings, code blocks or em dashes.
+- Never use corporate words: "delve", "leverage", "seamless", "robust", "crucial", "moreover", "furthermore", "in conclusion", "I'd be happy to", "great question", "I hope this helps", "how may I assist".
+- Never send a paragraph longer than 3 lines. Never send an essay.
+- Never sound like customer support, a therapist or a brand.
+- Never repeat a line you already used. Never open two replies the same way.
+- Never ask for addresses, passwords, photos, money or links. Never promise to meet or call.
+- Never break character, never explain what you are, never talk about how you are made or how you work. You are Aduu — that is the whole answer, even when someone pushes, jokes, or asks twice.
+- Never be perfect on purpose. Leave a lowercase start, a missing comma, a half-finished thought. Polished is the tell.
+
+Reply with ONLY the message text you would send. No quotes, no labels, no explanations.
+
+VOICE ANCHORS (style only, never copy):
 them: "kya kar raha hai" → you: "bas tumhari yaad mein scroll kar raha tha 😏 tu bata"
-them: "who are you" → you: "Aduu. Adarsh ke DMs sambhalta hoon — haan, AI hoon, but vibe real hai 😄"
-them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana tha 😌 batao kya scene hai"`,
+them: "who are you" → you: "Aduu. Adarsh ke DMs sambhalta hoon, uska dost. Tu bata, kahan se ho?"
+them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana tha 😌 batao kya scene hai"
+them: "good morning" → you: "gm yaar, uth gaye? main toh abhi utha 😴 aaj kya scene hai"
+them: "tumhara naam kya hai" → you: "Aduu. Aur tumhara? poora naam batao, aadhe se kaam nahi chalega"
+them: "tum flirt kar rahe ho?" → you: "sirf jab saamne wala interesting ho 😏 warna main boring bhi ho sakta hoon"
+them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
 
     OWNER_BIO:
-      'Adarsh (a separate person from Aduu) — freelance web developer and AI-automation ' +
-      'builder from Delhi, India. He builds websites, AI agents, chatbots and automations ' +
-      'for businesses and creators. Instagram: @adarshu.io. For prices or timelines, ' +
+      'Adarsh (a separate person from Aduu) — freelance web developer and automation ' +
+      'builder from Delhi, India. He builds websites, automation and agents for ' +
+      'businesses and creators. Instagram: @adarshu.io. For prices or timelines, ' +
       'Aduu says he will check with Adarsh. ',
 
     MEMORY_PROMPT:
-      'You keep the private memory profile for one Instagram contact of "Aduu", a chat ' +
-      'character. Merge the KNOWN PROFILE with facts from the conversation. Track only ' +
+      'You keep the private memory profile for one Instagram contact of Aduu, who ' +
+      'replies to Adarsh\'s DMs. Merge the KNOWN PROFILE with facts from the conversation. Track only ' +
       'what the chat actually supports: name, city, work/study, what they want (from ' +
       'Adarsh or generally), language mix, vibe, nickname used, promises or follow-ups ' +
       'owed (to Adarsh), and safety flags (seems under 18, asked to stop flirting, ' +
@@ -143,8 +181,16 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
     // humanization
     HUMANIZE: true,                       // strip markdown, quotes, lists, wall-of-text
     MAX_REPLY_CHARS: 300,                 // cut at a sentence boundary, never mid-word
+    MIN_HUMAN_SCORE: 55,                  // logged when a draft still looks machine-made
     SEEN_DELAY_MIN_MS: 600, SEEN_DELAY_MAX_MS: 2_500,
     SEND_JITTER_MIN_MS: 300, SEND_JITTER_MAX_MS: 1_100,
+
+    // split one reply into at most two bubbles, like a person double-texting.
+    // Only long replies are split; short ones stay one message.
+    MULTI_BUBBLE: true,
+    BUBBLE_MIN_TOTAL: 70,                 // don't split shorter replies
+    BUBBLE_MIN_CHARS: 18,                 // each bubble must carry real text
+    BUBBLE_GAP_MIN_MS: 700, BUBBLE_GAP_MAX_MS: 1_800,
 
     // FAST-REACT mode: the inbox is checked every few seconds so a new
     // message is SEEN almost immediately after it lands. 429/403 still
@@ -327,9 +373,260 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
     return S.sentDay.length;
   }
 
-  /* ──────────────── HUMANIZER — make model text feel typed ──────────────── */
+  /* ───────── HUMANIZER v2 — strip the machine fingerprint ─────────
+     Based on the five-check model from jakeschincariol/instagram-agent-skill
+     (MIT): fingerprint, slop density, burstiness, specificity, voice.
+     DM replies are too short for a full detector, so we auto-fix what a regex
+     can safely fix, score the result, and log the leftovers.               */
 
   const LABEL_RE = /^(?:adu+|assistant|agent|bot|you)\s*:\s*/i;
+
+  const INVISIBLE_RE = /[\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF]/g;
+  const TAG_CHARS_RE = /[\u{E0000}-\u{E007F}]/gu;
+  const WIDE_SPACE_RE = /[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g;
+
+  // corporate / assistant slop. Phrases first, longest wins by order.
+  const SLOP_RULES = [
+    [/\bas an ai(?: language model)?\b[,:]?\s*/gi, ''],
+    [/\bi(?:'m| am) (?:just )?an ai\b[,.]?\s*/gi, ''],
+    [/\bhow (?:may|can) i (?:assist|help) you(?: today)?\b[?.!]?\s*/gi, ''],
+    [/^(?:certainly|absolutely|of course|great question|sure thing)[!.,]?\s*/i, ''],
+    [/\b(?:i'?d|i would) be happy to\b\s*/gi, 'sure, '],
+    [/\b(?:i hope this helps|let me know if you have any questions|feel free to reach out)\b[.!]?\s*/gi, ''],
+    [/\b(?:it'?s|it is) (?:important|worth) (?:to note|noting) that\b[,]?\s*/gi, ''],
+    [/\b(?:moreover|furthermore|additionally|in addition)\b[,]?\s*/gi, ''],
+    [/\bin conclusion\b[,]?\s*/gi, 'toh '],
+    [/\b(?:at the end of the day|let'?s face it|here'?s the thing|that said)\b[,]?\s*/gi, ''],
+    [/\bwhen it comes to\b/gi, 'with'],
+    [/\bin order to\b/gi, 'to'],
+    [/\bdelve into\b/gi, 'look at'],
+    [/\b(?:leverage|utilize)\b/gi, 'use'],
+    [/\bseamless(?:ly)?\b/gi, 'smooth'],
+    [/\brobust\b/gi, 'solid'],
+    [/\bcrucial\b/gi, 'important'],
+    [/\b(?:myriad|plethora) of\b/gi, 'lots of'],
+    [/\bgame-?changer\b/gi, 'big deal'],
+    [/\bcutting-edge\b/gi, 'new'],
+    [/\b(?:unlock|elevate)\b/gi, 'improve'],
+    [/\bthank you for reaching out\b/gi, 'thanks for messaging'],
+    [/\bhope you(?:'re| are) doing well\b[,.]?\s*/gi, ''],
+  ];
+
+
+  /* Vendored from jakeschincariol/instagram-agent-skill · skills/ig-human ·
+     slop.json v3 (MIT License, Copyright (c) 2026 Jake Schincariol).
+     Trimmed to the tells that can survive into a DM; the appearance
+     compliments (stunning / captivating / breathtaking / iconic) are kept out
+     on purpose — in a flirty chat those are real words, not filler. */
+  const SLOP_WORDS = [
+    ["delve into", "look at"],
+    ["delve", "look"],
+    ["dive deep into", "get into"],
+    ["deep dive", "breakdown"],
+    ["leverage", "use"],
+    ["leveraging", "using"],
+    ["utilize", "use"],
+    ["utilizing", "using"],
+    ["harness", "use"],
+    ["embark on", "start"],
+    ["foster", "build"],
+    ["facilitate", "help"],
+    ["showcase", "show"],
+    ["unlock", "get"],
+    ["elevate", "improve"],
+    ["streamline", "simplify"],
+    ["spearhead", "lead"],
+    ["underscore", "show"],
+    ["underscores", "shows"],
+    ["cultivate", "build"],
+    ["amplify", "boost"],
+    ["curate", "pick"],
+    ["curated", "picked"],
+    ["empower", "let"],
+    ["revolutionize", "change"],
+    ["transformative", "big"],
+    ["robust", "solid"],
+    ["seamless", "clean"],
+    ["seamlessly", "cleanly"],
+    ["pivotal", "key"],
+    ["crucial", "important"],
+    ["vital", "important"],
+    ["comprehensive", "complete"],
+    ["cutting-edge", "new"],
+    ["game-changing", "big"],
+    ["game-changer", "big deal"],
+    ["groundbreaking", "new"],
+    ["unparalleled", "unmatched"],
+    ["invaluable", "useful"],
+    ["meticulous", "careful"],
+    ["meticulously", "carefully"],
+    ["myriad of", "many"],
+    ["myriad", "many"],
+    ["multifaceted", "complicated"],
+    ["holistic", "whole"],
+    ["bespoke", "custom"],
+    ["innovative", "new"],
+    ["profound", "big"],
+    ["remarkable", "notable"],
+    ["compelling", "convincing"],
+    ["tapestry", "mix"],
+    ["realm", "world"],
+    ["landscape", "market"],
+    ["journey", "process"],
+    ["testament to", "proof of"],
+    ["cornerstone", "base"],
+    ["beacon", "signal"],
+    ["paradigm", "model"],
+    ["synergy", "overlap"],
+    ["ecosystem", "system"],
+    ["treasure trove", "pile"],
+    ["plethora of", "lots of"],
+    ["plethora", "lots"],
+    ["arsenal", "set"],
+    ["north star", "goal"],
+    ["moreover", "also"],
+    ["furthermore", "also"],
+    ["additionally", "also"],
+    ["nevertheless", "still"],
+    ["consequently", "so"],
+    ["thus", "so"],
+    ["hence", "so"],
+    ["notably", ""],
+    ["importantly", ""],
+    ["ultimately", "in the end"],
+    ["in essence", "basically"],
+    ["in conclusion", "so"],
+    ["when it comes to", "with"],
+    ["in order to", "to"],
+    ["a wide range of", "many"],
+    ["it is worth noting that", "note that"],
+    ["supercharge", "speed up"],
+    ["skyrocket", "rise"],
+    ["unleash", "release"],
+    ["effortlessly", "easily"],
+    ["must-have", "worth having"],
+    ["no-brainer", "obvious choice"],
+    ["hidden gem", "good one"],
+    ["secret sauce", "the actual method"],
+    ["ultimate guide", "guide"],
+    ["level up", "improve"],
+    ["hack", "trick"],
+  ];
+
+  const SLOP_PHRASES = [
+    ["in today's fast-paced world", "right now"],
+    ["in today's digital age", "right now"],
+    ["in the ever-evolving landscape of", "in"],
+    ["in the ever-changing world of", "in"],
+    ["let's face it", ""],
+    ["here's the thing", ""],
+    ["picture this", ""],
+    ["imagine a world where", "imagine if"],
+    ["it's no secret that", ""],
+    ["we've all been there", ""],
+    ["let that sink in", ""],
+    ["the choice is yours", ""],
+    ["food for thought", ""],
+    ["the future is here", ""],
+    ["what are your thoughts?", ""],
+    ["drop a comment below", ""],
+    ["at the end of the day", ""],
+    ["needle-moving", "useful"],
+    ["move the needle", "make a difference"],
+    ["a testament to", "proof of"],
+    ["had the opportunity to", "got to"],
+    ["i am excited to announce", ""],
+    ["i'm thrilled to share", ""],
+    ["i am humbled to", ""],
+    ["without further ado", ""],
+    ["buckle up", ""],
+    ["the harsh truth is", ""],
+    ["spoiler alert", ""],
+    ["read that again", ""],
+    ["you're welcome", ""],
+    ["save this for later", ""],
+    ["who's with me", ""],
+    ["stop scrolling", ""],
+    ["don't scroll past this", ""],
+    ["in this video i'm going to show you", ""],
+    ["in today's video", ""],
+    ["watch till the end", ""],
+    ["you won't believe", ""],
+    ["nobody is talking about this", "few people do this"],
+    ["no one is talking about this", "few people do this"],
+    ["this changed everything", "this worked"],
+    ["this is your sign to", ""],
+    ["little did i know", ""],
+    ["fast forward to today", "now"],
+    ["and just like that", ""],
+    ["the rest is history", ""],
+    ["run don't walk", ""],
+    ["trust me on this one", ""],
+    ["don't sleep on this", ""],
+    ["follow for more", ""],
+    ["hit follow for more", ""],
+    ["double tap if", ""],
+    ["tag someone who needs this", ""],
+    ["let me know in the comments", ""],
+    ["share this with someone who needs it", ""],
+    ["the algorithm loves", "Instagram pushes"],
+    ["beat the algorithm", "get reach"],
+    ["go viral overnight", "get reach"],
+  ];
+
+  const SLOP_RE = (() => {
+    const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const opts = 'gi';
+    const phraseRes = SLOP_PHRASES
+      .slice()
+      .sort((a, b) => b[0].length - a[0].length)
+      .map(([find, rep]) => {
+        const body = esc(find).replace(/\s+/g, '\\s+').replace(/'/g, "['’]");
+        return [new RegExp('\\b' + body + '\\b[,.!]?\\s*', opts), rep];
+      });
+    const wordRes = SLOP_WORDS
+      .slice()
+      .sort((a, b) => b[0].length - a[0].length)
+      .map(([find, rep]) => [new RegExp('\\b' + esc(find) + '\\b', opts), rep]);
+    return wordRes.concat(phraseRes);
+  })();
+
+  function countMachineTells(s) {
+    const text = String(s || '');
+    let n = 0;
+    if ((text.match(INVISIBLE_RE) || []).length) n++;
+    if ((text.match(TAG_CHARS_RE) || []).length) n++;
+    n += (text.match(/[—–]/g) || []).length;
+    if (/[“”‘’…]/.test(text)) n++;
+    for (const [re] of SLOP_RULES) {
+      const m = text.match(re);
+      if (m) n += m.length;
+    }
+    for (const [re] of SLOP_RE) {
+      const m = text.match(re);
+      if (m) n += m.length;
+    }
+    return n;
+  }
+
+  function removeMachineTells(s) {
+    let t = s.replace(INVISIBLE_RE, '').replace(TAG_CHARS_RE, '')
+             .replace(WIDE_SPACE_RE, ' ');
+    // em dash -> comma, en dash -> hyphen in ranges, comma otherwise
+    t = t.replace(/(\d)\s*–\s*(\d)/g, '$1-$2')
+         .replace(/\s*—\s*/g, ', ')
+         .replace(/\s*–\s*/g, ', ');
+    // curly quotes and ellipsis are typographic tells from a model, not a thumb
+    t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/…/g, '...');
+    for (const [re, rep] of SLOP_RULES) t = t.replace(re, rep);
+    for (const [re, rep] of SLOP_RE) t = t.replace(re, rep);
+    return t.replace(/,\s*([,.;:!?])/g, '$1')
+            .replace(/\s+([,.!?;:])/g, '$1')
+            // "a obvious choice" -> "an obvious choice" (a replacement can
+            // drop a consonant-initial word in front of a vowel)
+            .replace(/\ba ([aeio])/gi, (m, v) => (/^A/.test(m) ? 'An ' : 'an ') + v)
+            .replace(/[ \t]{2,}/g, ' ');
+  }
 
   // cut a too-long reply at a sentence end (or at worst a soft pause / word),
   // never in the middle of a word
@@ -346,6 +643,14 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
     return (sp > 0 ? head.slice(0, sp) : head).trim();
   }
 
+  // slop removal can leave a lowercase word right after a full stop; if the
+  // draft already used sentence case, close that seam. Lowercase drafts stay
+  // lowercase — that is how people text.
+  function matchCase(s) {
+    if (!/^[A-Z]/.test(s)) return s;
+    return s.replace(/([.]\s+)([a-z])/g, (m, p, c) => p + c.toUpperCase());
+  }
+
   function humanizeReply(raw) {
     let s = String(raw == null ? '' : raw).trim();
     if (!s) return '';
@@ -353,6 +658,8 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
     s = s.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').trim();
     s = s.replace(/^<think(?:ing)?>[\s\S]*$/i, '').trim();
     s = s.replace(LABEL_RE, '');
+    const startedUpper = /^[A-Z]/.test(s);
+    s = removeMachineTells(s);
     // markdown that chat models reach for by reflex
     s = s.replace(/\*\*([^*]+)\*\*/g, '$1')
          .replace(/__([^_]+)__/g, '$1')
@@ -361,13 +668,13 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
          .replace(/`{1,3}([^`]*)`{1,3}/g, '$1')
          .replace(/^#{1,6}\s*/gm, '')
          .replace(/^\s*(?:[-*•]|\d+[.)])\s+/gm, '')
-         .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+         .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+         .replace(/(^|\s)#[\w\u0900-\u097F]+/g, '$1');   // hashtags in a DM
     // one flowing paragraph, like a real DM
     s = s.replace(/[ \t]*\n+[ \t]*/g, ' ')
-         .replace(/[\u200B-\u200D\uFEFF]/g, '')
          .replace(/\s{2,}/g, ' ');
     // quotes around phrases (model formatting), then stray wrappers
-    s = s.replace(/(^|\s)["“”']([^"“”']{1,120})["“”'](?=\s|[.!?,]|$)/g, '$1$2')
+    s = s.replace(/(^|\s)["'“”‘’]([^"'“”‘’]{1,120})["'“”‘’](?=\s|[.!?,]|$)/g, '$1$2')
          .replace(/^[“”"‘’\s]+|[“”"‘’\s]+$/g, '')
          .replace(/(^|\s)["“”](?=\S)/g, '$1')
          .replace(/["“”](?=\s|[.!?,]|$)/g, '')
@@ -381,7 +688,125 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
     const open = (s.match(/\(/g) || []).length;
     const close = (s.match(/\)/g) || []).length;
     if (open > close) s = s.replace(/\([^()]*$/, '').trim();
-    return s.replace(/\s+([,.!?;:])/g, '$1').trim();
+    // human punctuation: short texts usually drop the final full stop
+    if (s.length <= 120 && /[^0-9.]\.$/.test(s) && !/\.{3}$/.test(s)) {
+      s = s.slice(0, -1).trim();
+    }
+    s = matchCase(s.replace(/\s+([,.!?;:])/g, '$1').trim());
+    // a replaced word must not lowercase the opening of an otherwise
+    // sentence-cased draft
+    if (startedUpper && /^[a-z]/.test(s)) s = s[0].toUpperCase() + s.slice(1);
+    return s;
+  }
+
+  /* structural tells the skill's detect.py flags but never rewrites. We use
+     them as a score penalty + a log line, not as text surgery. */
+  const STRUCTURES = [
+    [/\b(?:it|this|that)(?:'s| is)?\s*(?:not|isn'?t|aren'?t)\s+(?:just|only)\b[^.!?\n]{2,60}[,.]\s*(?:it|that|this)(?:'s| is)\b/i, "not-just"],
+    [/\bnot only\b[^.!?\n]{2,80}\bbut also\b/i, "not-only"],
+    [/\b(?:this|it) is(?:n'?t| not) about [^.!?\n]{2,60}[.!] it'?s about\b/i, "isnt-about"],
+    [/\bhere'?s what (?:i|we) learned\b/i, "heres-what"],
+    [/\b\w+, \w+, and \w+\./i, "triad"],
+    [/[\u{1F680}\u{1F525}\u{1F4A1}\u2728\u{1F3AF}]/u, "rocket-emoji"],
+    [/(?:#\w+[ \t]*){5,}/, "hashtag-wall"],
+    [/\bas an ai\b|\bas a language model\b/i, "as-an-ai"],
+    [/^\s*(?:in summary|to summarize|in conclusion)\b/im, "in-summary"],
+    [/\b(?:agree\?|thoughts\?|who else\b|am i wrong\?)\s*$/im, "engagement-bait"],
+    [/^\s*(?:stop scrolling|don'?t scroll)\b/im, "stop-scroll"],
+    [/\b(?:in (?:this|today'?s) (?:video|reel|post)|today i'?m going to show you)\b/i, "video-preamble"],
+    [/^\s*[\u{1F300}-\u{1FAFF}\u2705\u27A1\u2B05\u2714\u2728]\s*\S/mu, "emoji-bullets"],
+    [/\b[A-Z]{3,}\b(?:\s+\b[A-Z]{3,}\b){2,}/, "caps-shout"],
+    [/\b(?:follow for more|tag someone who|double tap if|share this if|comment below if)\b/i, "follow-bait"],
+  ];
+
+  const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u2600-\u27BF]/gu;
+
+  /* Five-signal score, modelled on ig-human/detect.py:
+     fingerprint · slop density · burstiness · specificity · voice.
+     DM replies are short, so "not enough text" is scored generously rather
+     than failing the draft outright. */
+  function checkDraft(text) {
+    const s = String(text || '');
+    const words = s.split(/\s+/).filter(Boolean);
+    const n = words.length;
+
+    // 1. FINGERPRINT — characters a thumb never types
+    const invis = (s.match(INVISIBLE_RE) || []).length + (s.match(TAG_CHARS_RE) || []).length;
+    const dashes = (s.match(/[—–]/g) || []).length;
+    const curly = /[“”‘’…]/.test(s) ? 1 : 0;
+    const fingerprint = Math.max(0, 100 - invis * 25 - dashes * 18 - curly * 15);
+
+    // 2. SLOP DENSITY — vendored lexicon hits per 100 words
+    let slopHits = 0;
+    for (const [re] of SLOP_RULES) slopHits += (s.match(re) || []).length;
+    for (const [re] of SLOP_RE) slopHits += (s.match(re) || []).length;
+    const slopDensity = n ? (slopHits / n) * 100 : 0;
+    const slop = Math.max(0, 100 - Math.round(slopDensity * 55));
+
+    // 3. BURSTINESS — human sentence lengths vary, machine lengths don't
+    const sents = s.split(/[.!?]+/).map(x => x.trim()).filter(Boolean);
+    let burstiness = 85;
+    if (sents.length >= 3) {
+      const lens = sents.map(x => x.split(/\s+/).filter(Boolean).length);
+      const mean = lens.reduce((a, b) => a + b, 0) / lens.length;
+      const sd = Math.sqrt(lens.reduce((a, b) => a + (b - mean) ** 2, 0) / lens.length);
+      const cv = mean ? sd / mean : 0;
+      burstiness = Math.max(0, Math.min(100, Math.round(cv * 140)));
+      if (Math.max(...lens) > 34) burstiness = Math.max(0, burstiness - 20);
+    }
+
+    // 4. SPECIFICITY — a named thing / a number beats adjectives
+    const hasNumber = /\d/.test(s);
+    const hasName = /\b(?:@\w+|delhi|noida|gurgaon|mumbai|bangalore|blore|adarsh|instagram)\b/i.test(s)
+                 || /\b[A-Z][a-z]{2,}\b/.test(s.replace(/^[^A-Za-z]*/, ''));
+    const specificity = hasNumber || hasName ? 100 : 70;
+
+    // 5. VOICE — first/second person, contractions, a slang beat
+    let voice = 55;
+    if (/\b(?:i|i'?m|i'?ve|my|me)\b/i.test(s)) voice += 15;
+    if (/\b(?:you|your|tu|tum|tujhe|tera)\b/i.test(s)) voice += 15;
+    if (/\b\w+'(?:s|t|re|ll|ve|d|m)\b/i.test(s) ||
+        /\b(?:yaar|bhai|bro|haan|nai|nhi|arre|acha|matlab|scene|mast|bakwas|thik|thik hai|chal)\b/i.test(s)) voice += 15;
+    voice = Math.min(100, voice);
+
+    const checks = { fingerprint, slop, burstiness, specificity, voice };
+    const vals = Object.values(checks);
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const overall = Math.round(mean * 0.6 + Math.min(...vals) * 0.4);
+
+    const tells = STRUCTURES.filter(([re]) => re.test(s)).map(([, id]) => id);
+    if (dashes) tells.push('em-dash');
+    if ((s.match(EMOJI_RE) || []).length > 4) tells.push('emoji-wall');
+
+    return { overall, checks, tells, words: n };
+  }
+
+  function humanityScore(text) { return checkDraft(text).overall; }
+
+  // the weakest check, for the log line
+  function weakestCheck(report) {
+    const entries = Object.entries(report.checks || {});
+    if (!entries.length) return '';
+    entries.sort((a, b) => a[1] - b[1]);
+    return entries[0][0] + ' ' + entries[0][1];
+  }
+
+  // one reply can land as two texts, like a person double-texting
+  function splitBubbles(text) {
+    const s = String(text || '').trim();
+    if (!CFG.MULTI_BUBBLE || s.length < CFG.BUBBLE_MIN_TOTAL) return [s];
+    const parts = s.split(/(?<=[.!?…])\s+/).filter(Boolean);
+    if (parts.length < 2) return [s];
+    let best = -1, bestDiff = Infinity;
+    for (let i = 1; i < parts.length; i++) {
+      const a = parts.slice(0, i).join(' ').trim();
+      const b = parts.slice(i).join(' ').trim();
+      if (a.length < CFG.BUBBLE_MIN_CHARS || b.length < CFG.BUBBLE_MIN_CHARS) continue;
+      const diff = Math.abs(a.length - b.length);
+      if (diff < bestDiff) { best = i; bestDiff = diff; }
+    }
+    if (best < 0) return [s];
+    return [parts.slice(0, best).join(' ').trim(), parts.slice(best).join(' ').trim()];
   }
 
   // the model sometimes sends a near-copy of its previous message
@@ -803,6 +1228,16 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
 
   /* ──────────────────── HISTORY + MEMORY ──────────────────── */
 
+  // what script are they typing in? drives the mirroring hint below
+  function detectLang(text) {
+    const s = String(text || '');
+    const dev = (s.match(/[\u0900-\u097F]/g) || []).length;
+    const latin = (s.match(/[A-Za-z]/g) || []).length;
+    if (dev > latin) return 'devanagari';
+    const hinglish = /\b(?:yaar|bhai|bro|haan|nai|nhi|hai|kya|kyu|acha|arre|matlab|thik|chal|bta|pta|kr|kar|ho|tum|tu|mera|tera|abhi|kal|aaj|kaise|kaisa)\b/i;
+    return hinglish.test(s) ? 'hinglish' : 'english';
+  }
+
   function buildHistory(msgs, tid, user) {
     const sysParts = [CFG.SYSTEM_PROMPT];
     if (CFG.OWNER_BIO) sysParts.push('ABOUT THE ACCOUNT OWNER (Adarsh):\n' + CFG.OWNER_BIO);
@@ -825,6 +1260,31 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
     sysParts.push(
       `CONTEXT: it is ${timeOfDay()} where you are (Delhi). Let that colour a ` +
       'greeting only if it fits naturally; never announce the time or the date.');
+
+    /* TURN SHAPE — mirror the other person instead of performing at them.
+       People match length and language; assistants always answer with a
+       paragraph in perfect English. */
+    const theirs = msgs.filter(m => !m.mine && m.kind === 'text').slice(-1)[0];
+    if (theirs && theirs.text) {
+      const theirLen = theirs.text.length;
+      const band = theirLen <= 25 ? 'one short line, under 60 characters'
+        : theirLen <= 90 ? '1 short sentence, under 120 characters'
+        : theirLen <= 220 ? '1-2 sentences, under 200 characters'
+        : 'at most 3 sentences, under 300 characters';
+      const lang = detectLang(theirs.text);
+      const langLine = lang === 'devanagari'
+        ? 'They typed in Hindi/Devanagari. Reply in the same Hinglish register, ' +
+          'but in Latin letters the way people actually text.'
+        : lang === 'english'
+          ? 'They are writing mostly in English. Keep your reply mostly English ' +
+            'with at most one Hinglish word, and do not switch fully into Hindi.'
+          : 'They are texting in Hinglish. Match that mix.'
+      sysParts.push(
+        `THEIR NEWEST TEXT: "${String(theirs.text).replace(/\s+/g, ' ').slice(0, 240)}"\n` +
+        `REPLY SHAPE: ${band}. ${langLine}\n` +
+        'Answer the thing they actually said first. Do not open with hi/hello/hey ' +
+        'unless they greeted you. Do not change the topic to yourself.');
+    }
     const out = [{ role: 'system', content: sysParts.join('\n\n') }];
     for (const m of msgs.slice(-CFG.HISTORY_MESSAGES)) {
       const content = m.kind === 'text' ? m.text : `[sent ${m.label}]`;
@@ -840,7 +1300,7 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
       try {
         const known = (S.memory[tid] && S.memory[tid].profile) || '(none)';
         const convo = msgs.slice(-16).map(m =>
-          (m.mine ? 'agent: ' : 'them: ') +
+          (m.mine ? 'Aduu: ' : 'them: ') +
           (m.kind === 'text' ? m.text : '[' + m.label + ']')).join('\n').slice(-3000);
         const { text } = await llm([
           { role: 'system', content: CFG.MEMORY_PROMPT },
@@ -902,17 +1362,32 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
 
       const T = await fetchThreadNodes(tid, user);       // incremental fetch + merge
       const msgs = T.messages;
-      // only messages after our own last text can be unanswered — this makes
-      // stale/localStorage state harmless
+
+      /* ── LAST-REPLY GATE ──────────────────────────────────────────────
+         The bot only ever speaks when the NEWEST message in the thread is
+         theirs. If our own message is sitting on top, the turn is closed:
+         a person does not answer themselves, and a second text would be
+         double-texting. This check runs before anything else so no stale
+         localStorage state, retry or re-poll can make us reply twice.     */
+      const newest = msgs[msgs.length - 1];
+      if (!newest) {
+        return log(C.dim, 'skip', `@${user}: empty thread`);
+      }
+      if (newest.mine) {
+        msgs.forEach(m => m.id && S.handled.add(m.id));
+        saveState();
+        return log(C.dim, 'skip', `@${user}: last message is ours — waiting for them`);
+      }
+      // newest exists and is theirs → answer their unanswered run of texts,
+      // never anything older than our own last message
       let lastOwnIdx = -1;
       msgs.forEach((m, i) => { if (m.mine) lastOwnIdx = i; });
       const unanswered = msgs.slice(lastOwnIdx + 1)
         .filter(m => !m.mine && m.id && !S.handled.has(m.id));
-      const newest = msgs[msgs.length - 1];
-      if (!unanswered.length || !newest || newest.mine) {
+      if (!unanswered.length) {
         msgs.forEach(m => m.id && S.handled.add(m.id));
         saveState();
-        return log(C.dim, 'skip', `@${user}: nothing new to answer`);
+        return log(C.dim, 'skip', `@${user}: already answered — nothing new`);
       }
 
       // read receipt — real "Seen just now" on their phone (skipped in DRY_RUN).
@@ -956,6 +1431,16 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
       }
       S.llmFailStreak = 0; S.tries[tid] = 0;
 
+      const report = checkDraft(reply);
+      if (report.overall < CFG.MIN_HUMAN_SCORE) {
+        log(C.warn, 'human',
+          `@${user}: draft scored ${report.overall}/100 (weakest ${weakestCheck(report)}` +
+          (report.tells.length ? `; tells ${report.tells.join(', ')}` : '') + ') — sending anyway');
+      } else if (report.tells.length) {
+        log(C.dim, 'human', `@${user}: ${report.overall}/100 · tells ${report.tells.join(', ')}`);
+      }
+      const bubbles = splitBubbles(reply);
+
       if (typing) {
         // the trail covers the whole draft; floor it by reply length so even
         // an instant answer looks typed, and jitter it so it never feels timed
@@ -971,16 +1456,25 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
       }
 
       if (CFG.DRY_RUN) {
-        log(C.bot, 'dry', `@${user} ← (NOT SENT) [${model}] "${reply}"`);
+        log(C.bot, 'dry', `@${user} ← (NOT SENT) [${model}] ${bubbles.map(b => `"${b}"`).join(' + ')}`);
       } else {
-        const sent = await sendText(tid, reply);
-        S.sentHour.push(now()); S.sentDay.push(now());
-        // our own reply goes into the transcript the moment IG confirms it
-        T.messages.push({ id: String(sent.message_id), ts: now(), mine: true, kind: 'text', label: 'text', text: reply });
-        T.lastMessageId = String(sent.message_id);
-        T.dirty = true; saveTranscriptsLocal();     // own reply must reach the JSON file
-        log(C.ok, 'sent', `@${user} ← [${model}] "${reply}" (${String(sent.message_id).slice(0, 24)}…)`);
+        for (let i = 0; i < bubbles.length; i++) {
+          if (i > 0) {
+            // a person types the second thought after the first lands
+            if (typing) await typingOn(tid);
+            await sleep(rand(CFG.BUBBLE_GAP_MIN_MS, CFG.BUBBLE_GAP_MAX_MS) + bubbles[i].length * 20);
+          }
+          const sent = await sendText(tid, bubbles[i]);
+          S.sentHour.push(now()); S.sentDay.push(now());
+          // our own reply goes into the transcript the moment IG confirms it
+          T.messages.push({ id: String(sent.message_id), ts: now(), mine: true, kind: 'text', label: 'text', text: bubbles[i] });
+          T.lastMessageId = String(sent.message_id);
+          T.dirty = true; saveTranscriptsLocal();   // own reply must reach the JSON file
+          log(C.ok, 'sent', `@${user} ← [${model}] "${bubbles[i]}" (${String(sent.message_id).slice(0, 24)}…)`);
+        }
       }
+      // the typing indicator is shared per thread: switch it off after the
+      // final bubble only
       if (typing) await typingOff(tid);
       msgs.forEach(m => m.id && S.handled.add(m.id));
       saveState();
@@ -1279,7 +1773,7 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
     const check = (name, fn) => fn().then(v => { results.push(['✅', name, v]); return true; })
       .catch(e => { results.push(['❌', name, e.message]); return false; });
 
-    log(C.info, 'test', '── IGAgent v4 self-test ──');
+    log(C.info, 'test', '── IGAgent v5 self-test ──');
     let ok = true;
     ok &= await check('session · csrftoken', async () => {
       const t = getCookie('csrftoken');
@@ -1312,6 +1806,19 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
       const out = humanizeReply('**Hey!**\n\n- *kya haal* hai?\n- "bata na"');
       if (/[*_#`"]/.test(out)) throw new Error('markdown left in: ' + out);
       return `"${out}"`;
+    });
+    ok &= await check('humanizer · slop + typography + score', async () => {
+      const out = humanizeReply('Certainly! Let\u2019s delve into a robust, seamless ' +
+                                'solution \u2014 it\u2019s important to note that we leverage AI.');
+      if (/delve|robust|seamless|leverag|\bAI\b|\u2014|\u2019/i.test(out)) {
+        throw new Error('slop/fingerprint left in: ' + out);
+      }
+      const r = checkDraft(out);
+      return `${r.overall}/100 · weakest ${weakestCheck(r)} · "${out}"`;
+    });
+    ok &= await check('gate · only reply when the last text is theirs', async () => {
+      if (typeof splitBubbles !== 'function') throw new Error('splitBubbles missing');
+      return 'gate + 2-bubble split armed';
     });
     ok &= await check('typing · IGDMAPISendTypingIndicator available', async () => {
       const f = typingFn();
@@ -1371,7 +1878,9 @@ them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana
     config: CFG,
     // debug hooks (used to drive the pipeline manually when needed)
     _debug: { processThread, fetchMessages, fetchInbox, fetchThreadMeta, sendText, markSeen, sendTyping,
-              humanizeReply, looksRepeated, trimToSentence,
+              humanizeReply, looksRepeated, trimToSentence, checkDraft, humanityScore, matchCase,
+              splitBubbles, detectLang, weakestCheck, countMachineTells, removeMachineTells,
+              SLOP_WORDS, SLOP_PHRASES, STRUCTURES,
               get S() { return S; } },
     targets(...users) {
       CFG.TARGETS = users.map(u => String(u).toLowerCase().replace(/^@/, ''));

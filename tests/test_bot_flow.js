@@ -28,7 +28,7 @@ const IG = {
   sent: [],
   seen: 0,
 };
-const BRIDGE_REPLY = '**Haan bro!** <think>internal</think> kya haal hai? 😄';
+let BRIDGE_REPLY = '**Haan bro!** <think>internal</think> kya haal hai? 😄';
 
 /* ── browser stubs ─────────────────────────────────────────────────────── */
 const store = {};
@@ -203,6 +203,49 @@ const check = (name, fn) => {
   await api._debug.processThread('T1', 'testuser');
   check('own message · never answered again', () => {
     assert.strictEqual(IG.sent.length, before);
+  });
+
+  // LAST-REPLY GATE: clear the cooldown so the guard is the only thing that
+  // can stop a reply, then prove nothing is sent and nothing is even seen
+  S.cooldownUntil.T1 = 0;
+  const seenBefore = IG.seen;
+  await api._debug.processThread('T1', 'testuser');
+  check('gate · last message is ours → silent', () => {
+    assert.strictEqual(IG.sent.length, before, 'answered our own message');
+    assert.strictEqual(IG.seen, seenBefore, 'marked our own message as seen');
+  });
+
+  // …and the moment they speak again, the bot answers
+  IG.messages.push({
+    message_id: 'm3', timestamp_ms: 4000, sender_fbid: 'THEM',
+    content_type: 'TEXT',
+    content: { __typename: 'SlideMessageText', text_body: 'kuch nahi yaar, tu bata' },
+  });
+  IG.threads[0].last_activity_timestamp_ms = 4000;
+  S.cooldownUntil.T1 = 0;
+  await api._debug.processThread('T1', 'testuser');
+  check('gate · their message after ours → replies', () => {
+    assert.strictEqual(IG.sent.length, before + 1, 'no reply to a live turn');
+  });
+
+  // MULTI-BUBBLE: a long reply lands as two texts, not one wall
+  BRIDGE_REPLY = 'arre waah, ye toh mast scene hai bhai. kal milte hai pakka. ' +
+                 'tab tak tu bata, kya plan hai tera?';
+  IG.messages.push({
+    message_id: 'm4', timestamp_ms: Date.now() + 60_000, sender_fbid: 'THEM',
+    content_type: 'TEXT',
+    content: { __typename: 'SlideMessageText', text_body: 'kal kya karega?' },
+  });
+  IG.threads[0].last_activity_timestamp_ms = Date.now() + 60_000;
+  S.cooldownUntil.T1 = 0;
+  const bubblesBefore = IG.sent.length;
+  await api._debug.processThread('T1', 'testuser');
+  check('bubbles · long reply split into two texts', () => {
+    const fresh = IG.sent.slice(bubblesBefore);
+    assert.strictEqual(fresh.length, 2, 'sent: ' + JSON.stringify(fresh));
+    assert(fresh.every(x => x.length >= 18), JSON.stringify(fresh));
+    const T = S.transcripts.T1;
+    assert.strictEqual(T.messages[T.messages.length - 1].mine, true);
   });
 
   check('debounce · quiet window respects MAX_WAIT', () => {

@@ -59,8 +59,75 @@ check('persona · Aduu voice anchors present', () => {
   assert(/Aduu/.test(p));
   assert(/Hinglish/.test(p));
   assert(/VOICE ANCHORS/.test(p));
-  assert(/never claim to be human/i.test(p));
+  assert(/NEVER/.test(p));
   assert(!/meta-llama|llama-3/i.test(p), 'persona mentions the old model');
+});
+
+check('persona · zero AI in the personality', () => {
+  const p = api.config.SYSTEM_PROMPT;
+  assert(!/\bAI\b/i.test(p), 'persona still contains the word AI');
+  assert(!/language model|chatbot|assistant/i.test(p));
+  assert(/never break character/i.test(p), 'no stay-in-character rule');
+  assert(/never explain what you are/i.test(p), 'no no-self-explanation rule');
+  assert(/never talk about how you are made/i.test(p), 'no no-origin rule');
+});
+
+check('humanize · slop lexicon stripped', () => {
+  const out = h("Certainly! Let's delve into this robust and seamless solution. " +
+                "It's important to note that we leverage cutting-edge tools.");
+  assert(!/delve|robust|seamless|leverag|cutting-edge|important to note|^Certainly/i.test(out), out);
+});
+
+check('humanize · typographic fingerprint normalised', () => {
+  const out = h('haan\u2014bilkul \u201cscene kya hai\u201d\u2026 mast');
+  assert(!/[\u2014\u2013\u201c\u201d\u2018\u2019\u2026]/.test(out), out);
+  assert.strictEqual(out, 'haan, bilkul scene kya hai... mast');
+});
+
+check('humanize · invisible + bidi characters removed', () => {
+  const out = h('haan\u200b bro\u200f, chal\uFEFFta hai');
+  assert(!/[\u200B-\u200F\uFEFF]/.test(out), JSON.stringify(out));
+  assert.strictEqual(out, 'haan bro, chalta hai');
+});
+
+check('humanize · hashtags and markdown links do not survive', () => {
+  assert.strictEqual(h('dekh [yahan](https://x.com) #mood #delhi #vibes'), 'dekh yahan');
+});
+
+check('humanize · short reply loses its full stop', () => {
+  assert.strictEqual(h('haan bro.'), 'haan bro');
+  assert.strictEqual(h('kal milte hai.'), 'kal milte hai');
+  assert.strictEqual(h('sach?'), 'sach?');
+});
+
+check('score · clean Hinglish beats corporate slop', () => {
+  const d = api._debug;
+  const human = d.checkDraft('arre yaar, kal milte hai. 7 baje?'),
+        robot = d.checkDraft('Certainly! It is a seamless and robust solution — ' +
+                             'leveraging cutting-edge paradigms to elevate your journey.');
+  assert(human.overall >= 80, 'human draft scored ' + human.overall);
+  assert(robot.overall < 55, 'robot draft scored ' + robot.overall);
+  assert(robot.tells.includes('em-dash'), robot.tells.join(','));
+  assert.deepStrictEqual(Object.keys(human.checks).sort(),
+    ['burstiness', 'fingerprint', 'slop', 'specificity', 'voice']);
+});
+
+check('bubbles · long reply splits once, short stays whole', () => {
+  const d = api._debug;
+  assert.deepStrictEqual(d.splitBubbles('haan bro'), ['haan bro']);
+  const long = 'arre waah, ye toh mast scene hai bhai. kal milte hai pakka. ' +
+               'tab tak tu bata, kya plan hai?';
+  const b = d.splitBubbles(long);
+  assert.strictEqual(b.length, 2);
+  assert(b.every(x => x.length >= 18), JSON.stringify(b));
+  assert.strictEqual(b.join(' '), long);
+});
+
+check('language · mirroring hint detects the script', () => {
+  const d = api._debug;
+  assert.strictEqual(d.detectLang('अरे भाई क्या हाल है'), 'devanagari');
+  assert.strictEqual(d.detectLang('haan bhai, kal milte hai'), 'hinglish');
+  assert.strictEqual(d.detectLang('sure, that sounds good to me'), 'english');
 });
 
 check('humanize · markdown, bullets, quotes', () => {
@@ -112,4 +179,4 @@ check('prompt() · custom persona persists', () => {
   assert.strictEqual(saved.systemPrompt, 'my custom persona');
 });
 
-console.log('\n12 passed, 0 failed\n');
+console.log('\n20 passed, 0 failed\n');

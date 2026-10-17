@@ -1,9 +1,10 @@
 # IG Agent — Aduu on Instagram (gemma-4 edition, v5)
 
-An autonomous Instagram DM chatbot. People message the account, an AI agent
-answers by itself — across many chats at once, remembering each person, with
-real **Seen** receipts, the real **typing indicator**, and a complete JSON
-transcript of every chat.
+An Instagram DM auto-responder. People message the account and **Aduu** answers
+by itself — across many chats at once, remembering each person, with real
+**Seen** receipts, the real **typing indicator**, and a complete JSON transcript
+of every chat. It only speaks when the **newest message in the thread is
+theirs**, so it never answers itself or double-texts.
 
 **Primary model: [`@cf/google/gemma-4-26b-a4b-it`](https://llmchat.in)**
 via [llmchat.in](https://llmchat.in) — no API key. The provider handles its
@@ -34,6 +35,7 @@ the finished answer.
 | `tests/test_bot_flow.js` | Full page pipeline against a fake Instagram + fake bridge |
 | `tests/test_humanize.js` | Humanizer / persona / state-migration tests |
 | `tests/live_check.py` | Live gemma-4 check: prints reasoning vs. final answer |
+| `vendor/ig-human/` | MIT lexicon from jakeschincariol/instagram-agent-skill (source of the slop list) |
 | `transcripts/` | One merged JSON per contact (persona + memory + history) |
 | `requirements.txt` | `curl_cffi` — the only runtime dependency |
 
@@ -104,20 +106,25 @@ the DM UI, read the POST bodies).
 
 ## Aduu: the persona
 
-Aduu is Adarsh's DM character — **not Adarsh**. The full prompt lives in
-`ig-agent-chat.js` under `CFG.SYSTEM_PROMPT` and is built around:
+Aduu is Adarsh's 22-year-old friend from Delhi who handles his DMs — **not
+Adarsh**. The full prompt lives in `ig-agent-chat.js` under `CFG.SYSTEM_PROMPT`
+and is built around one rule: text like a person, not like software.
 
-- **Texts like a person** — 1–3 short sentences, contractions, casual Hinglish,
+- **No machine self-reference, ever** — the persona contains no AI/bot/model
+  language at all. If someone asks who they're talking to, Aduu answers as
+  Aduu ("Aduu. Adarsh ke DMs sambhalta hoon, uska dost.") and moves on.
+- **Texts like a person** — 1–2 short sentences, contractions, casual Hinglish,
   no markdown/bullets/headings, at most one question, emojis only if mirrored.
 - **Matches language and energy** — Hinglish → Hinglish, Hindi → Hindi,
-  English → English; dry → dry, playful → tease, low → soften.
-- **Flirty, classy, never explicit** — deflecting with humour if pushed; drops
-  all flirting instantly if the person seems under 18; backs off on request.
-- **Honest about being an AI** — never claims to be human when sincerely asked,
-  never brings it up unprompted.
-- **Sells Adarsh without being pushy** — explains websites / AI agents /
-  chatbots / automations, promises to connect them, never invents prices or
-  deadlines.
+  English → English; dry → dry, playful → tease, low → soften. A separate
+  `detectLang()` hint enforces the script mix per turn.
+- **Flirty in stages** — warm → playful tease → flirty push-pull → cool-down if
+  not reciprocated; never explicit, never desperate; drops all flirting
+  instantly if the person seems under 18; backs off on request.
+- **Funny, not a joke machine** — observational or self-deprecating, one beat
+  per message, never a canned quip.
+- **Sells Adarsh without being pushy** — websites / automation / agents,
+  promises to connect them, never invents prices or deadlines.
 - **Never repeats itself** — the prompt includes the last few texts it sent in
   that chat, and a repetition detector retries once with a fresh temperature.
 
@@ -125,31 +132,53 @@ Voice anchors (in the prompt, as style examples — not templates):
 
 ```text
 them: "kya kar raha hai"   → you: "bas tumhari yaad mein scroll kar raha tha 😏 tu bata"
-them: "who are you"        → you: "Aduu. Adarsh ke DMs sambhalta hoon — haan, AI hoon, but vibe real hai 😄"
+them: "who are you"        → you: "Aduu. Adarsh ke DMs sambhalta hoon, uska dost. Tu bata, kahan se ho?"
 them: "bore ho raha hoon"  → you: "acha? phir meri galti nahi hai, pehle batana tha 😌 batao kya scene hai"
 ```
 
 Change it live with `IGAgent.prompt("...")`; cached copies of **older default**
 personas are ignored after upgrades (only your own custom prompt is restored).
 
-## Humanization layer
+## Last-reply gate
 
-Real-model text is not the same as human texting. Before sending, every reply
-goes through `humanizeReply()`:
+`processThread()` reads the merged transcript and checks the **newest** message
+before doing anything else:
 
-- strips `<think>`/`<thinking>` leaks, `Aduu:` labels, markdown, code fences,
-  bullets, headings, links, wrapping and stray quotes;
-- collapses multi-line answers into one DM-style paragraph;
-- de-duplicates stutters, fixes spacing before punctuation;
-- cuts anything over **300 chars** at a sentence (or soft-pause) boundary —
-  never mid-word.
+```text
+newest.mine === true   → do nothing. Turn is closed. No seen, no typing, no reply.
+newest.mine === false  → answer their unanswered run of texts (seen → typing → reply)
+```
+
+That check runs before the LLM, the queue and the rate limits, so a stale
+`localStorage` entry, a retry or a re-poll can never make the bot answer
+itself. Both historical transcripts in `transcripts/` end with `mine: true`,
+which is exactly the state where the bot now stays silent.
+
+## Humanization layer (v2)
+
+Real-model text is not the same as human texting. The pipeline is ported from
+the five-check model in
+[jakeschincariol/instagram-agent-skill](https://github.com/jakeschincariol/instagram-agent-skill)
+(`ig-human`, MIT — lexicon vendored in `vendor/ig-human/`):
+
+| Stage | What it does |
+|---|---|
+| `removeMachineTells` | invisible/bidi chars, em dashes, en dashes, curly quotes, ellipsis → plain ASCII; corporate slop from the 92-word + 58-phrase vendored lexicon |
+| `humanizeReply` | strips `<think>` leaks, `Aduu:` labels, markdown, code fences, bullets, headings, links, hashtags, wrapping quotes; one paragraph; de-stutters; drops the final full stop on short DMs; cuts >300 chars at a sentence boundary |
+| `checkDraft` | scores fingerprint · slop density · burstiness · specificity · voice (0–100, overall = mean×0.6 + weakest×0.4) and flags 15 structural tells without rewriting them; low scores are logged, never sent as a warning |
+| `splitBubbles` | a long answer lands as **two texts** 0.7–1.8 s apart, like a person adding a second thought |
+| `detectLang` | per-turn hint: Devanagari → Hinglish-in-Latin, English → mostly English, else match the mix |
+
+The prompt is also shape-aware: `buildHistory()` injects the other person's
+newest text, a reply-length band derived from **their** message length, and a
+"don't greet unless they greeted you" rule. People mirror; assistants perform.
 
 Pacing is humanized too:
 
 - **Seen** happens after a 0.6–2.5s jitter, not instantly;
 - the **typing trail** covers the whole draft, floored by reply length
   (~55ms/char, 1.5–7s) jittered ±15–20%, plus a 0.3–1.1s pause before the
-  message lands;
+  message lands, plus a fresh typing beat between bubbles;
 - inbox is polled every 5–9s with jitter; double-texts merge in a 0.3–0.9s
   quiet window (max 8s), and mid-draft texts get their own reply.
 
@@ -184,8 +213,11 @@ IGAgent.stop()
 - **TRUE multi-thread** — every chat has its own cooldown, retry queue, debounce
   and memory; bridge reply workers run in parallel threads with serialized
   socket writes.
+- **Only answers a live turn** — the newest message must be theirs; if ours is
+  on top, the thread is left alone (no seen, no typing, no reply).
 - **Marks messages Seen** the moment a new text is detected (live mode only).
-- **Shows the real typing trail**, then sends the humanized reply.
+- **Shows the real typing trail**, then sends the humanized reply — split into
+  two bubbles when it is long.
 - **Remembers each contact** — a background LLM call merges a profile (name,
   city, work, wants, language, vibe, nickname, follow-ups, safety flags) and
   injects it into every future prompt.
@@ -242,8 +274,8 @@ replays the **exact** gemma-4 stream shape (reasoning → content → usage →
 
 ```bash
 python tests/test_pipeline.py     # provider · strip · config · fallback · HTTP + WS bridge
-node   tests/test_humanize.js     # humanizer · persona · state migration
-node   tests/test_bot_flow.js     # seen → typing → reply → humanize → send → transcript
+node   tests/test_humanize.js     # humanizer · slop lexicon · 5-check score · bubbles · persona has zero AI
+node   tests/test_bot_flow.js     # gate → seen → typing → reply → humanize → bubbles → send → transcript
 ```
 
 To verify the real upstream and watch gemma-4 think (run this on a machine with
@@ -287,3 +319,10 @@ from your own logged-in session, mimicking the web app's own calls. Defaults are
 conservative (5–9s inbox polling, 20 replies/hour, 100/day, 60s thread
 cooldown). Frequent polling can trigger Instagram rate limits, which cause the
 bot to stop automatically on HTTP 429/403. Don't crank the caps.
+
+**Impersonation:** Aduu is written to stay in character and never volunteers or
+confirms a machine nature. That is what the persona was asked to do, but it
+means a person can believe they are talking to a human. Run it on your own
+account, tell people if they sincerely need to know, and keep the flirting
+rules (no minors, back off on request) intact — they are the safety floor, not
+decoration.
