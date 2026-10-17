@@ -45,13 +45,13 @@ check('config · gemma-4 is the model', () => {
   assert.strictEqual(api.config.MAX_REPLY_CHARS, 300);
 });
 
-check('state · stale persona + llama model ignored', () => {
+check('state · stale persona + llama model ignored; default targets active', () => {
   assert(!/OLD STALE PERSONA/.test(api.config.SYSTEM_PROMPT),
     'old cached persona overrode the new default');
   assert.strictEqual(api.config.MODEL, 'google/gemma-4-26b-a4b-it');
-  // targets/dryRun are still restored — only persona/model are versioned
-  assert.deepStrictEqual(api.config.TARGETS, ['someone']);
-  assert.strictEqual(api.config.DRY_RUN, true);
+  assert.deepStrictEqual(api.config.DEFAULT_TARGETS, ['adarshu.io', 'deeps20_']);
+  assert.deepStrictEqual(api.config.TARGETS, ['adarshu.io', 'deeps20_']);
+  assert.strictEqual(api.config.DRY_RUN, false);
 });
 
 check('persona · Aduu voice anchors present', () => {
@@ -166,10 +166,36 @@ check('repeat detector · catches an echo', () => {
   assert.strictEqual(api._debug.looksRepeated('naya line hai', msgs), false);
 });
 
-check('targets() · no silent auto-start', () => {
-  api.targets('someone_else');
+check('targets() · batch group set + addTargets + everyone', () => {
+  api.targets('http://adarshu.io, @deeps20_  user3', ['user4', 'https://instagram.com/user5/']);
   assert.strictEqual(api._debug.S.running, false);
-  assert.deepStrictEqual(api.config.TARGETS, ['someone_else']);
+  assert.deepStrictEqual(api.config.TARGETS, ['adarshu.io', 'deeps20_', 'user3', 'user4', 'user5']);
+  // no-arg call returns current targets without wiping
+  assert.deepStrictEqual(api.targets(), ['adarshu.io', 'deeps20_', 'user3', 'user4', 'user5']);
+  // addTargets appends a group at once without losing existing targets
+  api.addTargets('user6, user7', ['user8']);
+  assert.deepStrictEqual(api.config.TARGETS,
+    ['adarshu.io', 'deeps20_', 'user3', 'user4', 'user5', 'user6', 'user7', 'user8']);
+  api.removeTargets('user3, user4, user5, user6, user7, user8');
+  assert.deepStrictEqual(api.config.TARGETS, ['adarshu.io', 'deeps20_']);
+  api.everyone();
+  assert.strictEqual(api.config.TARGETS, 'all');
+  api.clearState();
+  assert.deepStrictEqual(api.config.TARGETS, ['adarshu.io', 'deeps20_']);
+});
+
+check('buildHistory · partner, previous own line, and unanswered burst', () => {
+  const msgs = [
+    { id: '1', ts: 1000, mine: true, kind: 'text', label: 'text', text: 'poora naam batao' },
+    { id: '2', ts: 2000, mine: false, kind: 'text', label: 'text', text: 'Deepika' },
+    { id: '3', ts: 2500, mine: false, kind: 'text', label: 'text', text: 'aur tum karte kya ho?' },
+  ];
+  const hist = api._debug.buildHistory(msgs, 'T_DEEPS', 'deeps20_');
+  const sys = hist[0].content;
+  assert(sys.includes('CHAT PARTNER: @deeps20_'), 'partner missing');
+  assert(sys.includes('YOUR MESSAGE RIGHT BEFORE THEIR REPLY: "poora naam batao"'), 'prev own msg missing');
+  assert(sys.includes('THEIR NEWEST UNANSWERED BURST (2 messages in a row)'), 'burst block missing');
+  assert(sys.includes('1. "Deepika"') && sys.includes('2. "aur tum karte kya ho?"'), 'burst lines missing');
 });
 
 check('prompt() · custom persona persists', () => {
@@ -179,4 +205,4 @@ check('prompt() · custom persona persists', () => {
   assert.strictEqual(saved.systemPrompt, 'my custom persona');
 });
 
-console.log('\n20 passed, 0 failed\n');
+console.log('\n21 passed, 0 failed\n');

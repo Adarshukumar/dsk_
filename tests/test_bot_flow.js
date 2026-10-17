@@ -73,9 +73,10 @@ global.fetch = async (url, opts = {}) => {
       },
     };
   } else if (name === 'IGDMessageListOffMsysQuery') {
-    // the mock always returns the full list newest→oldest; the client filters
+    const tid = vars.id || 'T1';
+    const list = (IG.byThread && IG.byThread[tid]) || IG.messages;
     const newer = vars.newer_than_message_id;
-    const nodes = IG.messages
+    const nodes = list
       .filter(m => !newer || m.timestamp_ms > 1000)
       .slice()
       .reverse();
@@ -144,6 +145,11 @@ const check = (name, fn) => {
 
 (async () => {
   console.log('\nIG-Agent bot flow tests (fake Instagram + fake bridge)\n');
+
+  check('defaults · adarshu.io and deeps20_ active & live by default', () => {
+    assert.deepStrictEqual(api.config.TARGETS, ['adarshu.io', 'deeps20_']);
+    assert.strictEqual(api.config.DRY_RUN, false);
+  });
 
   api.dryRun(false);          // exercise the real send path
   api.targets('testuser');
@@ -257,6 +263,31 @@ const check = (name, fn) => {
     const left = firstAt + CFG.DEBOUNCE_MAX_WAIT_MS - now;
     const wait = Math.max(150, Math.min(quiet, Math.max(150, left)));
     assert(wait >= 150 && wait <= quiet);
+  });
+
+  // PARALLEL MULTI-TARGET: adarshu.io and deeps20_ answered concurrently
+  BRIDGE_REPLY = 'haan yaar, batao kya scene hai';
+  IG.byThread = {
+    T_ADARSH: [{
+      message_id: 'a1', timestamp_ms: 5000, sender_fbid: 'THEM_A',
+      content_type: 'TEXT',
+      content: { __typename: 'SlideMessageText', text_body: 'oye kahan hai?' },
+    }],
+    T_DEEPS: [{
+      message_id: 'd1', timestamp_ms: 5000, sender_fbid: 'THEM_D',
+      content_type: 'TEXT',
+      content: { __typename: 'SlideMessageText', text_body: 'hey kya kar rahe ho' },
+    }],
+  };
+  const parBefore = IG.sent.length;
+  await Promise.all([
+    api._debug.processThread('T_ADARSH', 'adarshu.io'),
+    api._debug.processThread('T_DEEPS', 'deeps20_'),
+  ]);
+  check('parallel · adarshu.io and deeps20_ answered concurrently', () => {
+    assert.strictEqual(IG.sent.length - parBefore, 2, 'parallel sends: ' + (IG.sent.length - parBefore));
+    assert(S.transcripts.T_ADARSH && S.transcripts.T_ADARSH.messages.slice(-1)[0].mine);
+    assert(S.transcripts.T_DEEPS && S.transcripts.T_DEEPS.messages.slice(-1)[0].mine);
   });
 
   api.stop();

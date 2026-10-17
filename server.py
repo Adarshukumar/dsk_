@@ -422,6 +422,16 @@ def handle_ws(handler) -> None:
                         "uptime_s": round(time.time() - START)}
                 conn.send_text(json.dumps(resp))
                 continue
+            if req.get("type") == "bot":
+                bot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ig-agent-chat.js")
+                try:
+                    with open(bot_path, encoding="utf-8") as bf:
+                        code = bf.read()
+                    resp = {"id": req.get("id"), "ok": True, "code": code}
+                except Exception as e:
+                    resp = {"id": req.get("id"), "ok": False, "error": str(e)[:200]}
+                conn.send_text(json.dumps(resp))
+                continue
             if req.get("type") == "save":
                 rid = req.get("id")
                 try:
@@ -563,6 +573,7 @@ def main():
     TIMEOUT = args.timeout
 
     os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+    ThreadingHTTPServer.allow_reuse_address = True
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
     print(f"IG-Agent LLM bridge  ->  http://{args.host}:{args.port}")

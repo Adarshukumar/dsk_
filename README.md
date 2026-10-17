@@ -28,8 +28,11 @@ the finished answer.
 | File | What it is |
 |---|---|
 | `llmchat_provider.py` | Async llmchat.in provider — SSE streaming, reasoning capture, retries |
-| `server.py` | Bridge: HTTP + hand-rolled WebSocket, model fallback, think-strip, transcript store |
-| `ig-agent-chat.js` | The Instagram bot — paste into the DevTools console (v5) |
+| `server.py` | Bridge: HTTP + hand-rolled WebSocket (`reply`, `health`, `save`, `bot`), model fallback, think-strip, transcript store |
+| `ig-agent-chat.js` | The Instagram bot — paste into the DevTools console (auto-starts LIVE with `adarshu.io` and `deeps20_`) |
+| `clone-and-run.bat` | Windows one-click script: clones repo, installs `curl_cffi`, copies bot to clipboard, starts bridge |
+| `clone-and-run.sh` | Linux / macOS / Git Bash one-command script: clones repo, installs `curl_cffi`, starts bridge |
+| `run.py` | Cross-platform Python starter: installs `curl_cffi`, copies bot to clipboard, keeps bridge running |
 | `tests/mock_llmchat.py` | Offline byte-faithful mock of the gemma-4 SSE stream |
 | `tests/test_pipeline.py` | End-to-end bridge test (provider → server → HTTP → WS) |
 | `tests/test_bot_flow.js` | Full page pipeline against a fake Instagram + fake bridge |
@@ -182,28 +185,51 @@ Pacing is humanized too:
 - inbox is polled every 5–9s with jitter; double-texts merge in a 0.3–0.9s
   quiet window (max 8s), and mid-draft texts get their own reply.
 
-## Run it
+## Clone & Run (one step)
 
+### Option 1 — One-file clone & start
+- **Windows:** run `clone-and-run.bat` (or double-click it) — clones the repo, installs `curl_cffi`, copies `ig-agent-chat.js` to your clipboard, and starts `server.py` in a continuous loop.
+- **Linux / macOS / Git Bash:**
+  ```bash
+  git clone -b arena/d05a574d-dsk https://github.com/Adarshukumar/dsk_.git && cd dsk_ && bash clone-and-run.sh
+  ```
+- **Any OS (Python):**
+  ```bash
+  python run.py
+  ```
+
+### Option 2 — Manual bridge + console
 ```bash
 pip install -r requirements.txt   # curl_cffi, once
 python server.py                  # http://127.0.0.1:8787 + ws://localhost:8787/ws
 ```
 
-On any **instagram.com** tab where you're logged in → DevTools → Console →
-paste all of `ig-agent-chat.js`, then:
+### In the Instagram tab (auto-starts immediately)
+On any **instagram.com** tab where you're logged in → open DevTools → Console (`F12`):
+- **Paste `ig-agent-chat.js`** (already copied to your clipboard by `clone-and-run.bat` / `run.py`), **OR** paste this 1-line WebSocket loader:
+  ```js
+  (()=>{const w=new WebSocket('ws://localhost:8787/ws');w.onopen=()=>w.send('{"id":"b","type":"bot"}');w.onmessage=e=>{eval(JSON.parse(e.data).code);w.close()}})()
+  ```
+- As soon as it runs, it **starts automatically in LIVE mode** (`DRY_RUN = false`) with default targets **`adarshu.io`** and **`deeps20_`** already active!
 
 ```js
-IGAgent.test()                 // session, tokens, WS, gemma-4 reply, humanizer, inbox, typing, seen, transcripts
-IGAgent.targets('user1')       // who gets auto-replies (or IGAgent.allTargets())
-IGAgent.start()                // DRY_RUN by default — replies logged, NOT sent
-IGAgent.dryRun(false)          // flip when you trust it → real sends + seen + typing
+// Manage targets (add or set a whole group at once — comma/space string, array, or multiple args):
+IGAgent.addTargets('user1, user2, user3')         // add a group of targets at once (keeps adarshu.io & deeps20_)
+IGAgent.addTargets(['user4', 'user5'])            // array form also works
+IGAgent.targets('adarshu.io, deeps20_, user3')    // replace the target group at once
+IGAgent.allTargets()                              // or IGAgent.everyone() — reply to EVERYONE in 1:1 DMs
+IGAgent.removeTargets('user3')                    // remove one or more targets
+IGAgent.targets()                                 // view currently active targets
+
+// Other controls:
+IGAgent.status()               // live status, active targets, counters, bridge health
+IGAgent.test()                 // session, tokens, WS, gemma-4 reply, humanizer, gate, inbox, typing, seen
+IGAgent.dryRun(true)           // optional: preview replies without sending
 IGAgent.say('user','hi')       // manual real send
 IGAgent.typingDemo('user')     // show the typing trail for a few seconds
 IGAgent.markSeenNow('user')    // mark that chat read right now
-IGAgent.model('google/gemma-4-26b-a4b-it')
-IGAgent.humanize(false)        // turn the humanizer off
 IGAgent.transcripts()          // list local transcript state
-IGAgent.stop()
+IGAgent.stop()                 // stop the polling loop
 ```
 
 ## What the bot does by itself
