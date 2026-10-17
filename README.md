@@ -31,7 +31,9 @@ the finished answer.
 | `ig-agent-chat.js` | The Instagram bot — paste into the DevTools console (v5) |
 | `tests/mock_llmchat.py` | Offline byte-faithful mock of the gemma-4 SSE stream |
 | `tests/test_pipeline.py` | End-to-end bridge test (provider → server → HTTP → WS) |
+| `tests/test_bot_flow.js` | Full page pipeline against a fake Instagram + fake bridge |
 | `tests/test_humanize.js` | Humanizer / persona / state-migration tests |
+| `tests/live_check.py` | Live gemma-4 check: prints reasoning vs. final answer |
 | `transcripts/` | One merged JSON per contact (persona + memory + history) |
 | `requirements.txt` | `curl_cffi` — the only runtime dependency |
 
@@ -240,7 +242,15 @@ replays the **exact** gemma-4 stream shape (reasoning → content → usage →
 
 ```bash
 python tests/test_pipeline.py     # provider · strip · config · fallback · HTTP + WS bridge
-node  tests/test_humanize.js      # humanizer · persona · state migration
+node   tests/test_humanize.js     # humanizer · persona · state migration
+node   tests/test_bot_flow.js     # seen → typing → reply → humanize → send → transcript
+```
+
+To verify the real upstream and watch gemma-4 think (run this on a machine with
+internet — it prints the reasoning phase and the final answer separately):
+
+```bash
+python tests/live_check.py
 ```
 
 The bridge honours `LLMCHAT_API` so you can point it at the mock:
