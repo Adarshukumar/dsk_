@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# runtime logs
+*.log
+
+# transcripts are private DM data — never commit new ones
+transcripts/*.json
+transcripts/*.tmp
