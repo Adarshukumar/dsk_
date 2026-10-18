@@ -214,6 +214,10 @@ def test_bridge_http_ws(mock):
             h = recv()
             assert h["id"] == "h1" and h["default_endpoint"] == MODEL_WIRE, h
 
+            send({"id": "b1", "type": "bot"})
+            b = recv()
+            assert b["id"] == "b1" and b["ok"] is True and "window.IGAgent" in b["code"]
+
             send({"id": "r1", "type": "reply", "messages": [
                 {"role": "user", "content": "bro hi"}]})
             r = recv()
