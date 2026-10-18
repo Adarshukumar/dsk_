@@ -184,18 +184,78 @@ check('targets() · batch group set + addTargets + everyone', () => {
   assert.deepStrictEqual(api.config.TARGETS, ['adarshu.io', 'deeps20_']);
 });
 
-check('buildHistory · partner, previous own line, and unanswered burst', () => {
+check('buildHistory · coalesces consecutive user messages into ONE newline-joined turn', () => {
   const msgs = [
     { id: '1', ts: 1000, mine: true, kind: 'text', label: 'text', text: 'poora naam batao' },
-    { id: '2', ts: 2000, mine: false, kind: 'text', label: 'text', text: 'Deepika' },
-    { id: '3', ts: 2500, mine: false, kind: 'text', label: 'text', text: 'aur tum karte kya ho?' },
+    { id: '2', ts: 2000, mine: false, kind: 'text', label: 'text', text: 'Hyy babyy🌚🌚' },
+    { id: '3', ts: 2100, mine: false, kind: 'text', label: 'text', text: 'Itne din se kahan gayab ho' },
+    { id: '4', ts: 2200, mine: false, kind: 'text', label: 'text', text: 'Yaad nhi aati meri🤡🤡' },
+    { id: '5', ts: 2300, mine: false, kind: 'text', label: 'text', text: 'Jaldi se sorry ka gift bhej with chocolates' },
+    { id: '6', ts: 2400, mine: false, kind: 'text', label: 'text', text: 'Hiluuuu biluuu' },
+    { id: '7', ts: 2500, mine: false, kind: 'text', label: 'text', text: 'Khaale thoda sa goo' },
   ];
   const hist = api._debug.buildHistory(msgs, 'T_DEEPS', 'deeps20_');
   const sys = hist[0].content;
   assert(sys.includes('CHAT PARTNER: @deeps20_'), 'partner missing');
   assert(sys.includes('YOUR MESSAGE RIGHT BEFORE THEIR REPLY: "poora naam batao"'), 'prev own msg missing');
-  assert(sys.includes('THEIR NEWEST UNANSWERED BURST (2 messages in a row)'), 'burst block missing');
-  assert(sys.includes('1. "Deepika"') && sys.includes('2. "aur tum karte kya ho?"'), 'burst lines missing');
+  assert(sys.includes('THEIR NEWEST UNANSWERED BURST (6 messages merged into one turn):'), 'burst block missing');
+  // Roles must strictly be: system, assistant ("poora naam batao"), user (all 6 joined by \n)
+  assert.strictEqual(hist.length, 3, 'all 6 user messages must coalesce into 1 user turn');
+  assert.strictEqual(hist[1].role, 'assistant');
+  assert.strictEqual(hist[1].content, 'poora naam batao');
+  assert.strictEqual(hist[2].role, 'user');
+  assert.strictEqual(
+    hist[2].content,
+    'Hyy babyy🌚🌚\n' +
+    'Itne din se kahan gayab ho\n' +
+    'Yaad nhi aati meri🤡🤡\n' +
+    'Jaldi se sorry ka gift bhej with chocolates\n' +
+    'Hiluuuu biluuu\n' +
+    'Khaale thoda sa goo'
+  );
+});
+
+check('agent tool · emotion & emoji analyzer + naughty->good-boy coaching', () => {
+  const burst =
+    'Hyy babyy🌚🌚\nItne din se kahan gayab ho\nYaad nhi aati meri🤡🤡\n' +
+    'Jaldi se sorry ka gift bhej with chocolates\nHiluuuu biluuu\nKhaale thoda sa goo';
+  const emo = api._debug.analyzeTurnEmotion(burst, 'deeps20_');
+  assert(emo.theirMood.includes('flirty-sweet'), 'flirty mood detected');
+  assert(emo.theirMood.includes('nakhre-drama'), 'nakhre mood detected');
+  assert(emo.theirMood.includes('desi-bakchodi-abuse'), 'desi abuse mood detected');
+  assert(emo.emotion.includes('good-boy'), 'good-boy flip in emotion mode');
+  assert(emo.emojis.includes('🌚') && emo.emojis.includes('😌'), 'suggested emojis present');
+});
+
+check('global memory + cross-chat gossip tool (adarshu.io <-> deeps20_)', () => {
+  const gm = api.globalMemory();
+  assert(gm.connections.some(c => c.a === 'adarshu.io' && c.b === 'deeps20_'), 'adarshu.io <-> deeps20_ linked by default');
+  // Simulate deeps20_ having sent a dramatic message
+  const deepsMsgs = [
+    { id: 'd1', ts: 3000, mine: false, kind: 'text', label: 'text', text: 'adarsh ko bolna mujhe chocolate chahiye 🍫' },
+  ];
+  api._debug.syncGlobalMemory('T_DEEPS', 'deeps20_', deepsMsgs, api._debug.analyzeTurnEmotion(deepsMsgs[0].text, 'deeps20_'), 'pakka bol dunga 😌');
+  // Now build history for adarshu.io asking what deeps20_ is up to
+  const adarshMsgs = [
+    { id: 'a1', ts: 4000, mine: false, kind: 'text', label: 'text', text: 'aur bata deeps kya bol rahi thi aaj?' },
+  ];
+  const hist = api._debug.buildHistory(adarshMsgs, 'T_ADARSH', 'adarshu.io');
+  const sys = hist[0].content;
+  assert(sys.includes('[GLOBAL MEMORY & SOCIAL GRAPH]'), 'global memory block present');
+  assert(sys.includes('[TOOL: cross_chat_gossip_intel]'), 'cross-chat gossip tool block present');
+  assert(sys.includes('chocolate chahiye'), 'deeps20_ message surfaced to adarshu.io via gossip tool');
+});
+
+check('event-driven anti-ban polling · adaptive idle backoff + instant realtime wake', () => {
+  const S = api._debug.S;
+  S.idlePolls = 0;
+  const activeDelay = api._debug.nextPollDelayMs();
+  assert(activeDelay >= 3000 && activeDelay <= 5000, `active delay in 3-5s (got ${activeDelay})`);
+  S.idlePolls = 6;
+  const idleDelay = api._debug.nextPollDelayMs();
+  assert(idleDelay >= 20000, `idle delay backs off to prevent IP block (got ${idleDelay})`);
+  api._debug.onRealtimeSignal('ig-ws-push');
+  assert.strictEqual(S.idlePolls, 0, 'realtime push signal resets idlePolls immediately');
 });
 
 check('prompt() · custom persona persists', () => {
@@ -205,4 +265,4 @@ check('prompt() · custom persona persists', () => {
   assert.strictEqual(saved.systemPrompt, 'my custom persona');
 });
 
-console.log('\n21 passed, 0 failed\n');
+console.log('\n24 passed, 0 failed\n');

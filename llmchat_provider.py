@@ -3,7 +3,7 @@
   💬  LLMChat Provider  (Async)
 
   Async streaming text generation via llmchat.in
-  25 models · Thinking model support · Zero setup
+  23 models · Thinking model support · Zero setup
 
   Uses curl_cffi for browser-like HTTP requests.
 """
@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import asyncio
-import os
 import random
 import time
 import threading
@@ -48,8 +47,6 @@ class LLMModel:
 # §2 — MODEL REGISTRY
 # ═══════════════════════════════════════════════════════════
 MODELS: tuple[LLMModel, ...] = (
-    # primary: Gemma 4 — streams a long reasoning_content phase, then content
-    LLMModel("@cf", "google/gemma-4-26b-a4b-it",                  200_000),
     LLMModel("@cf", "moonshotai/kimi-k2.5",                       200_000),
     LLMModel("@cf", "meta/llama-3.1-70b-instruct",                23_500),
     LLMModel("@cf", "qwen/qwq-32b",                               23_500),
@@ -79,21 +76,17 @@ MODELS: tuple[LLMModel, ...] = (
 _MODEL_MAP: dict[str, LLMModel] = {m.name: m for m in MODELS}
 
 _THINKING_MODELS: frozenset[str] = frozenset({
-    "google/gemma-4-26b-a4b-it",
     "moonshotai/kimi-k2.5",
     "qwen/qwq-32b",
     "deepseek-ai/deepseek-r1-distill-qwen-32b",
     "qwen/qwen3-30b-a3b-fp8",
-    "zai-org/glm-4.7-flash",
 })
 
 
 # ═══════════════════════════════════════════════════════════
 # §3 — CONSTANTS
 # ═══════════════════════════════════════════════════════════
-# Official endpoint.  LLMCHAT_API overrides it so the bridge can be smoke-
-# tested against a local mock of the exact SSE stream (see tests/).
-_API = os.environ.get("LLMCHAT_API", "https://llmchat.in/inference/stream")
+_API = "https://llmchat.in/inference/stream"
 
 _BASE_HEADERS = {
     "Content-Type": "application/json",
@@ -141,15 +134,12 @@ def _parse_sse(line: str) -> List[dict]:
 
     events: List[dict] = []
     choices = data.get("choices")
-    finish_reason = None
 
     if isinstance(choices, list) and choices:
         first = choices[0] if isinstance(choices[0], dict) else {}
         delta = first.get("delta") or {}
         finish_reason = first.get("finish_reason")
 
-        # gemma-4 / r1-style thinking: reasoning arrives first on its own
-        # stream of chunks, then real content starts (reasoning goes null).
         reasoning = delta.get("reasoning_content")
         if reasoning is None:
             reasoning = delta.get("reasoning")
@@ -176,25 +166,14 @@ def _parse_sse(line: str) -> List[dict]:
                 "finish_reason": finish_reason,
             })
 
+        return events
+
     resp = data.get("response")
-    if isinstance(resp, str) and resp:
+    if isinstance(resp, str):
         events.append({
             "kind": "response",
             "text": resp,
-            "finish_reason": finish_reason,
-        })
-
-    # llmchat sends a usage frame per chunk and one final summary frame
-    # ({"response":"","usage":{...}}).  Keep the last non-zero one so the
-    # bridge can log real token counts.
-    usage = data.get("usage")
-    if isinstance(usage, dict) and (usage.get("completion_tokens")
-                                    or usage.get("total_tokens")):
-        events.append({
-            "kind": "usage",
-            "text": "",
-            "usage": usage,
-            "finish_reason": finish_reason,
+            "finish_reason": None,
         })
 
     return events
@@ -210,18 +189,10 @@ def _resolve_model(query: Union[str, LLMModel, None], default: LLMModel) -> LLMM
     if isinstance(query, LLMModel):
         return query
 
-    # accept the wire form too: "@cf/google/gemma-4-26b-a4b-it"
-    q = str(query).strip()
-    if q.startswith("@") and "/" in q:
-        q = q.split("/", 1)[1]
+    if query in _MODEL_MAP:
+        return _MODEL_MAP[query]
 
-    if q in _MODEL_MAP:
-        return _MODEL_MAP[q]
-
-    q = q.lower()
-    for m in MODELS:
-        if m.name.lower() == q:
-            return m
+    q = query.lower()
     for m in MODELS:
         if q in m.name.lower():
             return m
@@ -286,7 +257,7 @@ class LLMChatProvider:
     """
     💬 LLMChat — Async Text Generation Provider
 
-    25 models · Thinking model support · Streaming
+    23 models · Thinking model support · Streaming
     """
 
     def __init__(
@@ -306,10 +277,6 @@ class LLMChatProvider:
         self.timeout = timeout
         self.retries = retries
         self.referer = referer
-        # telemetry filled in by the stream worker (fresh provider per request)
-        self.last_usage: Dict[str, Any] = {}
-        self.reasoning_chars = 0
-        self.content_chars = 0
 
     @property
     def model(self) -> LLMModel:
@@ -355,10 +322,6 @@ class LLMChatProvider:
         resp = None
         last_err = ""
         think_open = False
-
-        self.last_usage = {}
-        self.reasoning_chars = 0
-        self.content_chars = 0
 
         def emit(text: str) -> None:
             if text:
@@ -428,14 +391,9 @@ class LLMChatProvider:
                     text = chunk.get("text", "")
                     finish_reason = chunk.get("finish_reason")
 
-                    if kind == "usage":
-                        self.last_usage = chunk.get("usage") or self.last_usage
-                        continue
-
                     if kind == "reasoning":
                         # wrap reasoning ALWAYS — some models (e.g. glm-4.7-flash)
                         # stream reasoning_content without being on the known list
-                        self.reasoning_chars += len(text)
                         if not think_open:
                             think_open = True
                             emit("<think>\n")
@@ -443,7 +401,6 @@ class LLMChatProvider:
                         continue
 
                     if kind in ("content", "response"):
-                        self.content_chars += len(text)
                         close_think()
                         emit(text)
                         continue

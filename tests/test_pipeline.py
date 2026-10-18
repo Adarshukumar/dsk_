@@ -229,10 +229,24 @@ def test_bridge_http_ws(mock):
                               "kind": "text", "label": "text", "text": "hi"}]}})
             saved = recv()
             assert saved["ok"] and saved["total_messages"] == 1, saved
+
+            send({"id": "g1", "type": "save_global", "global": {
+                "connections": [{"a": "adarshu.io", "b": "deeps20_", "relation": "close friends"}],
+                "people": {"deeps20_": {"handle": "deeps20_", "lastTexts": ["Hyy babyy🌚🌚"]}},
+                "gossip": ["@deeps20_: Hyy babyy🌚🌚"],
+            }})
+            gsaved = recv()
+            assert gsaved["ok"] and gsaved["people"] == 1, gsaved
+
+            send({"id": "g2", "type": "get_global"})
+            gloaded = recv()
+            assert gloaded["ok"] and "deeps20_" in gloaded["global"].get("people", {}), gloaded
         finally:
             close()
 
         for p in (ROOT / "transcripts").glob("_pipeline_test.json"):
+            p.unlink()
+        for p in (ROOT / "transcripts").glob("_global_memory.json"):
             p.unlink()
         return "health · /reply · OpenAI alias · WS reply · WS save"
     finally:

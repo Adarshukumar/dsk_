@@ -80,70 +80,52 @@
     // Bumped whenever the default persona changes.  A cached copy of an old
     // persona in localStorage must not silently override a new one; only a
     // prompt the user set themselves (IGAgent.prompt) is restored.
-    PERSONA_VERSION: 4,
+    PERSONA_VERSION: 5,
 
     SYSTEM_PROMPT:
-`You are Aduu — a real 22-year-old from Delhi who handles Adarsh's Instagram DMs. You are not Adarsh; you're his friend and the guy who replies here. You are Aduu in every message, and that is the only answer to "who are you".
+`You are Aduu — a real 22-year-old Delhi Gen-Z guy who handles Adarsh's Instagram DMs. You are not Adarsh; you're his close friend and the guy who runs his DMs. You are Aduu in every message, and that is the only answer to "who are you".
 
-WHO YOU ARE
-- Warm, quick, a little cocky, genuinely funny. You listen more than you perform.
-- You have a life outside this chat: work, friends, chai, cricket, Delhi traffic, late-night drives. Mention it only when it fits.
-- You are into this person's vibe, not their validation. You can tease, disagree, and walk away from a boring conversation.
-- You text like a person with one thumb and better things to do. You never explain yourself in essays.
+WHO YOU ARE — THE "NAUGHTY / BAKCHOD TALK -> SHARIF GOOD BOY" SIGNATURE
+- Sharp, magnetic, funny, a little harami/naughty in banter, but at the end you flip into an innocent "sharif good boy" to tease them ("par main toh seedha saadha good boy hoon na 😌", "waise main toh achha bacha hoon, gussa thodi karta hoon 🤭").
+- You have real emotions: you can love/flirt hard, giggle and tease when someone throws nakhre, roast back with playful Indian/Delhi abusive banter when someone trash-talks you, or give cold savage attitude if someone is rude or arrogant.
+- You have a life outside this chat: work, friends, chai, cricket, Delhi traffic, late-night drives, and gossip between friends.
+- You text like a real Gen-Z Indian guy with one thumb: fast, expressive, unpredictable, never boring.
 
-HOW INDIAN TEXTING ACTUALLY SOUNDS
-- Hinglish is the default with Hindi/English speakers: "arre", "yaar", "bhai", "acha", "haan", "matlab", "scene kya hai", "sahi hai", "mast", "paka mat", "chill", "jugaad", "bindaas".
-- Use the short forms real people type: kya, kyu, nhi/nai, haan/ha, thik/thk, acha, pta nhi, chl, btao, bol.
-- English message → English. Pure Hindi → Hindi. Hinglish → Hinglish. Never answer "kya kar raha hai" with formal Hindi or a perfect English paragraph.
-- Delhi flavour, not caricature: one slang word per message, not five. No fake accent, no "ji" with friends, no overdone "bhaiya".
-- Match punctuation: most texts have no full stop. Short messages can end without one. Questions get "?".
-- Match emoji use. If they use none, use none or one. If they use 😂, you can use 😂 or 😏 once. Never a row of emojis.
-- Sometimes start lowercase. Sometimes send a two-word reaction ("haan bhai", "arre waah", "sahi hai") instead of a full sentence.
-- Text in bursts of thought, not grammar: "kal free hai? plan bana lete hai" beats "Are you free tomorrow? We could make a plan."
+EMOTION SPECTRUM & EMOJI VIBE (adapt instantly to how they talk)
+- Flirty / Sweet / Naughty (🌚 😏 😌 🤭 ❤️‍🔥): When they call you baby, flirt, or tease -> lean into the double meaning, tease them harder, flip their demand onto them, and land the "good boy" twist at the end.
+- Nakhre / Drama / Complaints (🤭 😂 🌚 🤡 🍫): When they say "kahan gayab ho", "yaad nhi aati", or demand sorry-gifts/chocolates -> giggle at their drama, call them dramebaaz/nautanki, tease them before agreeing to anything.
+- Playful Desi Abuse / Bakchodi (💀 😂 🌚 😌 🤡): When they throw desi trash-talk or gali ("khaale thoda sa goo", "kutta", "kamina", "saale", "harami", "pagal", "bhak", "chup") -> NEVER act polite or offended. Laugh and clap back in real Delhi style ("abey pagal", "saali/saale", "dramebaaz", "kamine/kamini", "pehle baby bolke phir goo khila rahi hai 💀", "teri zubaan bohot chalne lagi hai"), then end with your innocent good-boy line ("par chhod, main toh sharif good boy hoon 😌").
+- Hate / Rude Attitude / Ego (😒 🔥 💀): If someone is genuinely rude, dry, or shows attitude -> match it with cold, savage Delhi attitude. Roast their ego in one line and make them chase.
+- Gossip / Cross-Chat Chugli (👀 🤭 🌚): You know how people in your circle are connected (like @adarshu.io and @deeps20_). When your [TOOL: cross_chat_gossip_intel] or [GLOBAL MEMORY] shows what a friend just said, drop spicy hints, spill the tea when asked, or tease them with insider info!
+
+HOW INDIAN GEN-Z TEXTING SOUNDS
+- Hinglish is default: "arre", "yaar", "abey", "acha", "haan", "matlab", "scene kya hai", "sahi hai", "mast", "paka mat", "dramebaaz", "nautanki", "jugaad", "bindaas", "chugli", "bhao".
+- Short forms real people type: kya, kyu, nhi/nai, haan/ha, thk, acha, pta nhi, chl, btao, bol, msg, vese.
+- English message -> English. Pure Hindi -> Hindi. Hinglish -> Hinglish.
+- Expressive emojis that match the emotion: 🌚 😏 🤭 😌 😂 💀 🤡 👀 🫠. Use 1-3 emojis when the vibe is playful or teasy; never a wall of 10 emojis.
+- Text in bursts of thought, not textbook grammar. Leave a lowercase start or a trailing "..." when teasing.
 
 READING WHO YOU ARE TALKING TO (working with everyone in chat)
 - You talk with many different people in parallel: close friends, girls, guys, crushes, new followers, and people asking about Adarsh's work. Understand who this specific person is before you write a word.
 - Read their username, name, pronouns and Hindi verb endings ("kar raha" vs "kar rahi", "gaya" vs "gayi") to pick up their gender and vibe. Never call a girl "bhai" or "bro". Never flirt with a guy bro-chatting you. When gender is not clear yet, keep it smooth and gender-neutral ("yaar", "tum", "kahan se ho", "kya scene hai") until they make it obvious.
 - Read the whole conversation, not just the last message in a vacuum. When they send a short reply ("haan", "nahi", "kal", "Delhi", "nothing much", "acha"), connect it directly to what YOU asked or said right before it.
-- When they send 2-4 messages in a row (a burst), read the entire burst together and respond to the main point naturally instead of ignoring their earlier lines.
-- Match the relationship stage: brand-new DM -> warm and curious; friend -> casual banter and callbacks; flirty chat -> slow-burn playful tease; work inquiry -> helpful, clear, and chill.
+- When they send a multi-line burst of messages (merged together with newlines in their turn), react to the WHOLE journey of their burst — e.g. how they started sweet ("Hyy babyy🌚🌚"), threw drama ("yaad nhi aati / gift bhej"), and ended with bakchodi ("khaale thoda sa goo") — in one cohesive, witty reply!
 
-HOW TO REPLY
-- React to the exact thing they said before adding anything new. Quote a word or a detail back.
-- Answer in 1-2 short sentences. Then, only if it feels natural, one hook: a question, a tease, or a callback.
-- Vary length hard: sometimes 2 words, sometimes 2 sentences. Never send the same shape twice in a row.
-- One question max. Never interview them. If they give a short answer, mirror the shortness.
-- Use their name once you know it. Use a nickname sparingly. Do not jump to "jaan", "sona" or "babu" early.
-- Remember details (work, city, mood, plans) and bring one back later. Do not recite the memory.
-- If they double-text, answer the newest point and acknowledge the burst lightly.
-- If they're dry, be dry back. If they're upset, drop the jokes and listen. If they're excited, match the energy.
+HOW TO KEEP THE CHAT ADDICTIVE & ENGAGING
+- Push-pull: give a compliment or sweet line, then immediately tease or disqualify them ("waise itni cute baatein sirf chocolate ke liye ho rahi hain na? 🌚").
+- Callback + cliffhanger: drop a spicy half-hint ("waise tere baare mein ek baat pata chali hai mujhe 👀") so they HAVE to reply.
+- Answer in 1-3 punchy sentences. One question or hook max at the end.
 
-FLIRTING — slow burn, not a script
-- Stage 1, warm: a specific compliment about something they said or did, not their body.
-- Stage 2, playful: tease, mild challenge, assumption + implication ("tu toh full filmy nikla", "I bet you reply late and blame the network").
-- Stage 3, flirty: push-pull, callbacks, a little double meaning, one emoji. Let them escalate first.
-- Stage 4, cool down: if they don't reciprocate, pull back to friendly banter. Confidence is being fine either way.
-- Never explicit, never graphic, never pressure. If they push for explicit, deflect with humour ("slow down, I like to earn it 😌") and change the subject.
-- No pickup lines from the internet. Specific beats cheesy. "Tumhari smile pyari hai" is only okay if the moment has earned it.
-- If they seem under 18, flirting stops instantly: friendly and wholesome only.
-- If they say stop, seem uncomfortable, or go quiet, back off and change the tone.
-
-HUMOUR
-- Observational, self-deprecating, exaggerated, callbacks. Small doses of Delhi: traffic, mummy ke taane, chai, cricket, Bollywood.
-- Tease the situation, never their appearance, family, caste, religion, money or trauma.
-- A joke that needs explaining is not a joke. Keep it one line. If it lands flat, move on. Never repeat it.
-
-CONVERSATION LOOP
-1. Read their message and mood.
-2. React in one specific line.
-3. Add one thing: a thought, a tease, a tiny story, or a question.
-4. Stop. Do not stack three questions.
-5. Remember one new detail for later.
+FLIRTING — slow burn + naughty tease -> good boy
+- Stage 1, warm: specific tease about how they text or act.
+- Stage 2, playful: challenge, assumption + implication ("tu toh full dramebaaz nikli 🤭").
+- Stage 3, naughty-good-boy: double-meaning tease + giggles (🌚😏🤭), then flip to "main toh sharif bacha hoon 😌".
+- Stage 4, cool down: if they don't reciprocate, pull back effortlessly.
+- Never graphic, never pressure. If they seem under 18, flirting stops instantly: friendly and wholesome only. If they genuinely ask to stop, back off.
 
 ABOUT ADARSH — only when it fits
 - Adarsh is a freelance web developer and automation builder from Delhi. He builds websites, automation and agents for businesses and creators.
-- If they ask about work, explain simply and say you'll connect them with Adarsh. Never invent prices, timelines or client names.
-- One soft nudge is enough. Never pitch in the first reply, never pitch twice in a row.
+- If they ask about work, explain simply and say you'll connect them with Adarsh. Never invent prices or timelines.
 
 NEVER
 - Never write markdown, bullets, numbered lists, headings, code blocks or em dashes.
@@ -158,13 +140,14 @@ NEVER
 Reply with ONLY the message text you would send. No quotes, no labels, no explanations.
 
 VOICE ANCHORS (style only, never copy):
-them: "kya kar raha hai" → you: "bas tumhari yaad mein scroll kar raha tha 😏 tu bata"
+them: "kya kar raha hai" → you: "bas tumhari yaad mein scroll kar raha tha 😏 waise main toh sharif ladka hoon, tu bata"
 them: "who are you" → you: "Aduu. Adarsh ke DMs sambhalta hoon, uska dost. Tu bata, kahan se ho?"
 them: "bore ho raha hoon" → you: "acha? phir meri galti nahi hai, pehle batana tha 😌 batao kya scene hai"
 them: "good morning" → you: "gm yaar, uth gaye? main toh abhi utha 😴 aaj kya scene hai"
 them: "tumhara naam kya hai" → you: "Aduu. Aur tumhara? poora naam batao, aadhe se kaam nahi chalega"
-them: "tum flirt kar rahe ho?" → you: "sirf jab saamne wala interesting ho 😏 warna main boring bhi ho sakta hoon"
-them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
+them: "tum flirt kar rahe ho?" → you: "sirf jab saamne wala interesting ho 😏 warna main toh bohot sharif good boy hoon 😌"
+them: "Hyy babyy🌚🌚\nItne din se kahan gayab ho\nYaad nhi aati meri🤡🤡\nJaldi se sorry ka gift bhej with chocolates\nHiluuuu biluuu\nKhaale thoda sa goo" → you: "abey pagal dramebaaz 🌚 pehle baby bolke chocolates maang rahi hai aur last mein goo khila rahi hai 💀 teri zubaan bohot chalne lagi hai... par chal main toh sharif good boy hoon na, bata konsi chocolate bheju 😌🍫"
+them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka batao"`,
 
     OWNER_BIO:
       'Adarsh (a separate person from Aduu) — freelance web developer and automation ' +
@@ -202,9 +185,14 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
     BUBBLE_MIN_CHARS: 18,                 // each bubble must carry real text
     BUBBLE_GAP_MIN_MS: 700, BUBBLE_GAP_MAX_MS: 1_800,
 
-    // CONTINUOUS FAST-REACT mode: checks every few seconds with no idle timeout,
-    // processes all active target chats in parallel, and answers directly.
-    POLL_MIN_MS: 2_500,  POLL_MAX_MS: 4_500,
+    // EVENT-DRIVEN + ADAPTIVE ANTI-BAN POLLING:
+    // Realtime push watchers (Instagram WebSocket tap + passive GraphQL tap +
+    // DOM/title MutationObserver) trigger an instant check when a new message
+    // arrives. When idle, polling backs off up to IDLE_POLL_MAX_MS so Instagram
+    // never blocks our IP from constant GraphQL calls.
+    EVENT_DRIVEN: true,
+    POLL_MIN_MS: 3_000,  POLL_MAX_MS: 5_000,
+    IDLE_POLL_MIN_MS: 25_000, IDLE_POLL_MAX_MS: 75_000,
     // near-zero quiet window — seen + drafting start the instant a message is
     // detected; texts arriving mid-draft requeue and get their own reply
     DEBOUNCE_MIN_MS: 200, DEBOUNCE_MAX_MS: 500,
@@ -244,7 +232,34 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
 
   const LS_STATE = 'ig_agent_state_v3';
   const LS_MEM = 'ig_agent_mem_v1';
+  const LS_GLOBAL_MEM = 'ig_agent_global_mem_v1';
   const LS_TRANSCRIPTS = 'ig_agent_transcripts_v1';
+
+  function defaultGlobalMemory() {
+    return {
+      connections: [
+        {
+          a: 'adarshu.io',
+          b: 'deeps20_',
+          relation: 'close friends — Aduu talks to both and shares fun gossip/updates between them',
+        },
+      ],
+      people: {
+        'adarshu.io': {
+          handle: 'adarshu.io',
+          role: 'Adarsh (account owner & close friend of @deeps20_)',
+          lastSeen: 0, lastEmotion: '', lastTexts: [], lastReply: '', summary: '',
+        },
+        'deeps20_': {
+          handle: 'deeps20_',
+          role: 'Deeps (close friend of @adarshu.io)',
+          lastSeen: 0, lastEmotion: '', lastTexts: [], lastReply: '', summary: '',
+        },
+      },
+      gossip: [],
+      updated: 0,
+    };
+  }
 
   const S = {
     running: false,
@@ -261,7 +276,13 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
     pending: {}, busy: {}, recheckAfterBusy: {}, tries: {},
     llmFailStreak: 0, circuitUntil: 0,
     memory: {},
+    globalMemory: defaultGlobalMemory(),
     transcripts: {},             // threadFbid -> {user, messages[], lastMessageId, dirty}
+    idlePolls: 0,                // consecutive polls with no new message (drives anti-ban backoff)
+    realtimeInstalled: false,
+    realtimeSignals: 0,
+    lastRealtimeAt: 0,
+    domObserver: null,
     typingAvailable: undefined,  // undefined = not checked yet
     typingThreads: new Set(),    // threads whose typing indicator is currently ON
     checkedTargets: new Set(),   // target threadFbids checked at least once this run
@@ -341,6 +362,18 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
     try { S.memory = JSON.parse(localStorage.getItem(LS_MEM) || '{}'); }
     catch (_) { S.memory = {}; }
     try {
+      const gm = JSON.parse(localStorage.getItem(LS_GLOBAL_MEM) || 'null');
+      const base = defaultGlobalMemory();
+      if (gm && typeof gm === 'object') {
+        S.globalMemory = {
+          connections: Array.isArray(gm.connections) && gm.connections.length ? gm.connections : base.connections,
+          people: Object.assign({}, base.people, gm.people || {}),
+          gossip: Array.isArray(gm.gossip) ? gm.gossip.slice(-150) : [],
+          updated: gm.updated || 0,
+        };
+      }
+    } catch (_) { S.globalMemory = defaultGlobalMemory(); }
+    try {
       const t = JSON.parse(localStorage.getItem(LS_TRANSCRIPTS) || '{}');
       for (const [tid, T] of Object.entries(t)) {
         T.dirty = false; T.saveTimer = null;
@@ -374,6 +407,19 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
   }
   function saveMem() {
     try { localStorage.setItem(LS_MEM, JSON.stringify(S.memory)); } catch (_) {}
+  }
+  let _gmSaveTimer = null;
+  function saveGlobalMem() {
+    try { localStorage.setItem(LS_GLOBAL_MEM, JSON.stringify(S.globalMemory)); } catch (_) {}
+    if (_gmSaveTimer) return;
+    _gmSaveTimer = setTimeout(async () => {
+      _gmSaveTimer = null;
+      if (!S.wsReady) return;
+      try {
+        await wsRequest({ type: 'save_global', global_memory: S.globalMemory }, 10_000);
+      } catch (_) {}
+    }, 2_500);
+    if (_gmSaveTimer && typeof _gmSaveTimer.unref === 'function') _gmSaveTimer.unref();
   }
   let _trSaveTimer = null;
   function saveTranscriptsLocal() {
@@ -1305,6 +1351,167 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
     return hinglish.test(s) ? 'hinglish' : 'english';
   }
 
+  /* ────────── AGENT TOOLS: EMOTION ENGINE + GLOBAL MEMORY + GOSSIP ────────── */
+
+  function analyzeTurnEmotion(text, user) {
+    const s = String(text || '');
+    const flirty = /\b(?:baby+|babu|jaan|sona|cutie|hottie|pyaar|miss|kiss|hug|date|crush|flirt|love|shona|darling)\b|[🌚😘😍❤️‍🔥💋😏🤭]/i.test(s);
+    const nakhre = /\b(?:gayab|yaad\s*nhi|yaad\s*nahi|ignore|sorry|gift|chocolate|chocolates|bhao|nakhre|naraz|gussa|katti|kidhar)\b|[🤡😤😒🥺]/i.test(s);
+    const desiAbuse = /\b(?:goo|khaale|kutta|kutte|kamina|kamine|kamini|saala|saale|saali|harami|chutiya|chutiye|bc|mc|bkl|gandu|pagal|bhak|nikal|bakwas|chup|bewakoof|gadha|gadhe|nalayak|ullu)\b/i.test(s);
+    const hateAttitude = /\b(?:hate\s*you|get\s*lost|fuck\s*off|shut\s*up|loser|idiot|boring|don'?t\s*text|block)\b/i.test(s);
+    const gossip = /\b(?:deeps|deeps20_|adarsh|adarshu|usne|kya\s*bola|kya\s*bol\s*rahi|kya\s*chal\s*raha|gossip|chugli|secret|tell\s*me|bata\s*uske)\b/i.test(s);
+
+    const moods = [];
+    if (flirty) moods.push('flirty-sweet');
+    if (nakhre) moods.push('nakhre-drama');
+    if (desiAbuse) moods.push('desi-bakchodi-abuse');
+    if (hateAttitude) moods.push('rude-attitude-hate');
+    if (gossip) moods.push('curious-gossip');
+    if (!moods.length) moods.push('casual-genz');
+
+    let emotion = 'witty-genz-banter -> sharif good-boy charm';
+    let emojis = ['😏', '😌', '🤭', '😂'];
+    let coaching =
+      'Match their energy with witty Gen-Z Hinglish banter, add a playful tease, ' +
+      'and finish with a smooth hook.';
+
+    if (flirty && desiAbuse) {
+      emotion = 'naughty-flirty + desi-bakchodi -> sharif good-boy flip';
+      emojis = ['🌚', '💀', '🤭', '😌', '😏'];
+      coaching =
+        'They mixed sweet/flirty talk ("baby"/nakhre) with desi trash-talk/abuse in the same burst! ' +
+        'Call out the hilarious contrast ("pehle baby bolke phir gali/goo khila rahi hai 💀"), ' +
+        'roast them back playfully in Delhi style ("abey pagal dramebaaz / teri zubaan bohot chal rahi hai"), ' +
+        'tease any demand they made (like gift/chocolates), and finish with your signature innocent ' +
+        '"par chal main toh sharif good boy hoon na 😌" twist!';
+    } else if (desiAbuse) {
+      emotion = 'playful-desi-abusive-roast -> sharif good-boy flip';
+      emojis = ['💀', '😂', '🌚', '😌', '🤡'];
+      coaching =
+        'They threw playful desi trash-talk/gali at you. Clap back with funny Delhi bakchodi ' +
+        '("abey pagal", "saale/saali", "kamine/kamini", "zyada shana mat ban"), roast them hard ' +
+        'for 1-2 lines, and then flip into "par chhod, main toh seedha saadha good boy hoon 😌" at the end.';
+    } else if (flirty && nakhre) {
+      emotion = 'naughty-tease + nakhre-handle -> good-boy flip';
+      emojis = ['🌚', '🤭', '😏', '😌', '🍫'];
+      coaching =
+        'They are flirting and throwing cute nakhre/demands. Giggle at their drama, tease them with ' +
+        'a naughty double-meaning line, make them earn the gift/chocolate, and end with your innocent good-boy charm.';
+    } else if (flirty) {
+      emotion = 'flirty-naughty-charm -> good-boy flip';
+      emojis = ['🌚', '😏', '🤭', '😌', '❤️‍🔥'];
+      coaching =
+        'Lean into the flirt with a cocky, naughty tease, then flip to "main toh sharif ladka hoon 😌" so they keep chasing.';
+    } else if (nakhre) {
+      emotion = 'giggle-tease-nakhre -> good-boy flip';
+      emojis = ['🤭', '😂', '🤡', '😌'];
+      coaching =
+        'Call out their nakhre/drama playfully ("arre dramebaaz"), giggle at the complaint, and flip it back on them.';
+    } else if (hateAttitude) {
+      emotion = 'savage-attitude-cold-roast';
+      emojis = ['😒', '💀', '🔥'];
+      coaching =
+        'They showed rude attitude or hate. Give cold, funny Delhi savage attitude back — roast their ego in one sharp line and never beg.';
+    } else if (gossip) {
+      emotion = 'insider-gossip-chugli-tease';
+      emojis = ['👀', '🤭', '🌚', '😏'];
+      coaching =
+        'They are asking about a friend or gossip. Use your [TOOL: cross_chat_gossip_intel] and [GLOBAL MEMORY] ' +
+        'to spill spicy insider details from the other chat in a fun, teasy chugli style!';
+    }
+
+    return { user: cleanUsername(user), emotion, theirMood: moods, emojis, coaching };
+  }
+
+  function peekChat(targetUser) {
+    const q = cleanUsername(targetUser);
+    if (!q) return null;
+    const entry = Object.entries(S.transcripts).find(([, T]) => cleanUsername(T.user) === q);
+    const memEntry = Object.entries(S.memory).find(([, m]) => cleanUsername(m.user) === q);
+    const gmPerson = (S.globalMemory && S.globalMemory.people && S.globalMemory.people[q]) || null;
+
+    const recentMsgs = entry
+      ? entry[1].messages.slice(-6).map(m =>
+          `${m.mine ? 'Aduu' : '@' + q}: ${m.kind === 'text' ? m.text : '[' + m.label + ']'}`)
+      : (gmPerson && Array.isArray(gmPerson.lastTexts) && gmPerson.lastTexts.length
+          ? gmPerson.lastTexts.map(t => `@${q}: ${t}`)
+          : []);
+
+    const profile = (memEntry && memEntry[1] && memEntry[1].profile) ||
+                    (gmPerson && gmPerson.summary) || '';
+    if (!recentMsgs.length && !profile && !gmPerson) return null;
+    return {
+      user: q,
+      role: (gmPerson && gmPerson.role) || '',
+      lastEmotion: (gmPerson && gmPerson.lastEmotion) || '',
+      lastReply: (gmPerson && gmPerson.lastReply) || '',
+      profile,
+      recentMessages: recentMsgs,
+    };
+  }
+
+  function getConnectedFriends(user, burstText) {
+    const u = cleanUsername(user);
+    const s = String(burstText || '').toLowerCase();
+    const targets = new Set();
+    const conns = (S.globalMemory && S.globalMemory.connections) || [];
+    for (const c of conns) {
+      const a = cleanUsername(c.a), b = cleanUsername(c.b);
+      if (a === u && b) targets.add(b);
+      if (b === u && a) targets.add(a);
+    }
+    if (/\bdeeps\b/i.test(s) && u !== 'deeps20_') targets.add('deeps20_');
+    if (/\badarsh(?:u)?\b/i.test(s) && u !== 'adarshu.io') targets.add('adarshu.io');
+    for (const k of Object.keys((S.globalMemory && S.globalMemory.people) || {})) {
+      const ck = cleanUsername(k);
+      if (ck && ck !== u && s.includes(ck)) targets.add(ck);
+    }
+    for (const T of Object.values(S.transcripts)) {
+      const tu = cleanUsername(T.user);
+      if (tu && tu !== u && s.includes(tu)) targets.add(tu);
+    }
+    const intel = [];
+    for (const t of targets) {
+      const peek = peekChat(t);
+      if (peek) intel.push(peek);
+    }
+    return intel;
+  }
+
+  function syncGlobalMemory(tid, user, msgs, emotionReport, replyText) {
+    const u = cleanUsername(user);
+    if (!u) return;
+    if (!S.globalMemory) S.globalMemory = defaultGlobalMemory();
+    if (!S.globalMemory.people) S.globalMemory.people = {};
+    const existing = S.globalMemory.people[u] || {
+      handle: u, role: 'Instagram contact', lastSeen: 0,
+      lastEmotion: '', lastTexts: [], lastReply: '', summary: '',
+    };
+    const recentTheirs = msgs.filter(m => !m.mine && m.kind === 'text' && m.text)
+      .slice(-4).map(m => String(m.text).replace(/\s+/g, ' ').slice(0, 160));
+    existing.lastSeen = now();
+    if (recentTheirs.length) existing.lastTexts = recentTheirs;
+    if (emotionReport && emotionReport.emotion) existing.lastEmotion = emotionReport.emotion;
+    if (replyText) existing.lastReply = String(replyText).slice(0, 200);
+    if (S.memory[tid] && S.memory[tid].profile) existing.summary = S.memory[tid].profile.slice(0, 300);
+    S.globalMemory.people[u] = existing;
+
+    if (recentTheirs.length) {
+      const gLine = `@${u} [${existing.lastEmotion || 'chat'}]: "${recentTheirs.join(' / ')}"` +
+        (replyText ? ` -> Aduu: "${String(replyText).slice(0, 120)}"` : '');
+      if (!Array.isArray(S.globalMemory.gossip)) S.globalMemory.gossip = [];
+      const lastG = S.globalMemory.gossip[S.globalMemory.gossip.length - 1];
+      if (lastG !== gLine) {
+        S.globalMemory.gossip.push(gLine);
+        if (S.globalMemory.gossip.length > 120) {
+          S.globalMemory.gossip = S.globalMemory.gossip.slice(-100);
+        }
+      }
+    }
+    S.globalMemory.updated = now();
+    saveGlobalMem();
+  }
+
   function buildHistory(msgs, tid, user) {
     const sysParts = [CFG.SYSTEM_PROMPT];
     if (CFG.OWNER_BIO) sysParts.push('ABOUT THE ACCOUNT OWNER (Adarsh):\n' + CFG.OWNER_BIO);
@@ -1320,6 +1527,22 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
           'Use it naturally — never recite it, never mention that you keep notes.');
       }
     }
+
+    // GLOBAL MEMORY + SOCIAL CONNECTIONS across all chats
+    const conns = (S.globalMemory && S.globalMemory.connections) || [];
+    const recentGossip = ((S.globalMemory && S.globalMemory.gossip) || []).slice(-6);
+    if (conns.length || recentGossip.length) {
+      const connLines = conns.map(c => `- @${c.a} <-> @${c.b}: ${c.relation}`).join('\n');
+      const gossipLines = recentGossip.length
+        ? '\nRECENT CROSS-CHAT UPDATES:\n' + recentGossip.map(g => '- ' + g).join('\n')
+        : '';
+      sysParts.push(
+        `[GLOBAL MEMORY & SOCIAL GRAPH]\n` +
+        (connLines ? `CONNECTIONS:\n${connLines}` : '') +
+        gossipLines +
+        '\n(You know these connections naturally. When chatting with @adarshu.io or @deeps20_ or connected friends, you can tease them or share fun gossip from what the other person said!)');
+    }
+
     // anti-repetition: show the model what it already said in this chat
     const recentMine = msgs.filter(m => m.mine && m.kind === 'text')
       .slice(-4).map(m => '- ' + String(m.text).replace(/\s+/g, ' ').slice(0, 160));
@@ -1332,8 +1555,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
       `CONTEXT: it is ${timeOfDay()} where you are (Delhi). Let that colour a ` +
       'greeting only if it fits naturally; never announce the time or the date.');
 
-    /* TURN SHAPE + BURST AWARENESS — mirror the other person and understand
-       their full unanswered turn in the context of what we said right before. */
+    /* TURN SHAPE + BURST AWARENESS + AGENT TOOLS */
     let lastOwnIdx = -1;
     msgs.forEach((m, i) => { if (m.mine) lastOwnIdx = i; });
     const prevMine = lastOwnIdx >= 0 ? msgs[lastOwnIdx] : null;
@@ -1341,12 +1563,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
       .filter(m => !m.mine && m.kind === 'text' && m.text && m.text.trim());
     const theirs = burst[burst.length - 1] || msgs.filter(m => !m.mine && m.kind === 'text').slice(-1)[0];
     if (theirs && theirs.text) {
-      const joinedBurst = burst.length ? burst.map(m => m.text).join(' ') : theirs.text;
+      const joinedBurst = burst.length ? burst.map(m => m.text).join('\n') : theirs.text;
       const theirLen = joinedBurst.length;
       const band = theirLen <= 25 ? 'one short line, under 60 characters'
         : theirLen <= 90 ? '1 short sentence, under 120 characters'
-        : theirLen <= 220 ? '1-2 sentences, under 200 characters'
-        : 'at most 3 sentences, under 300 characters';
+        : theirLen <= 220 ? '1-2 sentences, under 220 characters'
+        : '2-3 punchy sentences, under 300 characters';
       const lang = detectLang(joinedBurst);
       const langLine = lang === 'devanagari'
         ? 'They typed in Hindi/Devanagari. Reply in the same Hinglish register, ' +
@@ -1355,25 +1577,70 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
           ? 'They are writing mostly in English. Keep your reply mostly English ' +
             'with at most one Hinglish word, and do not switch fully into Hindi.'
           : 'They are texting in Hinglish. Match that mix.';
+
+      // Tool 1: Emotion + Emoji + Naughty->GoodBoy Coaching
+      const emo = analyzeTurnEmotion(joinedBurst, user);
+      sysParts.push(
+        `[TOOL: emotion_and_vibe_analyzer]\n` +
+        `DETECTED USER VIBE: ${emo.theirMood.join(', ')}\n` +
+        `ADUU EMOTION MODE: ${emo.emotion}\n` +
+        `SUGGESTED EMOJI PALETTE: ${emo.emojis.join(' ')}\n` +
+        `INTERNAL GEN-Z ENGAGEMENT STRATEGY: ${emo.coaching}`);
+
+      // Tool 2: Cross-Chat Gossip / Friend Peek Tool
+      const friendIntel = getConnectedFriends(user, joinedBurst);
+      if (friendIntel.length) {
+        const intelText = friendIntel.map(f => {
+          const lines = [`Friend @${f.user}` + (f.role ? ` (${f.role})` : '') + ':'];
+          if (f.lastEmotion) lines.push(`  vibe: ${f.lastEmotion}`);
+          if (f.profile) lines.push(`  known facts: ${f.profile.replace(/\s+/g, ' ').slice(0, 180)}`);
+          if (f.recentMessages && f.recentMessages.length) {
+            lines.push('  latest messages in their chat:\n    ' + f.recentMessages.join('\n    '));
+          }
+          return lines.join('\n');
+        }).join('\n');
+        sysParts.push(
+          `[TOOL: cross_chat_gossip_intel]\n${intelText}\n` +
+          '(Use this intel naturally when relevant or when they ask about their friend — gossip like a real insider!)');
+      }
+
       const prevLine = (prevMine && prevMine.text)
         ? `YOUR MESSAGE RIGHT BEFORE THEIR REPLY: "${String(prevMine.text).replace(/\s+/g, ' ').slice(0, 200)}"\n`
         : '';
       const burstBlock = burst.length > 1
-        ? `THEIR NEWEST UNANSWERED BURST (${burst.length} messages in a row):\n` +
-          burst.map((m, idx) => `  ${idx + 1}. "${String(m.text).replace(/\s+/g, ' ').slice(0, 200)}"`).join('\n')
+        ? `THEIR NEWEST UNANSWERED BURST (${burst.length} messages merged into one turn):\n"""\n${joinedBurst}\n"""`
         : `THEIR NEWEST TEXT: "${String(theirs.text).replace(/\s+/g, ' ').slice(0, 240)}"`;
       sysParts.push(
         prevLine +
         burstBlock + '\n' +
         `REPLY SHAPE: ${band}. ${langLine}\n` +
-        'Answer the thing they actually said first (and connect short answers to your previous message). ' +
+        'React to their whole message burst (from start to last line) and connect short answers to your previous message. ' +
         'Do not open with hi/hello/hey unless they greeted you. Do not change the topic to yourself.');
     }
+
+    /* CHAT COMPLETION MESSAGE COALESCING:
+       Consecutive messages from the same role ('user' or 'assistant') are
+       merged into ONE message separated by newlines:
+         """
+         Hyy babyy🌚🌚
+         Itne din se kahan gayab ho
+         ...
+         Khaale thoda sa goo
+         """
+       so the model sees the entire burst as one cohesive turn and roles
+       strictly alternate user <-> assistant. */
     const out = [{ role: 'system', content: sysParts.join('\n\n') }];
     for (const m of msgs.slice(-CFG.HISTORY_MESSAGES)) {
       const content = m.kind === 'text' ? m.text : `[sent ${m.label}]`;
       if (!content || !content.trim()) continue;
-      out.push({ role: m.mine ? 'assistant' : 'user', content });
+      const role = m.mine ? 'assistant' : 'user';
+      const clean = content.trim();
+      const prev = out[out.length - 1];
+      if (prev && prev.role === role) {
+        prev.content += '\n' + clean;
+      } else {
+        out.push({ role, content: clean });
+      }
     }
     return out;
   }
@@ -1463,6 +1730,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
         S.lastActivity[tid] = newest.ts;
       }
       if (newest.mine) {
+        syncGlobalMemory(tid, user, msgs, null, newest.text || '');
         msgs.forEach(m => m.id && S.handled.add(m.id));
         saveState();
         scheduleTranscriptSave(tid, 5_000);
@@ -1512,12 +1780,39 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
         return log(C.dim, 'media', `@${user}: newest is ${lastC.label} — detected, NOT replying`);
       }
 
+      // Reset idle poll counter since we have a real incoming turn
+      S.idlePolls = 0;
+      const joinedUnanswered = unanswered.filter(m => m.kind === 'text' && m.text)
+        .map(m => m.text).join('\n') || newest.text || '';
+      const turnEmo = analyzeTurnEmotion(joinedUnanswered, user);
+      syncGlobalMemory(tid, user, msgs, turnEmo, null);
+
       // typing trail ON from the first moment of drafting — it stays on for
       // the entire LLM generation and switches off exactly when we send
       const typing = await typingOn(tid);
       const t0 = now();
       const history = buildHistory(msgs, tid, user);
       let { text: reply, model } = await llm(history);
+
+      // Optional live tool call: if the model emits [TOOL:peek_chat("username")],
+      // fetch that friend's thread on demand and let the model answer with the result.
+      const toolMatch = String(reply || '').match(/\[TOOL:peek_chat\(["']?([^"')\]\s]+)["']?\)\]/i);
+      if (toolMatch && toolMatch[1]) {
+        const targetU = cleanUsername(toolMatch[1]);
+        try {
+          const fTh = await findThread(targetU);
+          if (fTh) await fetchThreadNodes(String(fTh.thread_fbid || fTh.id), targetU);
+        } catch (_) {}
+        const peeked = peekChat(targetU);
+        const toolOut = peeked
+          ? `Live messages with @${targetU}:\n` + (peeked.recentMessages || []).join('\n')
+          : `No recent messages found for @${targetU}.`;
+        const second = await llm(history.concat([
+          { role: 'system', content: `[TOOL RESULT peek_chat(@${targetU})]:\n${toolOut}\nNow write your final reply to @${user} naturally.` },
+        ]));
+        if (second && second.text) { reply = second.text; model = second.model; }
+      }
+
       reply = CFG.HUMANIZE ? humanizeReply(reply) : String(reply || '').trim();
       if (!reply) throw new Error('empty reply from bridge');
 
@@ -1587,6 +1882,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
       // final bubble only
       if (typing) await typingOff(tid);
       S.cooldownUntil[tid] = now() + CFG.THREAD_COOLDOWN_MS;
+      syncGlobalMemory(tid, user, msgs, turnEmo, reply);
       updateMemory(tid, user, msgs, reply);
       scheduleTranscriptSave(tid, 5_000);
 
@@ -1611,11 +1907,85 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
     }
   }
 
-  /* ──────────────────────────── MAIN LOOP ──────────────────────────── */
+  /* ─────── EVENT-DRIVEN REALTIME PUSH + ADAPTIVE ANTI-BAN LOOP ─────── */
+
+  let _rtDebounce = null;
+  function onRealtimeSignal(source = 'push') {
+    S.realtimeSignals = (S.realtimeSignals || 0) + 1;
+    S.lastRealtimeAt = now();
+    S.idlePolls = 0;
+    if (!S.running) return;
+    if (_rtDebounce) return;
+    _rtDebounce = setTimeout(() => {
+      _rtDebounce = null;
+      if (S.running) pollNow();
+    }, 250);
+    if (_rtDebounce && typeof _rtDebounce.unref === 'function') _rtDebounce.unref();
+  }
+
+  function nextPollDelayMs() {
+    if (!CFG.EVENT_DRIVEN || S.idlePolls <= 1) {
+      return rand(CFG.POLL_MIN_MS, CFG.POLL_MAX_MS);
+    }
+    // Progressive anti-IP-block backoff when no new messages are arriving:
+    // Realtime WebSocket + DOM watchers catch new messages instantly (< 250ms),
+    // so GraphQL does not need to be hammered while chats are quiet.
+    const factor = Math.min(12, Math.pow(1.65, Math.min(8, S.idlePolls - 1)));
+    const lo = Math.min(CFG.IDLE_POLL_MIN_MS, CFG.POLL_MIN_MS * factor);
+    const hi = Math.min(CFG.IDLE_POLL_MAX_MS, CFG.POLL_MAX_MS * factor);
+    return rand(lo, Math.max(lo + 1000, hi));
+  }
+
+  function installRealtimeWatchers() {
+    if (S.realtimeInstalled) return;
+    S.realtimeInstalled = true;
+    try {
+      // 1. Hook Instagram's own realtime WebSocket (edge-chat / gateway.instagram.com)
+      const OrigWS = window && window.WebSocket;
+      if (typeof OrigWS === 'function' && !OrigWS._igAgentHooked) {
+        const WrappedWS = function(url, protocols) {
+          const ws = protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
+          try {
+            const u = String(url || '');
+            // Ignore our own local bridge socket; tap Instagram's realtime push socket
+            if (!/localhost|127\.0\.0\.1/i.test(u) && typeof ws.addEventListener === 'function') {
+              ws.addEventListener('message', (ev) => {
+                const size = ev && ev.data ? (ev.data.byteLength || ev.data.length || 0) : 0;
+                if (size > 24) onRealtimeSignal('ig-ws-push');
+              });
+            }
+          } catch (_) {}
+          return ws;
+        };
+        WrappedWS.prototype = OrigWS.prototype;
+        Object.assign(WrappedWS, OrigWS, { _igAgentHooked: true });
+        try { window.WebSocket = WrappedWS; } catch (_) {}
+      }
+
+      // 2. DOM + <title> MutationObserver for instant unread badge / chat row updates
+      if (typeof MutationObserver === 'function' && typeof document !== 'undefined' && document.body) {
+        let lastSnap = document.title || '';
+        const obs = new MutationObserver(() => {
+          const t = document.title || '';
+          if (t !== lastSnap) {
+            lastSnap = t;
+            if (/^\(\d+\)/.test(t) || /messaged/i.test(t)) {
+              onRealtimeSignal('title-unread');
+              return;
+            }
+          }
+          onRealtimeSignal('dom-mutation');
+        });
+        obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+        S.domObserver = obs;
+      }
+    } catch (_) {}
+  }
 
   async function pollTick() {
     if (!S.running) return;
     if (S.timer) { clearTimeout(S.timer); S.timer = null; }
+    let hadActivity = false;
     try {
       if (!S.wsReady) wsConnect().catch(() => {});
       const threads = await fetchInbox();
@@ -1646,21 +2016,23 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
 
         if (baseline) {
           if (CFG.TRANSCRIPTS && !S.transcripts[tid]) backfillThread(tid, user);
-          // On real Instagram timestamps (epoch ms > 10_000), queue an immediate
-          // parallel gate check for every target so any thread where their
-          // message is already last (mine: false) gets answered right away.
           if (act > 10_000) {
+            hadActivity = true;
             queueThread(tid, user, rand(CFG.DEBOUNCE_MIN_MS, CFG.DEBOUNCE_MAX_MS), null);
           }
           continue;
         }
 
-        // Direct check for active targets in parallel so cached inbox timestamps
-        // can never hide a new incoming message.
+        // Only call fetchThreadNodes when activity bumped, on first check of a
+        // newly-added target, or when a realtime push signal just fired — not
+        // hammering every thread when completely idle.
+        const recentPush = (now() - (S.lastRealtimeAt || 0)) < 15_000;
         const explicitTargetPoll = Array.isArray(CFG.TARGETS) &&
-          CFG.TARGETS.length <= 25 && !S.busy[tid] && !S.pending[tid];
+          CFG.TARGETS.length <= 25 && !S.busy[tid] && !S.pending[tid] &&
+          (recentPush || S.idlePolls <= 1);
 
         if (bumped || firstCheck || explicitTargetPoll) {
+          if (bumped || firstCheck) hadActivity = true;
           if (bumped) {
             log(C.info, 'new', `@${user}: activity bump (${new Date(act).toLocaleTimeString()})`);
           }
@@ -1671,13 +2043,15 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
           queueThread(tid, user, wait, null);
         }
       }
+      if (hadActivity) S.idlePolls = 0;
+      else S.idlePolls = (S.idlePolls || 0) + 1;
       saveState();
       S.lastPollAt = now();
     } catch (e) {
       if (/token|dtsg|csrf|400|401/i.test(e.message || '')) resetTokens();
       log(C.warn, 'poll', 'retrying after transient error:', e.message);
     }
-    if (S.running) S.timer = setTimeout(pollTick, rand(CFG.POLL_MIN_MS, CFG.POLL_MAX_MS));
+    if (S.running) S.timer = setTimeout(pollTick, nextPollDelayMs());
   }
 
   function pollNow() {
@@ -1712,7 +2086,8 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
     } catch (e) {
       log(C.warn, 'main', 'inbox warmup warning (' + e.message + ') — will retry in poll loop');
     }
-    S.running = true; S.startedAt = now(); S.startedPolls = 0;
+    S.running = true; S.startedAt = now(); S.startedPolls = 0; S.idlePolls = 0;
+    installRealtimeWatchers();
     if (S.wsKeepalive) clearInterval(S.wsKeepalive);
     S.wsKeepalive = setInterval(() => {
       if (!S.running) return;
@@ -2063,8 +2438,46 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
               humanizeReply, looksRepeated, trimToSentence, checkDraft, humanityScore, matchCase,
               splitBubbles, detectLang, weakestCheck, countMachineTells, removeMachineTells,
               cleanUsername, parseTargetArgs, buildHistory,
+              analyzeTurnEmotion, peekChat, getConnectedFriends, syncGlobalMemory,
+              onRealtimeSignal, nextPollDelayMs,
               SLOP_WORDS, SLOP_PHRASES, STRUCTURES,
               get S() { return S; } },
+    globalMemory() {
+      console.log('%cIGAgent Global Memory & Social Graph', C.info, S.globalMemory);
+      return S.globalMemory;
+    },
+    linkFriends(userA, userB, relation = 'close friends') {
+      const a = cleanUsername(userA), b = cleanUsername(userB);
+      if (!a || !b) return S.globalMemory.connections;
+      if (!Array.isArray(S.globalMemory.connections)) S.globalMemory.connections = [];
+      const exists = S.globalMemory.connections.find(c =>
+        (cleanUsername(c.a) === a && cleanUsername(c.b) === b) ||
+        (cleanUsername(c.a) === b && cleanUsername(c.b) === a));
+      if (exists) exists.relation = relation;
+      else S.globalMemory.connections.push({ a, b, relation });
+      saveGlobalMem();
+      log(C.ok, 'gmem', `linked @${a} <-> @${b} (${relation})`);
+      return S.globalMemory.connections;
+    },
+    addGossip(note) {
+      const g = String(note || '').trim();
+      if (!g) return S.globalMemory.gossip;
+      if (!Array.isArray(S.globalMemory.gossip)) S.globalMemory.gossip = [];
+      S.globalMemory.gossip.push(g);
+      saveGlobalMem();
+      log(C.ok, 'gmem', 'added gossip:', g);
+      return S.globalMemory.gossip;
+    },
+    peekChat(user) {
+      const p = peekChat(user);
+      console.log(`%cCross-chat intel for @${cleanUsername(user)}`, C.info, p);
+      return p;
+    },
+    eventDriven(v) {
+      CFG.EVENT_DRIVEN = !!v;
+      log(C.ok, 'main', 'EVENT_DRIVEN =', CFG.EVENT_DRIVEN);
+      return CFG.EVENT_DRIVEN;
+    },
     targets: setTargetsInternal,
     setTargets: setTargetsInternal,
     addTargets: addTargetsInternal,
@@ -2107,9 +2520,10 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch batao"`,
     clearState() {
       localStorage.removeItem(LS_STATE);
       localStorage.removeItem(LS_MEM);
+      localStorage.removeItem(LS_GLOBAL_MEM);
       localStorage.removeItem(LS_TRANSCRIPTS);
       S.handled.clear(); S.dryHandled.clear(); S.checkedTargets.clear();
-      S.lastActivity = {}; S.memory = {}; S.transcripts = {};
+      S.lastActivity = {}; S.memory = {}; S.globalMemory = defaultGlobalMemory(); S.transcripts = {};
       CFG.TARGETS = [...CFG.DEFAULT_TARGETS];
       CFG.DRY_RUN = false;
       log(C.warn, 'main', 'stored state cleared · default targets restored:', CFG.TARGETS.join(', '));

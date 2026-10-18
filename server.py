@@ -299,6 +299,56 @@ def load_transcript(user: str) -> dict | None:
         return json.load(f)
 
 
+GLOBAL_MEM_PATH = os.path.join(TRANSCRIPT_DIR, "_global_memory.json")
+
+
+def save_global_memory(gm: dict) -> dict:
+    """Persist the cross-chat global memory + social graph + gossip on disk."""
+    with _SAVE_LOCK:
+        old: dict = {}
+        if os.path.exists(GLOBAL_MEM_PATH):
+            try:
+                with open(GLOBAL_MEM_PATH, encoding="utf-8") as f:
+                    old = json.load(f)
+            except Exception:
+                old = {}
+        people = dict(old.get("people") or {})
+        for k, v in (gm.get("people") or {}).items():
+            if isinstance(v, dict):
+                people[str(k)] = v
+        conns = gm.get("connections") or old.get("connections") or []
+        gossip = (old.get("gossip") or []) + (gm.get("gossip") or [])
+        seen_g = set()
+        dedup_gossip = []
+        for g in gossip:
+            gs = str(g).strip()
+            if gs and gs not in seen_g:
+                seen_g.add(gs)
+                dedup_gossip.append(gs)
+        doc = {
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "connections": conns,
+            "people": people,
+            "gossip": dedup_gossip[-200:],
+        }
+        os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+        tmp = GLOBAL_MEM_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, GLOBAL_MEM_PATH)
+    return {"file": GLOBAL_MEM_PATH, "people_count": len(doc["people"]), "gossip_count": len(doc["gossip"])}
+
+
+def load_global_memory() -> dict:
+    if os.path.exists(GLOBAL_MEM_PATH):
+        try:
+            with open(GLOBAL_MEM_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"connections": [], "people": {}, "gossip": []}
+
+
 # ═══════════════════════════ WEBSOCKET (CSP bypass) ═══════════════════════════
 # Instagram's CSP blocks fetch() to http://127.0.0.1 but ALLOWS ws://localhost:*.
 # So the page-side bot talks to the bridge over a tiny hand-rolled WebSocket.
@@ -447,6 +497,26 @@ def handle_ws(handler) -> None:
                 except (BrokenPipeError, ConnectionError, OSError, ValueError):
                     pass
                 continue
+            if req.get("type") == "save_global":
+                rid = req.get("id")
+                try:
+                    gm = req.get("global_memory") or req.get("global")
+                    if not isinstance(gm, dict):
+                        raise ValueError("'global_memory' dict is required")
+                    r = save_global_memory(gm)
+                    resp = {"id": rid, "ok": True, "people": r["people_count"], **r}
+                except Exception as e:
+                    resp = {"id": rid, "ok": False, "error": str(e)[:300]}
+                try:
+                    conn.send_text(json.dumps(resp))
+                except (BrokenPipeError, ConnectionError, OSError, ValueError):
+                    pass
+                continue
+            if req.get("type") == "get_global":
+                rid = req.get("id")
+                gm_doc = load_global_memory()
+                conn.send_text(json.dumps({"id": rid, "ok": True, "global_memory": gm_doc, "global": gm_doc}))
+                continue
             # Do not block this connection while an LLM streams. The browser's
             # request ids let responses safely arrive in whichever order finishes first.
             threading.Thread(target=_serve_ws_reply, args=(conn, req), daemon=True).start()
@@ -502,6 +572,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/models":
             self._json(200, {"models": [m.name for m in MODELS], "default": DEFAULT_MODEL})
+        elif path == "/global_memory":
+            self._json(200, load_global_memory())
         elif path == "/transcripts":
             self._json(200, {"transcripts": list_transcripts()})
         elif path.startswith("/transcripts/"):

@@ -137,9 +137,24 @@ Voice anchors (in the prompt, as style examples — not templates):
 them: "kya kar raha hai"   → you: "bas tumhari yaad mein scroll kar raha tha 😏 tu bata"
 them: "who are you"        → you: "Aduu. Adarsh ke DMs sambhalta hoon, uska dost. Tu bata, kahan se ho?"
 them: "bore ho raha hoon"  → you: "acha? phir meri galti nahi hai, pehle batana tha 😌 batao kya scene hai"
+them (burst):
+  "Hyy babyy🌚🌚
+   Itne din se kahan gayab ho
+   Yaad nhi aati meri🤡🤡
+   Jaldi se sorry ka gift bhej with chocolates
+   Hiluuuu biluuu
+   Khaale thoda sa goo"
+→ you: "arre dramebaaz 🤭 pehle baby bolke phir seedha goo khila rahi hai, kya bipolar pyar hai ye 💀 chocolate toh tab milegi jab tameez se maangegi, par chal main toh sharif good boy hoon isliye maaf kiya 😌 bata kahan gayab thi tu?"
 ```
 
-Change it live with `IGAgent.prompt("...")`; cached copies of **older default**
+### v5 Agent Tools, Global Memory & Event-Driven Anti-Ban
+
+1. **Consecutive User Message Coalescing (`buildHistory`)** — When a user sends a multi-message burst in a row, all consecutive `user` messages are merged into **one** newline-joined `{role: "user", content: "msg1\nmsg2\n..."}` turn so the LLM sees and reacts to the entire burst together.
+2. **Global Memory & Cross-Chat Gossip Tool (`adarshu.io` ↔ `deeps20_`)** — `S.globalMemory` (persisted to `localStorage` and `transcripts/_global_memory.json` via the bridge) tracks connections between contacts (`adarshu.io` and `deeps20_` are linked as close friends by default), each person's recent texts/vibe, and cross-chat gossip. When chatting with one friend or when someone asks about another contact, `[TOOL: cross_chat_gossip_intel]` injects their friend's latest messages so Aduu can gossip naturally.
+3. **Emotion & Emoji Analyzer Tool + "Naughty/Bakchod → Sharif Good Boy" Signature** — `analyzeTurnEmotion()` inspects every incoming burst (`flirty-sweet`, `nakhre-drama`, `desi-bakchodi-abuse`, `rude-attitude-hate`, `curious-gossip`), selects expressive Gen-Z emojis (`🌚 😏 🤭 💀 😌 🤡 😂`), and coaches Aduu to match flirty/naughty/playful desi-abusive banter before flipping into an innocent *"main toh sharif good boy hoon 😌"* ending.
+4. **Event-Driven Realtime Message Detection (Anti-IP-Block)** — Instead of hammering `/api/graphql` every few seconds when idle, `installRealtimeWatchers()` hooks Instagram's own realtime WebSocket push frames (`edge-chat` / `gateway.instagram.com`) and DOM/title `MutationObserver` events to trigger an instant check (`< 250ms`) on incoming messages while backing off idle GraphQL polls up to `25–75s`.
+
+Change the persona live with `IGAgent.prompt("...")`; cached copies of **older default**
 personas are ignored after upgrades (only your own custom prompt is restored).
 
 ## Last-reply gate
@@ -220,6 +235,13 @@ IGAgent.targets('adarshu.io, deeps20_, user3')    // replace the target group at
 IGAgent.allTargets()                              // or IGAgent.everyone() — reply to EVERYONE in 1:1 DMs
 IGAgent.removeTargets('user3')                    // remove one or more targets
 IGAgent.targets()                                 // view currently active targets
+
+// Cross-chat Global Memory & Gossip tools:
+IGAgent.globalMemory()                            // inspect global memory, social graph & gossip
+IGAgent.peekChat('deeps20_')                      // see latest cross-chat intel for @deeps20_
+IGAgent.linkFriends('adarshu.io', 'deeps20_')     // link two contacts as friends in the social graph
+IGAgent.addGossip('deeps was asking for chocolates') // add a cross-chat gossip note
+IGAgent.eventDriven(true)                         // toggle event-driven anti-IP-block mode (ON by default)
 
 // Other controls:
 IGAgent.status()               // live status, active targets, counters, bridge health
