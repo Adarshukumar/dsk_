@@ -23,24 +23,51 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-MODEL_WIRE = "@cf/google/gemma-4-26b-a4b-it"
-MODEL_RESP = "@cf/google/gemma-4-26b-a4b-it-external"
+MODEL_WIRE = "@cf/qwen/qwen3-30b-a3b-fp8"
+BRAIN_MODEL_WIRE = "@cf/google/gemma-4-26b-a4b-it"
+MODEL_RESP = "@cf/qwen/qwen3-30b-a3b-fp8"
+BRAIN_MODEL_RESP = "@cf/google/gemma-4-26b-a4b-it-external"
 
 REASONING = (
-    'The user said "bro hi". They are casual and friendly, so the reply should '
-    "be short, warm and human. Match the Hinglish tone, keep it to one or two "
-    "sentences, and end with a light question."
+    'Okay, the user said "hey bro". Let me think about how to respond. '
+    "Keep the tone relaxed and approachable. Ready to respond."
 )
 CONTENT = "Yo! I'm listening, bro. What's up?"
 
 
-def _frame(delta: dict, finish=None, usage=None, choices=True) -> str:
+def _qwen_frame(content=None, role=None, finish=None, usage=None, choices=True) -> str:
+    """Exact @cf/qwen/qwen3-30b-a3b-fp8 SSE chunk shape (both delta.content and top-level response)."""
+    delta = {}
+    if role is not None:
+        delta["role"] = role
+    if content is not None:
+        delta["content"] = content
+    payload = {
+        "id": "chatcmpl-3086a16e-6cd6-4d99-b342-4d495aa4797e",
+        "object": "chat.completion.chunk",
+        "created": 1792321951,
+        "model": MODEL_RESP,
+        "choices": ([{"index": 0, "delta": delta, "logprobs": None,
+                      "finish_reason": finish, "token_ids": None}] if choices else []),
+        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 1 if content else 0,
+                           "total_tokens": 1 if content else 0,
+                           "prompt_tokens_details": {"cached_tokens": 0},
+                           "neurons": 0.030474770814180374 if content else 0},
+        "tool_calls": [],
+        "p": "mockqwen",
+    }
+    if content is not None:
+        payload["response"] = content
+    return "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
+
+
+def _gemma_frame(delta: dict, finish=None, usage=None, choices=True) -> str:
     payload = {
         "choices": ([{"delta": delta, "finish_reason": finish, "index": 0,
                       "logprobs": None, "matched_stop": None}] if choices else []),
         "created": int(time.time()),
         "id": "mock-completion-id",
-        "model": MODEL_RESP,
+        "model": BRAIN_MODEL_RESP,
         "object": "chat.completion.chunk",
         "p": "mock",
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0,
@@ -50,46 +77,72 @@ def _frame(delta: dict, finish=None, usage=None, choices=True) -> str:
     return "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
 
 
-def _usage_frame(prompt=385, completion=250) -> str:
+def _usage_frame(prompt=112, completion=250) -> str:
     payload = {
         "response": "",
         "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
                   "total_tokens": prompt + completion,
                   "prompt_tokens_details": {"cached_tokens": 0},
-                  "neurons": 10.318181835114956},
+                  "neurons": 5.21106780320406},
     }
     return "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
 
 
-def build_stream() -> bytes:
-    """Full SSE body, in wire order."""
+def build_qwen_stream() -> bytes:
+    """Exact @cf/qwen/qwen3-30b-a3b-fp8 SSE stream (inline <think>...</think> + response field)."""
     out = []
-    # 1. role-only opener (content "" / reasoning_content null)
-    out.append(_frame({"content": "", "reasoning_content": None, "role": "assistant"},
-                      usage={"prompt_tokens": 385, "completion_tokens": 0,
-                             "total_tokens": 385,
-                             "prompt_tokens_details": {"cached_tokens": 0},
-                             "neurons": 3.5}))
-    # 2. reasoning phase, token by token (thinking models stream this first)
+    out.append(_qwen_frame(content="", role="assistant",
+                           usage={"prompt_tokens": 112, "completion_tokens": 0,
+                                  "total_tokens": 112,
+                                  "prompt_tokens_details": {"cached_tokens": 0},
+                                  "neurons": 0.517953097820282}))
+    out.append(_qwen_frame(content="<think>"))
+    out.append(_qwen_frame(content="\n"))
     for word in REASONING.split(" "):
-        out.append(_frame({"reasoning_content": word + " "},
-                          usage={"prompt_tokens": 0, "completion_tokens": 1,
-                                 "total_tokens": 1,
-                                 "prompt_tokens_details": {"cached_tokens": 0},
-                                 "neurons": 0.027}))
-    # 3. answer
+        out.append(_qwen_frame(content=word + " "))
+    out.append(_qwen_frame(content="\n"))
+    out.append(_qwen_frame(content="</think>"))
+    out.append(_qwen_frame(content="\n\n"))
     for word in CONTENT.split(" "):
-        out.append(_frame({"content": word + " ", "reasoning_content": None},
-                          usage={"prompt_tokens": 0, "completion_tokens": 1,
-                                 "total_tokens": 1,
-                                 "prompt_tokens_details": {"cached_tokens": 0},
-                                 "neurons": 0.027}))
-    # 4. stop + empty-choices keepalive + summary + [DONE]
-    out.append(_frame({"reasoning_content": None}, finish="stop"))
-    out.append(_frame({}, choices=False))
+        out.append(_qwen_frame(content=word + " "))
+    out.append(_qwen_frame(finish="stop"))
+    out.append(_qwen_frame(choices=False))
     out.append(_usage_frame())
     out.append("data: [DONE]\n\n")
     return "".join(out).encode()
+
+
+def build_gemma_stream() -> bytes:
+    """Full Gemma-4 SSE body (delta.reasoning_content phase -> delta.content)."""
+    out = []
+    out.append(_gemma_frame({"content": "", "reasoning_content": None, "role": "assistant"},
+                            usage={"prompt_tokens": 385, "completion_tokens": 0,
+                                   "total_tokens": 385,
+                                   "prompt_tokens_details": {"cached_tokens": 0},
+                                   "neurons": 3.5}))
+    for word in REASONING.split(" "):
+        out.append(_gemma_frame({"reasoning_content": word + " "},
+                                usage={"prompt_tokens": 0, "completion_tokens": 1,
+                                       "total_tokens": 1,
+                                       "prompt_tokens_details": {"cached_tokens": 0},
+                                       "neurons": 0.027}))
+    for word in CONTENT.split(" "):
+        out.append(_gemma_frame({"content": word + " ", "reasoning_content": None},
+                                usage={"prompt_tokens": 0, "completion_tokens": 1,
+                                       "total_tokens": 1,
+                                       "prompt_tokens_details": {"cached_tokens": 0},
+                                       "neurons": 0.027}))
+    out.append(_gemma_frame({"reasoning_content": None}, finish="stop"))
+    out.append(_gemma_frame({}, choices=False))
+    out.append(_usage_frame())
+    out.append("data: [DONE]\n\n")
+    return "".join(out).encode()
+
+
+def build_stream(model: str = "") -> bytes:
+    if "gemma" in (model or "").lower():
+        return build_gemma_stream()
+    return build_qwen_stream()
 
 
 class MockLLM:
@@ -122,7 +175,7 @@ class MockLLM:
                     return self._json(404, {"error": "unknown path"})
                 if any(part in model for part in outer.fail_models):
                     return self._json(500, {"error": "mock upstream failure"})
-                data = build_stream()
+                data = build_stream(model)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")

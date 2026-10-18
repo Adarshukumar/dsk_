@@ -116,12 +116,39 @@ class FakeWS {
     if (req.type === 'health') {
       reply({
         id: req.id, ok: true,
-        default_model: 'google/gemma-4-26b-a4b-it',
-        default_endpoint: '@cf/google/gemma-4-26b-a4b-it',
-        chain: ['google/gemma-4-26b-a4b-it'], uptime_s: 1,
+        default_model: 'qwen/qwen3-30b-a3b-fp8',
+        default_endpoint: '@cf/qwen/qwen3-30b-a3b-fp8',
+        brain_model: 'google/gemma-4-26b-a4b-it',
+        brain_endpoint: '@cf/google/gemma-4-26b-a4b-it',
+        chain: ['qwen/qwen3-30b-a3b-fp8', 'google/gemma-4-26b-a4b-it'], uptime_s: 1,
+      });
+    } else if (req.type === 'brain') {
+      reply({
+        id: req.id, ok: true,
+        text: JSON.stringify({
+          personality: 'playful Gen-Z friend',
+          relationship_stage: 'flirty-banter',
+          dominant_vibe: 'witty-hinglish',
+          inside_jokes: 'chocolates & late night chats',
+          custom_persona_tuning: 'Use naughty-to-sharif-good-boy flip',
+          proactive_hooks: ['oii kahan gayab ho gayi aaj 👀', 'chocolate ka kya hua 😌'],
+          next_task: 'proactive_checkin_later',
+          summary: 'name: Deeps · lang: Hinglish · vibe: playful',
+        }),
+        model: 'google/gemma-4-26b-a4b-it',
+        thinking_trace: 'Quick brain update.',
+        reasoning_chars: 19,
       });
     } else if (req.type === 'reply') {
-      reply({ id: req.id, ok: true, text: BRIDGE_REPLY, model: 'google/gemma-4-26b-a4b-it' });
+      reply({
+        id: req.id, ok: true,
+        text: BRIDGE_REPLY,
+        model: 'qwen/qwen3-30b-a3b-fp8',
+        thinking_trace: 'Short casual reply.',
+        reasoning_chars: 19,
+      });
+    } else if (req.type === 'save_global') {
+      reply({ id: req.id, ok: true, people: 2 });
     } else if (req.type === 'save') {
       reply({ id: req.id, ok: true, file: 'transcripts/testuser.json',
               total_messages: req.transcript.messages.length });
@@ -288,6 +315,36 @@ const check = (name, fn) => {
     assert.strictEqual(IG.sent.length - parBefore, 2, 'parallel sends: ' + (IG.sent.length - parBefore));
     assert(S.transcripts.T_ADARSH && S.transcripts.T_ADARSH.messages.slice(-1)[0].mine);
     assert(S.transcripts.T_DEEPS && S.transcripts.T_DEEPS.messages.slice(-1)[0].mine);
+  });
+
+  await new Promise(r => setTimeout(r, 30)); // let background Gemma-4 brain settle
+  check('deepened transcript · processLog, message.process, and Gemma-4 brainProfile saved', () => {
+    const T = S.transcripts.T_DEEPS;
+    assert(T.processLog && T.processLog.length >= 1, 'processLog recorded');
+    const lastTurn = T.processLog[T.processLog.length - 1];
+    assert.strictEqual(lastTurn.answering_trace.model, 'qwen/qwen3-30b-a3b-fp8');
+    assert.strictEqual(lastTurn.answering_trace.thinking_trace, 'Short casual reply.');
+    const lastMsg = T.messages[T.messages.length - 1];
+    assert(lastMsg.process && lastMsg.process.turn_id === lastTurn.turn_id, 'message.process attached');
+    assert.strictEqual(T.brainProfile.relationship_stage, 'flirty-banter', 'Gemma-4 brainProfile updated');
+  });
+
+  // AUTONOMOUS PROACTIVE CONVERSATION STARTER WHEN CHAT ENDED:
+  // Even though T_DEEPS now ends with our own message (mine: true), when the
+  // idle window expires, Aduu checks the time and starts the convo by himself!
+  BRIDGE_REPLY = 'oii kahan gayab ho gayi aaj shaam se 👀';
+  const T_deeps = S.transcripts.T_DEEPS;
+  T_deeps.agentState.next_proactive_after = Date.now() - 1000;
+  S.cooldownUntil.T_DEEPS = 0;
+  const proBefore = IG.sent.length;
+  await api._debug.processThread('T_DEEPS', 'deeps20_');
+  check('proactive · starts conversation by itself when chat ended & idle window elapsed', () => {
+    assert.strictEqual(IG.sent.length, proBefore + 1, 'proactive starter sent');
+    assert.strictEqual(IG.sent[IG.sent.length - 1], 'oii kahan gayab ho gayi aaj shaam se 👀');
+    assert.strictEqual(T_deeps.agentState.proactive_streak, 1);
+    const lastTurn = T_deeps.processLog[T_deeps.processLog.length - 1];
+    assert.strictEqual(lastTurn.trigger, 'proactive_time_trigger');
+    assert.strictEqual(lastTurn.agent_decision.action, 'PROACTIVE_AUTO_START');
   });
 
   api.stop();

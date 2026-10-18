@@ -44,10 +44,10 @@ def check(name):
     return deco
 
 
-def collect_stream(messages):
+def collect_stream(messages, model=None):
     async def run():
         prov = llmchat_provider.LLMChatProvider(
-            model="google/gemma-4-26b-a4b-it",
+            model=model,
             system=None, temperature=0.9, max_tokens=600,
             timeout=30, retries=0,
         )
@@ -132,10 +132,12 @@ def test_provider(mock):
     msgs = [{"role": "user", "content": "bro hi"}]
     raw, prov = collect_stream(msgs)
 
-    assert "<think>" in raw, "provider did not wrap reasoning in <think>"
-    assert "The user said" in raw, "reasoning text missing"
-    assert CONTENT.strip() in raw, "answer text missing"
-    assert prov.reasoning_chars > 100, f"reasoning_chars={prov.reasoning_chars}"
+    assert "<think>" in raw, "provider did not capture <think>"
+    assert "user said" in raw, f"reasoning text missing in {raw!r}"
+    assert CONTENT.strip() in raw, f"answer text missing in {raw!r}"
+    # Ensure top-level "response" field in Qwen3 SSE chunks did NOT double tokens
+    assert "Yo! Yo!" not in raw, f"tokens were doubled: {raw!r}"
+    assert prov.reasoning_chars > 50, f"reasoning_chars={prov.reasoning_chars}"
     assert prov.last_usage.get("completion_tokens") == 250, prov.last_usage
     assert mock.requests, "mock received no request"
     sent = mock.requests[-1]
@@ -143,7 +145,7 @@ def test_provider(mock):
     assert sent["body"].get("stream") is True
     assert sent["body"].get("max_tokens") == 600
     assert sent["body"]["messages"][-1]["role"] == "assistant"
-    return f"{prov.reasoning_chars} reasoning chars · model {MODEL_WIRE} used"
+    return f"{prov.reasoning_chars} reasoning chars · model {MODEL_WIRE} used (no token duplication)"
 
 
 def test_strip():
@@ -151,37 +153,42 @@ def test_strip():
     assert server.strip_think("a<thinking>x</thinking>b") == "ab"
     assert server.strip_think("a<think>unclosed") == "a"
     assert server.strip_think("plain") == "plain"
-    return "closed, <thinking>, truncated"
+    clean, trace = server.extract_think("<think>\nQuick thought.\n</think>\n\nHey bro!")
+    assert clean == "Hey bro!" and trace == "Quick thought."
+    return "closed, <thinking>, truncated, extract_think"
 
 
 def test_config():
-    assert server.DEFAULT_MODEL == "google/gemma-4-26b-a4b-it"
+    assert server.DEFAULT_MODEL == "qwen/qwen3-30b-a3b-fp8"
+    assert server.BRAIN_MODEL == "google/gemma-4-26b-a4b-it"
     assert server.FALLBACK_CHAIN[0] == server.DEFAULT_MODEL
+    assert server.FALLBACK_CHAIN[1] == server.BRAIN_MODEL
     assert server.model_endpoint(server.DEFAULT_MODEL) == MODEL_WIRE
-    assert server.resolve_model("@cf/google/gemma-4-26b-a4b-it") == server.DEFAULT_MODEL
-    assert server.resolve_model("GEMMA-4-26B") == server.DEFAULT_MODEL
+    assert server.resolve_model("@cf/qwen/qwen3-30b-a3b-fp8") == server.DEFAULT_MODEL
+    assert server.resolve_model("@cf/google/gemma-4-26b-a4b-it") == server.BRAIN_MODEL
     assert server.resolve_model(None) == server.DEFAULT_MODEL
-    return "primary + fallbacks + name resolution"
+    return "Qwen3-30B primary + Gemma-4 brain + fallbacks"
 
 
 def test_fallback(mock):
     llmchat_provider._API = mock.url
     msgs = [{"role": "user", "content": "bro hi"}]
-    res = server.generate_with_fallback(msgs, "@cf/google/gemma-4-26b-a4b-it", 600, 0.9)
+    res = server.generate_with_fallback(msgs, "@cf/qwen/qwen3-30b-a3b-fp8", 600, 0.9)
     assert res["text"] == CONTENT.strip(), res["text"]
     assert res["model"] == server.DEFAULT_MODEL
     assert res["fallback_index"] == 0
     assert "<think" not in res["text"]
-    assert res["reasoning_chars"] > 100
+    assert res["reasoning_chars"] > 50
+    assert "user said" in res["thinking_trace"]
     assert res["usage"].get("completion_tokens") == 250
 
-    with MockLLM(fail_models=("gemma",)) as broken:
+    with MockLLM(fail_models=("qwen",)) as broken:
         llmchat_provider._API = broken.url
-        res2 = server.generate_with_fallback(msgs, "@cf/google/gemma-4-26b-a4b-it", 600, 0.9)
-        assert res2["model"] == "meta/llama-3.3-70b-instruct-fp8-fast", res2["model"]
+        res2 = server.generate_with_fallback(msgs, "@cf/qwen/qwen3-30b-a3b-fp8", 600, 0.9)
+        assert res2["model"] == "google/gemma-4-26b-a4b-it", res2["model"]
         assert res2["fallback_index"] == 1, res2["fallback_index"]
         assert res2["text"] == CONTENT.strip()
-    return "gemma-4 primary · auto-fallback when gemma fails"
+    return "Qwen3-30B primary (/no_think) · auto-fallback to Gemma-4 when Qwen fails"
 
 
 def test_bridge_http_ws(mock):
@@ -201,8 +208,16 @@ def test_bridge_http_ws(mock):
         })
         assert status == 200
         assert reply["text"] == CONTENT.strip(), reply["text"]
-        assert reply["reasoning_chars"] > 100
+        assert reply["model"] == "qwen/qwen3-30b-a3b-fp8", reply
+        assert reply["reasoning_chars"] > 50
         assert "elapsed_ms" in reply and "fallback_index" in reply
+
+        status, brain_resp = http_json("http://127.0.0.1:8791/brain", {
+            "messages": [{"role": "user", "content": "analyze profile"}],
+            "max_tokens": 300,
+        })
+        assert status == 200
+        assert brain_resp["model"] == "google/gemma-4-26b-a4b-it", brain_resp
 
         status, oai = http_json("http://127.0.0.1:8791/v1/chat/completions", {
             "messages": [{"role": "user", "content": "bro hi"}]})
@@ -223,12 +238,20 @@ def test_bridge_http_ws(mock):
             r = recv()
             assert r["ok"] and r["text"] == CONTENT.strip(), r
 
+            send({"id": "br1", "type": "brain", "messages": [
+                {"role": "user", "content": "analyze profile"}]})
+            br = recv()
+            assert br["ok"] and br["model"] == "google/gemma-4-26b-a4b-it", br
+
             send({"id": "s1", "type": "save", "transcript": {
                 "user": "_pipeline_test",
+                "agent_state": {"relationship_stage": "flirty-banter", "proactive_streak": 0},
+                "brain_profile": {"personality": "witty Gen-Z"},
+                "process_log": [{"turn_id": "t1", "at": 1, "trigger": "incoming_burst"}],
                 "messages": [{"id": "test:1", "ts": 1, "mine": False,
                               "kind": "text", "label": "text", "text": "hi"}]}})
             saved = recv()
-            assert saved["ok"] and saved["total_messages"] == 1, saved
+            assert saved["ok"] and saved["total_messages"] == 1 and saved["process_turn_count"] == 1, saved
 
             send({"id": "g1", "type": "save_global", "global": {
                 "connections": [{"a": "adarshu.io", "b": "deeps20_", "relation": "close friends"}],

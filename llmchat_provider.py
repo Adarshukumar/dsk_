@@ -48,7 +48,9 @@ class LLMModel:
 # §2 — MODEL REGISTRY
 # ═══════════════════════════════════════════════════════════
 MODELS: tuple[LLMModel, ...] = (
-    # primary: Gemma 4 — streams a long reasoning_content phase, then content
+    # primary answering model: Qwen3 30B A3B FP8 — streams <think>...</think> in delta.content
+    LLMModel("@cf", "qwen/qwen3-30b-a3b-fp8",                    32_500),
+    # background brain model: Gemma 4 26B A4B — streams delta.reasoning_content, then delta.content
     LLMModel("@cf", "google/gemma-4-26b-a4b-it",                  200_000),
     LLMModel("@cf", "moonshotai/kimi-k2.5",                       200_000),
     LLMModel("@cf", "meta/llama-3.1-70b-instruct",                23_500),
@@ -70,7 +72,6 @@ MODELS: tuple[LLMModel, ...] = (
     LLMModel("@cf", "meta/llama-3.2-3b-instruct",                 79_500),
     LLMModel("@cf", "defog/sqlcoder-7b-2",                         9_500),
     LLMModel("@cf", "ibm-granite/granite-4.0-h-micro",           100_000),
-    LLMModel("@cf", "qwen/qwen3-30b-a3b-fp8",                    32_500),
     LLMModel("@cf", "zai-org/glm-4.7-flash",                     100_000),
     LLMModel("@cf", "mistralai/mistral-small-3.1-24b-instruct",   76_500),
     LLMModel("@cf", "meta/llama-3.1-8b-instruct",                100_000),
@@ -175,14 +176,17 @@ def _parse_sse(line: str) -> List[dict]:
                 "text": "",
                 "finish_reason": finish_reason,
             })
-
-    resp = data.get("response")
-    if isinstance(resp, str) and resp:
-        events.append({
-            "kind": "response",
-            "text": resp,
-            "finish_reason": finish_reason,
-        })
+    else:
+        # Only fall back to top-level "response" when "choices" is absent/empty.
+        # Models like @cf/qwen/qwen3-30b-a3b-fp8 echo each delta.content token in
+        # top-level "response" on the same SSE frame — emitting both would double every token.
+        resp = data.get("response")
+        if isinstance(resp, str) and resp:
+            events.append({
+                "kind": "response",
+                "text": resp,
+                "finish_reason": finish_reason,
+            })
 
     # llmchat sends a usage frame per chunk and one final summary frame
     # ({"response":"","usage":{...}}).  Keep the last non-zero one so the
@@ -359,6 +363,8 @@ class LLMChatProvider:
         self.last_usage = {}
         self.reasoning_chars = 0
         self.content_chars = 0
+        inline_think = False
+        inline_buf = ""
 
         def emit(text: str) -> None:
             if text:
@@ -443,8 +449,24 @@ class LLMChatProvider:
                         continue
 
                     if kind in ("content", "response"):
-                        self.content_chars += len(text)
                         close_think()
+                        # Qwen3-30B-A3B streams <think>...</think> inline inside delta.content.
+                        # Track reasoning_chars vs content_chars accurately while streaming.
+                        inline_buf += text
+                        if "<think>" in inline_buf and "</think>" not in inline_buf:
+                            inline_think = True
+                        if inline_think:
+                            if "</think>" in inline_buf:
+                                before, after = inline_buf.split("</think>", 1)
+                                think_body = before.replace("<think>", "")
+                                self.reasoning_chars = len(think_body.strip())
+                                self.content_chars += len(after)
+                                inline_think = False
+                                inline_buf = ""
+                            else:
+                                self.reasoning_chars = len(inline_buf.replace("<think>", "").strip())
+                        else:
+                            self.content_chars += len(text)
                         emit(text)
                         continue
 

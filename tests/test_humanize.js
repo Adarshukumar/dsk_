@@ -39,8 +39,11 @@ const check = (name, fn) => {
 
 console.log('\nIG-Agent humanizer / config tests\n');
 
-check('config · gemma-4 is the model', () => {
-  assert.strictEqual(api.config.MODEL, 'google/gemma-4-26b-a4b-it');
+check('config · Qwen3-30B is answering model + Gemma-4 is background brain model', () => {
+  assert.strictEqual(api.config.MODEL, '@cf/qwen/qwen3-30b-a3b-fp8');
+  assert.strictEqual(api.config.BRAIN_MODEL, '@cf/google/gemma-4-26b-a4b-it');
+  assert.strictEqual(api.config.FAST_THINK, true);
+  assert.strictEqual(api.config.PROACTIVE_ENABLED, true);
   assert.strictEqual(api.config.HUMANIZE, true);
   assert.strictEqual(api.config.MAX_REPLY_CHARS, 300);
 });
@@ -48,7 +51,8 @@ check('config · gemma-4 is the model', () => {
 check('state · stale persona + llama model ignored; default targets active', () => {
   assert(!/OLD STALE PERSONA/.test(api.config.SYSTEM_PROMPT),
     'old cached persona overrode the new default');
-  assert.strictEqual(api.config.MODEL, 'google/gemma-4-26b-a4b-it');
+  assert.strictEqual(api.config.MODEL, '@cf/qwen/qwen3-30b-a3b-fp8');
+  assert.strictEqual(api.config.BRAIN_MODEL, '@cf/google/gemma-4-26b-a4b-it');
   assert.deepStrictEqual(api.config.DEFAULT_TARGETS, ['adarshu.io', 'deeps20_']);
   assert.deepStrictEqual(api.config.TARGETS, ['adarshu.io', 'deeps20_']);
   assert.strictEqual(api.config.DRY_RUN, false);
@@ -258,6 +262,33 @@ check('event-driven anti-ban polling · adaptive idle backoff + instant realtime
   assert.strictEqual(S.idlePolls, 0, 'realtime push signal resets idlePolls immediately');
 });
 
+check('agentic engine · time context + autonomous decision + proactive starter', () => {
+  const tMorning = api._debug.getTimeContext('2026-10-18T04:00:00Z'); // 9:30 AM IST
+  assert.strictEqual(tMorning.slot, 'morning');
+  const tNight = api._debug.getTimeContext('2026-10-18T18:00:00Z'); // 11:30 PM IST
+  assert.strictEqual(tNight.slot, 'late_night');
+
+  const msgs = [
+    { id: '1', ts: 1000, mine: false, kind: 'text', label: 'text', text: 'hmm' },
+  ];
+  const emo = api._debug.analyzeTurnEmotion('hmm', 'deeps20_');
+  const dec = api._debug.agentDecide('T_DEEPS', 'deeps20_', msgs, emo, 'incoming_burst');
+  assert.strictEqual(dec.action, 'HARD_TO_GET_TEASE');
+
+  // Ended chat: proactive starter check
+  const endedMsgs = [
+    { id: '1', ts: 1000, mine: false, kind: 'text', label: 'text', text: 'achha chalo baad mein baat karte' },
+    { id: '2', ts: 2000, mine: true, kind: 'text', label: 'text', text: 'chal thik hai, gayab mat ho jana 😌' },
+  ];
+  const T = api._debug.ensureTranscript('T_PRO', 'deeps20_');
+  T.agentState.chat_ended_at = Date.now() - 60 * 60_000;
+  T.agentState.next_proactive_after = Date.now() - 1000;
+  const pro = api._debug.shouldStartProactiveConvo('T_PRO', 'deeps20_', endedMsgs, false);
+  assert.strictEqual(pro.ok, true, 'proactive starter triggers when idle timer elapses');
+  const proHist = api._debug.buildProactiveHistory(endedMsgs, 'T_PRO', 'deeps20_');
+  assert(proHist[0].content.includes('[AUTONOMOUS PROACTIVE CONVERSATION STARTER'), 'proactive system header present');
+});
+
 check('prompt() · custom persona persists', () => {
   api.prompt('my custom persona');
   const saved = JSON.parse(store.ig_agent_state_v3);
@@ -265,4 +296,4 @@ check('prompt() · custom persona persists', () => {
   assert.strictEqual(saved.systemPrompt, 'my custom persona');
 });
 
-console.log('\n24 passed, 0 failed\n');
+console.log('\n25 passed, 0 failed\n');

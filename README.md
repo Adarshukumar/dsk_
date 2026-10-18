@@ -1,45 +1,54 @@
-# IG Agent — Aduu on Instagram (gemma-4 edition, v5)
+# IG Agent — Aduu Autonomous Agent on Instagram (v6: Qwen3-30B + Gemma-4 Brain)
 
-An Instagram DM auto-responder. People message the account and **Aduu** answers
-by itself — across many chats at once, remembering each person, with real
-**Seen** receipts, the real **typing indicator**, and a complete JSON transcript
-of every chat. It only speaks when the **newest message in the thread is
-theirs**, so it never answers itself or double-texts.
+An autonomous Instagram DM agent. People message the account and **Aduu**
+responds how a real person responds in reality — across many chats at once,
+deciding its own actions, remembering each person, sharing cross-chat gossip,
+and **even starting/reviving conversations by itself when a chat has ended**
+by checking the time of day (`morning`, `afternoon`, `evening`, `late night` in IST).
 
-**Primary model: [`@cf/google/gemma-4-26b-a4b-it`](https://llmchat.in)**
-via [llmchat.in](https://llmchat.in) — no API key. The provider handles its
-`reasoning_content` stream, the bridge strips it, and the bot only ever sends
-the finished answer.
+> **v5 Archive:** All previous v5 files are preserved inside the [`v5/`](./v5) folder.
+
+## Dual-Model Agentic Architecture (v6)
+
+1. **Frontline Answering Model (`@cf/qwen/qwen3-30b-a3b-fp8`)**
+   - Handles fast, natural human DM replies (`POST /reply` / WS `type: "reply"`).
+   - Streams `<think>…</think>` inline inside `choices[0].delta.content` (and echoes each token in top-level `"response"` — deduplicated in `llmchat_provider.py`).
+   - **Low-Think Fine-Tuned (`/no_think`)**: automatically injects `/no_think` + an ultra-short thinking constraint (`< 10 words`) so Qwen3 doesn't waste time writing 150-token essays in `<think>`.
+2. **Background Agentic Brain Model (`@cf/google/gemma-4-26b-a4b-it`)**
+   - Runs asynchronously in the background (`POST /brain` / WS `type: "brain"`) after every turn so it never slows down frontline replies.
+   - Deeply processes each contact's **personality, relationship stage, dominant vibe, inside jokes, dynamic persona tuning, and time-aware proactive starter hooks**, and updates the global social graph.
 
 ```
  instagram.com tab                your machine                      internet
-┌────────────────────┐ WebSocket ┌──────────────────────┐   SSE    ┌────────────────┐
-│ ig-agent-chat.js   │ ────────► │ server.py :8787      │ ───────► │ llmchat.in     │
-│ (console, GraphQL  │ ws://local│ + llmchat_provider.py│  stream  │ gemma-4-26b    │
-│  DM + seen + typing│ ◄──────── │ fallback chain +     │ ◄─────── │ reasoning →    │
-│  + transcripts)    │  replies  │ think-strip + JSON   │  tokens  │ answer, no key │
-└────────────────────┘           │ transcripts          │          └────────────────┘
+┌────────────────────┐ WebSocket ┌──────────────────────┐   SSE    ┌─────────────────────────────┐
+│ ig-agent-chat.js   │ ────────► │ server.py :8787      │ ───────► │ llmchat.in (no API key)     │
+│ v6 Autonomous Agent│ ws://local│ + llmchat_provider.py│  stream  │ • @cf/qwen/qwen3-30b-a3b-fp8│
+│ • agentDecide()    │ ◄──────── │ • /reply (Qwen3-30B) │ ◄─────── │   (fast /no_think responder)│
+│ • proactive starter│  replies  │ • /brain (Gemma-4)   │  tokens  │ • @cf/google/gemma-4-26b    │
+│ • event-driven WS  │  + brain  │ • v6 process logs    │          │   (background brain engine) │
+└────────────────────┘           └──────────────────────┘          └─────────────────────────────┘
         │ seen/typing: Instagram's own GraphQL + DGW gateway
-        └─ transcripts/: one merged JSON per contact (persona + memory + history)
+        └─ transcripts/: v6.0-agentic JSON per contact (messages + process_log + brain_profile + agent_state)
 ```
 
-## Repo layout (flat — this folder *is* the project)
+## Repo layout (flat — this folder *is* the v6 project, with `v5/` archived)
 
 | File | What it is |
 |---|---|
-| `llmchat_provider.py` | Async llmchat.in provider — SSE streaming, reasoning capture, retries |
-| `server.py` | Bridge: HTTP + hand-rolled WebSocket (`reply`, `health`, `save`, `bot`), model fallback, think-strip, transcript store |
-| `ig-agent-chat.js` | The Instagram bot — paste into the DevTools console (auto-starts LIVE with `adarshu.io` and `deeps20_`) |
+| `llmchat_provider.py` | Async llmchat.in provider — Qwen3 inline `<think>` + Gemma-4 `reasoning_content` SSE streaming |
+| `server.py` | Bridge v6: HTTP + WebSocket (`reply`, `brain`, `health`, `save`, `save_global`, `bot`), `/no_think` tuning, v6 agentic transcript store |
+| `ig-agent-chat.js` | The v6 Autonomous Instagram Agent — auto-starts LIVE with `adarshu.io` & `deeps20_`, proactive convo starter, Gemma-4 background brain |
+| `v5/` | Complete archive of the previous v5 system (`v5/ig-agent-chat.js`, `v5/server.py`, `v5/llmchat_provider.py`, `v5/README.md`, etc.) |
 | `clone-and-run.bat` | Windows one-click script: clones repo, installs `curl_cffi`, copies bot to clipboard, starts bridge |
 | `clone-and-run.sh` | Linux / macOS / Git Bash one-command script: clones repo, installs `curl_cffi`, starts bridge |
 | `run.py` | Cross-platform Python starter: installs `curl_cffi`, copies bot to clipboard, keeps bridge running |
-| `tests/mock_llmchat.py` | Offline byte-faithful mock of the gemma-4 SSE stream |
-| `tests/test_pipeline.py` | End-to-end bridge test (provider → server → HTTP → WS) |
-| `tests/test_bot_flow.js` | Full page pipeline against a fake Instagram + fake bridge |
-| `tests/test_humanize.js` | Humanizer / persona / state-migration tests |
-| `tests/live_check.py` | Live gemma-4 check: prints reasoning vs. final answer |
+| `tests/mock_llmchat.py` | Offline byte-faithful mock of both `@cf/qwen/qwen3-30b-a3b-fp8` and `@cf/google/gemma-4-26b-a4b-it` SSE streams |
+| `tests/test_pipeline.py` | End-to-end bridge test (Qwen3 provider → Gemma-4 brain → HTTP → WS → v6 transcript save) |
+| `tests/test_bot_flow.js` | Full page pipeline including Gemma-4 brain updates, v6 process log, and proactive conversation starter |
+| `tests/test_humanize.js` | Humanizer / persona / time-context / autonomous decision / state-migration tests |
+| `tests/live_check.py` | Live upstream check |
 | `vendor/ig-human/` | MIT lexicon from jakeschincariol/instagram-agent-skill (source of the slop list) |
-| `transcripts/` | One merged JSON per contact (persona + memory + history) |
+| `transcripts/` | Deepened `6.0-agentic` JSON per contact (messages + complete agentic process log + Gemma-4 brain profile) |
 | `requirements.txt` | `curl_cffi` — the only runtime dependency |
 
 ## Why WebSocket?
@@ -242,6 +251,14 @@ IGAgent.peekChat('deeps20_')                      // see latest cross-chat intel
 IGAgent.linkFriends('adarshu.io', 'deeps20_')     // link two contacts as friends in the social graph
 IGAgent.addGossip('deeps was asking for chocolates') // add a cross-chat gossip note
 IGAgent.eventDriven(true)                         // toggle event-driven anti-IP-block mode (ON by default)
+
+// v6 Autonomous Proactive Conversation Starter & Gemma-4 Background Brain:
+IGAgent.proactiveNow('deeps20_')                  // immediately start/revive a conversation with @deeps20_
+IGAgent.proactiveIdleMinutes(30)                  // set idle minutes after chat ends before auto-starting convo
+IGAgent.proactive(true)                           // toggle autonomous proactive conversation starting (ON by default)
+IGAgent.brain('deeps20_')                         // inspect Gemma-4 background brain profile & relationship stage
+IGAgent.processLog('deeps20_')                    // view complete turn-by-turn agentic process log
+IGAgent.brainModel('@cf/google/gemma-4-26b-a4b-it') // view/set the background brain model
 
 // Other controls:
 IGAgent.status()               // live status, active targets, counters, bridge health

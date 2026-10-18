@@ -67,38 +67,36 @@ except Exception:
 
 # ═══════════════════════════ CONFIG ═══════════════════════════
 
-DEFAULT_MODEL = "google/gemma-4-26b-a4b-it"
+# Primary frontline answering model: Qwen3-30B-A3B-FP8 (fast, snappy DM replies)
+DEFAULT_MODEL = "qwen/qwen3-30b-a3b-fp8"
+# Background agentic brain model: Gemma-4-26B-A4B-IT (deep personality, memory, proactive tasks)
+BRAIN_MODEL = "google/gemma-4-26b-a4b-it"
 
-# Tried in order until one answers.  Gemma 4 first (primary), then fast
-# llama fallbacks, then the slower/smarter ones; kimi last (currently dead
-# upstream — streams nothing, but fails in ~1s so it costs nothing to keep).
+# Tried in order until one answers. Qwen3-30B first (answering primary),
+# then Gemma-4-26B, then fast llama/glm fallbacks.
 FALLBACK_CHAIN = [
+    "qwen/qwen3-30b-a3b-fp8",
     "google/gemma-4-26b-a4b-it",
     "meta/llama-3.3-70b-instruct-fp8-fast",
     "meta/llama-4-scout-17b-16e-instruct",
     "zai-org/glm-4.7-flash",
     "meta/llama-3.1-70b-instruct",
-    "qwen/qwen3-30b-a3b-fp8",
     "meta/llama-3.1-8b-instruct",
     "moonshotai/kimi-k2.5",
 ]
 
 NAME_MAP = {m.name: m for m in MODELS}
-_THINK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.S)
+_THINK_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.S)
 
-# Models that burn completion tokens on a reasoning_content phase before
-# they emit the actual answer.  These get a floor on their token budget so
-# the reasoning can never eat the whole reply (gemma-4 streams reasoning
-# first — see the sample stream in README/tests).
 _THINKING = {
+    "qwen/qwen3-30b-a3b-fp8",
     "google/gemma-4-26b-a4b-it",
     "moonshotai/kimi-k2.5",
     "qwen/qwq-32b",
     "deepseek-ai/deepseek-r1-distill-qwen-32b",
-    "qwen/qwen3-30b-a3b-fp8",
     "zai-org/glm-4.7-flash",
 }
-THINK_MIN_BUDGET = 3000   # per-reply token floor for thinking models
+THINK_MIN_BUDGET = 1200   # lean token floor for fast low-think responses
 
 TIMEOUT = 120         # per-model HTTP timeout (s), set by --timeout
 START = time.time()
@@ -111,13 +109,53 @@ _SAVE_LOCK = threading.Lock()       # one writer at a time — merges must not r
 # ═══════════════════════════ HELPERS ═══════════════════════════
 
 
+def extract_think(text: str) -> tuple[str, str]:
+    """Return (clean_answer, thinking_trace) from raw model output."""
+    traces = [m.strip() for m in _THINK_RE.findall(text or "") if m and m.strip()]
+    cleaned = _THINK_RE.sub("", text or "")
+    cut = cleaned.find("<think")
+    if cut != -1:
+        unclosed = cleaned[cut:]
+        unclosed = re.sub(r"^<think(?:ing)?>", "", unclosed).strip()
+        if unclosed:
+            traces.append(unclosed)
+        cleaned = cleaned[:cut]
+    return cleaned.strip(), "\n".join(traces).strip()
+
+
 def strip_think(text: str) -> str:
     """Remove reasoning blocks; also salvage a truncated (unclosed) one."""
-    text = _THINK_RE.sub("", text)
-    cut = text.find("<think")
-    if cut != -1:
-        text = text[:cut]
-    return text.strip()
+    cleaned, _ = extract_think(text)
+    return cleaned
+
+
+_LOW_THINK_DIRECTIVE = (
+    "\n\n[FAST-THINK DIRECTIVE /no_think]: Think SO LESS. "
+    "Keep <think> empty or under 10 words max, close </think> immediately, "
+    "and output ONLY the final response."
+)
+
+
+def _apply_low_think(messages: list[dict], model_name: str, fast_think: bool = True) -> list[dict]:
+    """Fine-tune prompt for Qwen3 / Gemma-4 so internal thinking stays minimal."""
+    if not fast_think or not messages:
+        return messages
+    out = [dict(m) for m in messages]
+    if model_name in ("qwen/qwen3-30b-a3b-fp8", "google/gemma-4-26b-a4b-it"):
+        if out[0].get("role") == "system":
+            if "/no_think" not in str(out[0].get("content", "")):
+                out[0]["content"] = str(out[0].get("content", "")) + _LOW_THINK_DIRECTIVE
+        else:
+            out.insert(0, {"role": "system", "content": _LOW_THINK_DIRECTIVE.strip()})
+        # For Qwen3, appending /no_think to the last user turn triggers native 0-token think mode
+        if model_name == "qwen/qwen3-30b-a3b-fp8":
+            for idx in range(len(out) - 1, -1, -1):
+                if out[idx].get("role") == "user":
+                    u_txt = str(out[idx].get("content", ""))
+                    if "/no_think" not in u_txt:
+                        out[idx]["content"] = u_txt + " /no_think"
+                    break
+    return out
 
 
 def resolve_model(query) -> str | None:
@@ -175,8 +213,8 @@ def _generate(messages: list, model: str, max_tokens: int, temperature: float):
     return raw, prov.reasoning_chars, dict(prov.last_usage)
 
 
-def generate_with_fallback(messages, model_query, max_tokens=512, temperature=0.9):
-    """Shared by POST /reply and the WebSocket channel."""
+def generate_with_fallback(messages, model_query=None, max_tokens=512, temperature=0.9, fast_think=True):
+    """Shared by POST /reply, POST /brain, and the WebSocket channel."""
     max_tokens = int(max_tokens or 512)
     temperature = float(temperature if temperature is not None else 0.9)
     first = resolve_model(model_query)
@@ -188,9 +226,12 @@ def generate_with_fallback(messages, model_query, max_tokens=512, temperature=0.
     for i, name in enumerate(chain):
         t0 = time.time()
         budget = max(max_tokens, THINK_MIN_BUDGET) if name in _THINKING else max_tokens
+        tuned_msgs = _apply_low_think(messages, name, fast_think=fast_think)
         try:
-            raw, reasoning_chars, usage = _generate(messages, name, budget, temperature)
-            text = strip_think(raw)
+            raw, reasoning_chars, usage = _generate(tuned_msgs, name, budget, temperature)
+            text, thinking_trace = extract_think(raw)
+            if not reasoning_chars and thinking_trace:
+                reasoning_chars = len(thinking_trace)
             if not text:
                 raise RuntimeError("empty output")
             dt = time.time() - t0
@@ -202,9 +243,11 @@ def generate_with_fallback(messages, model_query, max_tokens=512, temperature=0.
             return {
                 "text": text,
                 "model": name,
+                "endpoint": model_endpoint(name),
                 "elapsed_ms": round(dt * 1000),
                 "fallback_index": i,
                 "reasoning_chars": reasoning_chars,
+                "thinking_trace": thinking_trace[:500] if thinking_trace else "",
                 "usage": usage,
             }
         except Exception as e:
@@ -226,12 +269,13 @@ def _transcript_path(user: str) -> str:
 
 
 def save_transcript(tr: dict) -> dict:
-    """Merge a client transcript window into the on-disk file (by message id)
-    and refresh persona / memory / timestamps. Atomic write."""
+    """Merge a client transcript window + complete v6 agentic process log,
+    brain profile, and agent state into the on-disk JSON file. Atomic write."""
     user = str(tr.get("user") or "").strip() or "unknown"
     path = _transcript_path(user)
     with _SAVE_LOCK:
         old_msgs: dict[str, dict] = {}
+        old_proc: dict[str, dict] = {}
         keep: dict = {}
         if os.path.exists(path):
             try:
@@ -240,35 +284,69 @@ def save_transcript(tr: dict) -> dict:
                 for m in old.get("messages", []):
                     if isinstance(m, dict) and m.get("id"):
                         old_msgs[str(m["id"])] = m
-                keep = {k: old.get(k) for k in ("persona", "owner_bio", "memory_profile")}
+                for p_entry in old.get("process_log", []):
+                    if isinstance(p_entry, dict) and p_entry.get("turn_id"):
+                        old_proc[str(p_entry["turn_id"])] = p_entry
+                keep = {k: old.get(k) for k in (
+                    "persona", "owner_bio", "memory_profile",
+                    "brain_profile", "agent_state", "models"
+                )}
             except Exception:
-                old_msgs, keep = {}, {}
+                old_msgs, old_proc, keep = {}, {}, {}
 
         incoming = tr.get("messages") or []
         for m in incoming:
             if isinstance(m, dict) and m.get("id"):
-                old_msgs[str(m["id"])] = m          # client state is fresher
+                mid = str(m["id"])
+                prev_m = old_msgs.get(mid) or {}
+                merged_m = {**prev_m, **m}
+                if m.get("ts") and not merged_m.get("iso_time"):
+                    try:
+                        merged_m["iso_time"] = datetime.fromtimestamp(
+                            float(m["ts"]) / 1000.0, tz=timezone.utc
+                        ).isoformat(timespec="seconds")
+                    except Exception:
+                        pass
+                old_msgs[mid] = merged_m
+
+        for p_entry in (tr.get("process_log") or []):
+            if isinstance(p_entry, dict) and p_entry.get("turn_id"):
+                old_proc[str(p_entry["turn_id"])] = p_entry
 
         msgs = sorted(old_msgs.values(), key=lambda m: m.get("ts") or 0)
+        proc_list = sorted(old_proc.values(), key=lambda x: x.get("at") or 0)[-500:]
+        brain_prof = tr.get("brain_profile") or keep.get("brain_profile") or {}
+        agent_st = tr.get("agent_state") or keep.get("agent_state") or {}
+        models_meta = tr.get("models") or keep.get("models") or {
+            "answering_model": model_endpoint(DEFAULT_MODEL),
+            "brain_model": model_endpoint(BRAIN_MODEL),
+        }
+
         doc = {
+            "schema_version": "6.0-agentic",
             "user": user,
             "thread_fbid": tr.get("thread_fbid"),
             "updated_at": tr.get("updated_at")
                           or datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "message_count": len(msgs),
+            "process_turn_count": len(proc_list),
+            "models": models_meta,
+            "agent_state": agent_st,
+            "brain_profile": brain_prof,
+            "memory_profile": tr.get("memory_profile") or keep.get("memory_profile") or "",
             "persona": tr.get("persona") or keep.get("persona") or "",
             "owner_bio": tr.get("owner_bio") or keep.get("owner_bio") or "",
-            "memory_profile": tr.get("memory_profile") or keep.get("memory_profile") or "",
+            "process_log": proc_list,
             "messages": msgs[-TRANSCRIPT_MAX_MSGS:],
         }
         os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(doc, f, ensure_ascii=False, indent=1)
+            json.dump(doc, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     total = len(doc["messages"])
-    print(f"[save] @{_safe_user(user)}  {total} msgs  →  {os.path.basename(path)}", flush=True)
-    return {"file": path, "total_messages": total}
+    print(f"[save] @{_safe_user(user)}  {total} msgs ({len(proc_list)} agentic turns)  →  {os.path.basename(path)}", flush=True)
+    return {"file": path, "total_messages": total, "process_turn_count": len(proc_list)}
 
 
 def list_transcripts() -> list[dict]:
@@ -425,21 +503,24 @@ class _WSConn:
 
 
 def _serve_ws_reply(conn: _WSConn, req: dict) -> None:
-    """Generate one reply in its own worker so independent chats run in parallel."""
+    """Generate one reply or background brain pass in its own worker thread."""
     rid = req.get("id")
+    req_type = req.get("type") or "reply"
     try:
         messages = req.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("'messages' must be a non-empty list")
+        default_m = BRAIN_MODEL if req_type == "brain" else DEFAULT_MODEL
+        model_q = req.get("model") or default_m
         result = generate_with_fallback(
-            messages, req.get("model"), req.get("max_tokens"), req.get("temperature"))
-        resp = {"id": rid, "ok": True, **result}
+            messages, model_q, req.get("max_tokens"), req.get("temperature"),
+            fast_think=req.get("fast_think", True))
+        resp = {"id": rid, "ok": True, "role_type": req_type, **result}
     except Exception as e:
         resp = {"id": rid, "ok": False, "error": str(e)[:300]}
     try:
         conn.send_text(json.dumps(resp))
     except (BrokenPipeError, ConnectionError, OSError, ValueError):
-        # The browser can close/reload while an LLM is still generating.
         pass
 
 
@@ -468,6 +549,8 @@ def handle_ws(handler) -> None:
                 resp = {"id": req.get("id"), "ok": True,
                         "default_model": DEFAULT_MODEL,
                         "default_endpoint": model_endpoint(DEFAULT_MODEL),
+                        "brain_model": BRAIN_MODEL,
+                        "brain_endpoint": model_endpoint(BRAIN_MODEL),
                         "chain": FALLBACK_CHAIN,
                         "uptime_s": round(time.time() - START)}
                 conn.send_text(json.dumps(resp))
@@ -567,6 +650,8 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "default_model": DEFAULT_MODEL,
                 "default_endpoint": model_endpoint(DEFAULT_MODEL),
+                "brain_model": BRAIN_MODEL,
+                "brain_endpoint": model_endpoint(BRAIN_MODEL),
                 "chain": FALLBACK_CHAIN,
                 "uptime_s": round(time.time() - START),
             })
@@ -594,7 +679,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in ("/reply", "/v1/chat/completions", "/save"):
+        if path not in ("/reply", "/brain", "/v1/chat/completions", "/save"):
             return self._json(404, {"error": "unknown endpoint " + path})
 
         try:
@@ -617,9 +702,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "'messages' must be a non-empty list"})
 
         try:
+            default_m = BRAIN_MODEL if path == "/brain" else DEFAULT_MODEL
             result = generate_with_fallback(
-                messages, body.get("model"), body.get("max_tokens"),
-                body.get("temperature", 0.9))
+                messages, body.get("model") or default_m, body.get("max_tokens"),
+                body.get("temperature", 0.9), fast_think=body.get("fast_think", True))
         except Exception as e:
             return self._json(502, {"error": str(e)[:300]})
 

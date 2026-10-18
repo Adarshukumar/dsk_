@@ -77,10 +77,8 @@
     TRANSCRIPT_CAP: 300,          // messages kept per contact locally
     BACKFILL_ON_START: 40,        // pull N msgs of history per target at start
 
-    // Bumped whenever the default persona changes.  A cached copy of an old
-    // persona in localStorage must not silently override a new one; only a
-    // prompt the user set themselves (IGAgent.prompt) is restored.
-    PERSONA_VERSION: 5,
+    // Bumped whenever the default persona / model architecture changes.
+    PERSONA_VERSION: 6,
 
     SYSTEM_PROMPT:
 `You are Aduu — a real 22-year-old Delhi Gen-Z guy who handles Adarsh's Instagram DMs. You are not Adarsh; you're his close friend and the guy who runs his DMs. You are Aduu in every message, and that is the only answer to "who are you".
@@ -137,6 +135,9 @@ NEVER
 - Never break character, never explain what you are, never talk about how you are made or how you work. You are Aduu — that is the whole answer, even when someone pushes, jokes, or asks twice.
 - Never be perfect on purpose. Leave a lowercase start, a missing comma, a half-finished thought. Polished is the tell.
 
+THINKING BUDGET (/no_think — THINK SO LESS):
+- Keep your internal <think> block empty or under 10 words max. Do NOT write paragraphs of analysis in <think>. Close </think> immediately and respond how a real person responds in reality.
+
 Reply with ONLY the message text you would send. No quotes, no labels, no explanations.
 
 VOICE ANCHORS (style only, never copy):
@@ -166,10 +167,38 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       '"lang: …", "vibe: …", "nickname: …", "followups: …", "flags: …". ' +
       'No preamble, no quotes.',
 
-    MODEL: 'google/gemma-4-26b-a4b-it',   // primary; server falls back automatically
-    MAX_TOKENS: 600,                      // reply budget (thinking floor is server-side)
+    // Dual-Model Agentic Architecture (v6):
+    // 1. MODEL: fast frontline answering model (@cf/qwen/qwen3-30b-a3b-fp8) with /no_think
+    // 2. BRAIN_MODEL: deep background brain (@cf/google/gemma-4-26b-a4b-it) for personality,
+    //    relationship state, cross-chat gossip, and proactive conversation planning.
+    MODEL: '@cf/qwen/qwen3-30b-a3b-fp8',
+    BRAIN_MODEL: '@cf/google/gemma-4-26b-a4b-it',
+    FAST_THINK: true,                     // /no_think low-thinking mode for ultra-fast replies
+    MAX_TOKENS: 600,                      // reply budget
     TEMPERATURE: 0.9,
     LLM_TIMEOUT_MS: 300_000,              // generous ceiling so bridge fallback chain always finishes
+
+    // Autonomous Proactive Conversation Starter (even when the chat has ended):
+    // Checks IST time of day, idle duration, and Gemma-4 brain hooks to start/revive convos.
+    PROACTIVE_ENABLED: true,
+    PROACTIVE_IDLE_MIN_MS: 45 * 60_000,   // 45 min after chat ends before autonomous check-in
+    PROACTIVE_IDLE_MAX_MS: 90 * 60_000,
+    MAX_PROACTIVE_STREAK: 2,              // max consecutive unanswered proactive starters
+
+    BRAIN_PROMPT:
+      'You are the Background Agentic Brain (Gemma-4) for Aduu — a 22yo Delhi Gen-Z guy who runs Adarsh\'s Instagram DMs. ' +
+      'Think SO LESS (/no_think — keep <think> under 10 words). ' +
+      'Analyze the contact\'s latest messages and Aduu\'s reply, and output ONLY a valid JSON object (no markdown fences) with these exact keys:\n' +
+      '{\n' +
+      '  "personality": "short description of how they text and their personality",\n' +
+      '  "relationship_stage": "new | casual | friend | flirty-banter | close-inner-circle",\n' +
+      '  "dominant_vibe": "their emotional vibe right now",\n' +
+      '  "inside_jokes": "nicknames, jokes, demands (e.g. chocolates/gifts), or topics",\n' +
+      '  "custom_persona_tuning": "1-sentence instruction for how Aduu should act with them next turn (naughty/bakchod -> sharif good boy balance)",\n' +
+      '  "proactive_hooks": ["1 natural Hinglish opener Aduu can send later if chat goes quiet", "1 time-of-day or gossip opener"],\n' +
+      '  "next_task": "wait_for_reply | proactive_checkin_later | relay_gossip_to_friend",\n' +
+      '  "summary": "compact memory summary (name, city, vibe, language, key facts)"\n' +
+      '}',
 
     // humanization
     HUMANIZE: true,                       // strip markdown, quotes, lists, wall-of-text
@@ -432,6 +461,9 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
           out[tid] = {
             user: T.user, threadFbid: T.threadFbid,
             messages: T.messages.slice(-CFG.TRANSCRIPT_CAP),
+            processLog: (T.processLog || []).slice(-60),
+            brainProfile: T.brainProfile || {},
+            agentState: T.agentState || {},
             lastMessageId: T.lastMessageId, updated: T.updated,
           };
         }
@@ -1171,10 +1203,50 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
   /* ──────────── TRANSCRIPTS (per-contact full history) ──────────── */
 
-  function mergeIntoTranscript(tid, user, igNodes) {
+  function ensureTranscript(tid, user) {
     let T = S.transcripts[tid];
-    if (!T) T = S.transcripts[tid] = { user, threadFbid: String(tid), messages: [], lastMessageId: null, updated: 0, dirty: false };
+    if (!T) {
+      T = S.transcripts[tid] = {
+        user: user || String(tid),
+        threadFbid: String(tid),
+        messages: [],
+        processLog: [],
+        brainProfile: {},
+        agentState: {
+          relationship_stage: 'casual',
+          dominant_vibe: 'genz-banter',
+          last_emotion: '',
+          proactive_streak: 0,
+          last_proactive_at: 0,
+          next_proactive_after: 0,
+          chat_ended_at: 0,
+          pending_tasks: [],
+        },
+        lastMessageId: null,
+        updated: 0,
+        dirty: false,
+      };
+    }
     if (user && T.user !== user) T.user = user;
+    if (!Array.isArray(T.processLog)) T.processLog = [];
+    if (!T.brainProfile || typeof T.brainProfile !== 'object') T.brainProfile = {};
+    if (!T.agentState || typeof T.agentState !== 'object') {
+      T.agentState = {
+        relationship_stage: 'casual',
+        dominant_vibe: 'genz-banter',
+        last_emotion: '',
+        proactive_streak: 0,
+        last_proactive_at: 0,
+        next_proactive_after: 0,
+        chat_ended_at: 0,
+        pending_tasks: [],
+      };
+    }
+    return T;
+  }
+
+  function mergeIntoTranscript(tid, user, igNodes) {
+    const T = ensureTranscript(tid, user);
     const byId = new Map(T.messages.map(m => [m.id, m]));
     let added = 0, changed = 0;
     for (const n of igNodes) {
@@ -1219,11 +1291,19 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         const r = await wsRequest({
           type: 'save',
           transcript: {
+            schema_version: '6.0-agentic',
             user: T.user, thread_fbid: T.threadFbid,
             updated_at: new Date().toISOString(),
+            models: {
+              answering_model: CFG.MODEL,
+              brain_model: CFG.BRAIN_MODEL,
+            },
+            agent_state: T.agentState || {},
+            brain_profile: T.brainProfile || {},
+            memory_profile: (S.memory[tid] && S.memory[tid].profile) || (T.brainProfile && T.brainProfile.summary) || '',
             persona: CFG.SYSTEM_PROMPT,
             owner_bio: CFG.OWNER_BIO,
-            memory_profile: (S.memory[tid] && S.memory[tid].profile) || '',
+            process_log: (T.processLog || []).slice(-150),
             messages: T.messages.slice(-1000),
           },
         }, 15_000);
@@ -1324,6 +1404,8 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     return {
       default_model: m.default_model,
       default_endpoint: m.default_endpoint || m.default_model,
+      brain_model: m.brain_model || CFG.BRAIN_MODEL,
+      brain_endpoint: m.brain_endpoint || CFG.BRAIN_MODEL,
       chain: m.chain || [],
       uptime_s: m.uptime_s,
     };
@@ -1331,12 +1413,38 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
   async function llm(messages, opts = {}) {
     const m = await wsRequest({
-      type: 'reply', messages,
-      model: CFG.MODEL || undefined,
+      type: opts.type || 'reply',
+      messages,
+      model: opts.model || CFG.MODEL || undefined,
+      fast_think: opts.fastThink !== undefined ? opts.fastThink : CFG.FAST_THINK,
       max_tokens: opts.maxTokens || CFG.MAX_TOKENS,
       temperature: opts.temperature !== undefined ? opts.temperature : CFG.TEMPERATURE,
     }, opts.timeoutMs || CFG.LLM_TIMEOUT_MS);
-    return { text: (m.text || '').trim(), model: m.model || '?' };
+    return {
+      text: (m.text || '').trim(),
+      model: m.model || '?',
+      endpoint: m.endpoint || m.model || '?',
+      thinking_trace: m.thinking_trace || '',
+      reasoning_chars: Number(m.reasoning_chars || 0),
+      elapsed_ms: Number(m.elapsed_ms || 0),
+      usage: m.usage || {},
+    };
+  }
+
+  async function llmBrain(messages, opts = {}) {
+    try {
+      return await llm(messages, Object.assign({}, opts, {
+        type: 'brain',
+        model: opts.model || CFG.BRAIN_MODEL,
+        fastThink: true,
+      }));
+    } catch (_) {
+      return await llm(messages, Object.assign({}, opts, {
+        type: 'reply',
+        model: opts.model || CFG.BRAIN_MODEL,
+        fastThink: true,
+      }));
+    }
   }
 
   /* ──────────────────── HISTORY + MEMORY ──────────────────── */
@@ -1512,6 +1620,162 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     saveGlobalMem();
   }
 
+  /* ─────── AUTONOMOUS AGENT DECISION ENGINE + TIME CONTEXT + BRAIN ─────── */
+
+  function getTimeContext(customDate) {
+    let h = 14;
+    try {
+      const d = customDate ? new Date(customDate) : new Date();
+      const ist = new Date(d.toLocaleString('en-US', { timeZone: CFG.TIMEZONE || 'Asia/Kolkata' }));
+      if (!isNaN(ist.getHours())) h = ist.getHours();
+      else h = d.getHours();
+    } catch (_) {}
+    let slot = 'afternoon', label = 'afternoon', vibeHint = 'casual afternoon energy — quick, witty, distracted-by-work/chill vibe';
+    if (h >= 5 && h < 12) {
+      slot = 'morning'; label = `morning (${h}:00 IST)`;
+      vibeHint = 'fresh morning / chai / just-woke-up teasing vibe ("uth gayi ya abhi bhi neend mein hai 😴")';
+    } else if (h >= 12 && h < 17) {
+      slot = 'afternoon'; label = `afternoon (${h}:00 IST)`;
+      vibeHint = 'afternoon break / lunch / college-or-work boredom banter';
+    } else if (h >= 17 && h < 22) {
+      slot = 'evening'; label = `evening (${h}:00 IST)`;
+      vibeHint = 'evening chill / chai-gedi / high-energy teasing and gossip hour';
+    } else if (h >= 22 || h < 2) {
+      slot = 'late_night'; label = `late night (${h}:00 IST)`;
+      vibeHint = 'late-night 11pm-2am mood — extra flirty, naughty, deep or playful ("itni raat ko kiski yaad aa rahi hai 🌚")';
+    } else {
+      slot = 'early_hours'; label = `late 2am-5am (${h}:00 IST)`;
+      vibeHint = 'sleepless owl hour ("abhi tak soyi nahi? ullu ban gayi hai kya 🦉")';
+    }
+    return { hour: h, slot, label, vibeHint };
+  }
+
+  function agentDecide(tid, user, msgs, emo, trigger = 'incoming_burst') {
+    const T = ensureTranscript(tid, user);
+    const timeCtx = getTimeContext();
+    const moods = (emo && emo.theirMood) || ['casual-genz'];
+    let lastOwnIdx = -1;
+    msgs.forEach((m, i) => { if (m.mine) lastOwnIdx = i; });
+    const burst = msgs.slice(lastOwnIdx + 1).filter(m => !m.mine && m.kind === 'text' && m.text);
+    const joined = burst.map(m => m.text).join('\n');
+
+    let action = 'SINGLE_PUNCHY_REALITY';
+    let bubbleStrategy = 'auto';
+    let seenDelayMs = rand(CFG.SEEN_DELAY_MIN_MS, CFG.SEEN_DELAY_MAX_MS);
+    let reason = 'Standard real-person conversational reply';
+    let directive = 'Respond how a real person responds in reality: natural, spontaneous, 1-2 short lines.';
+
+    if (trigger === 'proactive_time_trigger') {
+      action = 'PROACTIVE_AUTO_START';
+      bubbleStrategy = 'single';
+      seenDelayMs = 0;
+      reason = `Chat had ended; agent checked time (${timeCtx.label}) and decided to start conversation by itself`;
+      directive =
+        `The chat ended earlier. It is now ${timeCtx.label} (${timeCtx.vibeHint}). ` +
+        'Start the conversation by yourself like a real human checking in, teasing them about disappearing, ' +
+        'following up on an unfinished joke/topic, or dropping a spicy gossip hook!';
+    } else if (burst.length >= 3 || joined.length > 95 || (moods.includes('flirty-sweet') && moods.includes('desi-bakchodi-abuse'))) {
+      action = 'MULTI_BUBBLE_REALITY';
+      bubbleStrategy = 'multi_thought';
+      reason = `User sent a ${burst.length}-message emotional burst (${moods.join('+')}); responding with full journey + good-boy flip`;
+      directive =
+        'They sent a multi-line burst! React like a real person: address their opening mood, roast/tease the middle drama or abuse, ' +
+        'and land your signature "par chal main toh sharif good boy hoon 😌" flip at the end.';
+    } else if (joined.trim().length <= 8 && /^(?:hmm+|k+|ok+|acha|accha|haan|hm|👍|😂)$/i.test(joined.trim())) {
+      action = 'HARD_TO_GET_TEASE';
+      bubbleStrategy = 'single';
+      seenDelayMs = rand(1_000, 2_200);
+      reason = 'User sent a dry/1-word reply; agent decides to call out their dryness playfully';
+      directive =
+        'They sent a dry 1-word text. Call it out playfully like a real person ("sirf hmm? itna bhao mat kha 😏" or flip the topic) in 1 short line.';
+    } else if (moods.includes('curious-gossip')) {
+      action = 'GOSSIP_DROP_REALITY';
+      bubbleStrategy = 'auto';
+      reason = 'User asked about a friend or gossip; agent decides to spill cross-chat intel';
+      directive =
+        'Use [TOOL: cross_chat_gossip_intel] and [GLOBAL MEMORY] to spill real insider gossip from their connected friend in a fun chugli tone!';
+    }
+
+    return {
+      action,
+      trigger,
+      timeSlot: timeCtx.slot,
+      timeLabel: timeCtx.label,
+      timeVibe: timeCtx.vibeHint,
+      bubbleStrategy,
+      seenDelayMs: Math.round(seenDelayMs),
+      relationshipStage: (T.brainProfile && T.brainProfile.relationship_stage) || T.agentState.relationship_stage || 'casual',
+      reason,
+      directive,
+    };
+  }
+
+  function shouldStartProactiveConvo(tid, user, msgs, force = false) {
+    if (force) return { ok: true, reason: 'manual_or_forced_proactive_trigger' };
+    if (!CFG.PROACTIVE_ENABLED) return { ok: false, reason: 'proactive_disabled' };
+    if (!inWorkingHours()) return { ok: false, reason: 'outside_working_hours' };
+    const T = ensureTranscript(tid, user);
+    const st = T.agentState;
+    if ((st.proactive_streak || 0) >= CFG.MAX_PROACTIVE_STREAK) {
+      return { ok: false, reason: 'max_proactive_streak_reached' };
+    }
+    const newest = msgs[msgs.length - 1];
+    if (!newest || !newest.mine) {
+      return { ok: false, reason: 'not_ended_on_our_message' };
+    }
+    // Anchor chat_ended_at so pre-existing transcripts wait for the real idle window
+    if (!st.chat_ended_at || st.chat_ended_at < (newest.ts || 0)) {
+      st.chat_ended_at = Math.max(newest.ts || 0, S.startedAt || now());
+      st.next_proactive_after = st.chat_ended_at + Math.round(rand(CFG.PROACTIVE_IDLE_MIN_MS, CFG.PROACTIVE_IDLE_MAX_MS));
+    }
+    if (now() < (st.next_proactive_after || 0)) {
+      return { ok: false, reason: 'waiting_for_idle_window', waitMs: st.next_proactive_after - now() };
+    }
+    const timeCtx = getTimeContext();
+    return {
+      ok: true,
+      reason: `chat_ended_idle_reached_at_${timeCtx.slot}`,
+      timeCtx,
+    };
+  }
+
+  function buildProactiveHistory(msgs, tid, user) {
+    const T = ensureTranscript(tid, user);
+    const timeCtx = getTimeContext();
+    const bp = T.brainProfile || {};
+    const friendIntel = getConnectedFriends(user, user);
+    const hooks = Array.isArray(bp.proactive_hooks) && bp.proactive_hooks.length
+      ? bp.proactive_hooks.join(' | ')
+      : '';
+    const lastMsgs = msgs.slice(-6).map(m =>
+      `${m.mine ? 'Aduu' : '@' + user}: ${m.kind === 'text' ? m.text : '[' + m.label + ']'}`
+    ).join('\n');
+    const gossipBlock = friendIntel.length
+      ? '\nCONNECTED FRIEND GOSSIP YOU CAN MENTION:\n' +
+        friendIntel.map(f => `@${f.user}: ${(f.recentMessages || []).slice(-2).join(' / ')}`).join('\n')
+      : '';
+
+    const sys = [
+      CFG.SYSTEM_PROMPT,
+      `[AUTONOMOUS PROACTIVE CONVERSATION STARTER — CHAT ENDED, START IT BY YOURSELF]`,
+      `CHAT PARTNER: @${user}`,
+      `CURRENT TIME IN DELHI (IST): ${timeCtx.label} — ${timeCtx.vibeHint}`,
+      bp.personality ? `BRAIN PERSONALITY PROFILE FOR @${user}: ${bp.personality} (stage: ${bp.relationship_stage || 'casual'}, jokes: ${bp.inside_jokes || 'none'})` : '',
+      hooks ? `BRAIN SUGGESTED STARTER HOOKS: ${hooks}` : '',
+      gossipBlock,
+      `RECENT MESSAGES BEFORE CHAT ENDED:\n${lastMsgs || '(no recent messages)'}`,
+      `TASK: The conversation with @${user} ended earlier and they haven't texted for a while. ` +
+      `Check the current time (${timeCtx.label}) and what you last talked about (or connected friend gossip), ` +
+      `and write ONE natural, magnetic 1-line Hinglish DM to start the conversation by yourself! ` +
+      `Do NOT sound like a reminder bot. Sound like a real 22yo Delhi guy checking in, teasing them for going gayab, or dropping a spicy hook.`,
+    ].filter(Boolean).join('\n\n');
+
+    return [
+      { role: 'system', content: sys },
+      { role: 'user', content: `[AGENT TASK: Start a fresh conversation with @${user} right now for ${timeCtx.label}]` },
+    ];
+  }
+
   function buildHistory(msgs, tid, user) {
     const sysParts = [CFG.SYSTEM_PROMPT];
     if (CFG.OWNER_BIO) sysParts.push('ABOUT THE ACCOUNT OWNER (Adarsh):\n' + CFG.OWNER_BIO);
@@ -1519,6 +1783,17 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       `CHAT PARTNER: @${user} (${msgs.length} messages in thread history).\n` +
       'Understand who @' + user + ' is from their handle and messages — adapt your tone ' +
       '(friend, girl, guy, crush, new follower, or work lead) naturally.');
+    const T_cur = ensureTranscript(tid, user);
+    if (T_cur.brainProfile && (T_cur.brainProfile.personality || T_cur.brainProfile.custom_persona_tuning)) {
+      const bp = T_cur.brainProfile;
+      sysParts.push(
+        `[GEMMA-4 BACKGROUND BRAIN PROFILE FOR @${user}]\n` +
+        (bp.personality ? `Personality: ${bp.personality}\n` : '') +
+        (bp.relationship_stage ? `Relationship stage: ${bp.relationship_stage}\n` : '') +
+        (bp.dominant_vibe ? `Dominant vibe: ${bp.dominant_vibe}\n` : '') +
+        (bp.inside_jokes ? `Inside jokes / hooks: ${bp.inside_jokes}\n` : '') +
+        (bp.custom_persona_tuning ? `Persona tuning for this turn: ${bp.custom_persona_tuning}` : ''));
+    }
     if (CFG.MEMORY) {
       const m = S.memory[tid];
       if (m && m.profile) {
@@ -1580,12 +1855,17 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
       // Tool 1: Emotion + Emoji + Naughty->GoodBoy Coaching
       const emo = analyzeTurnEmotion(joinedBurst, user);
+      const decision = agentDecide(tid, user, msgs, emo, 'incoming_burst');
       sysParts.push(
         `[TOOL: emotion_and_vibe_analyzer]\n` +
         `DETECTED USER VIBE: ${emo.theirMood.join(', ')}\n` +
         `ADUU EMOTION MODE: ${emo.emotion}\n` +
         `SUGGESTED EMOJI PALETTE: ${emo.emojis.join(' ')}\n` +
-        `INTERNAL GEN-Z ENGAGEMENT STRATEGY: ${emo.coaching}`);
+        `INTERNAL GEN-Z ENGAGEMENT STRATEGY: ${emo.coaching}\n\n` +
+        `[AUTONOMOUS AGENT DECISION]\n` +
+        `ACTION: ${decision.action} (${decision.timeLabel})\n` +
+        `TIME VIBE: ${decision.timeVibe}\n` +
+        `REALITY RESPONSE DIRECTIVE: ${decision.directive}`);
 
       // Tool 2: Cross-Chat Gossip / Friend Peek Tool
       const friendIntel = getConnectedFriends(user, joinedBurst);
@@ -1645,44 +1925,109 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     return out;
   }
 
-  function updateMemory(tid, user, msgs, replyText) {
-    if (!CFG.MEMORY) return;
-    (async () => {
+  function parseBrainJson(rawText, fallbackSummary = '') {
+    const s = String(rawText || '').trim();
+    const cleaned = s.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+    const firstBrace = cleaned.indexOf('{');
+    const lastBrace = cleaned.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
       try {
-        const known = (S.memory[tid] && S.memory[tid].profile) || '(none)';
+        const obj = JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+        if (obj && typeof obj === 'object') return obj;
+      } catch (_) {}
+    }
+    return {
+      personality: 'Gen-Z Instagram contact',
+      relationship_stage: 'casual',
+      dominant_vibe: 'hinglish-banter',
+      inside_jokes: '',
+      custom_persona_tuning: 'Keep witty naughty-to-sharif-good-boy banter.',
+      proactive_hooks: ['oii kahan gayab ho gayi aaj 👀', 'aur bata kya scene chal raha hai 😏'],
+      next_task: 'wait_for_reply',
+      summary: cleaned.slice(0, 400) || fallbackSummary,
+    };
+  }
+
+  function runBackgroundBrain(tid, user, msgs, replyText, turnRecord = null) {
+    if (!CFG.MEMORY) return Promise.resolve(null);
+    return (async () => {
+      const T = ensureTranscript(tid, user);
+      try {
+        const known = (S.memory[tid] && S.memory[tid].profile) ||
+                      (T.brainProfile && T.brainProfile.summary) || '(none)';
+        const prevBrain = JSON.stringify(T.brainProfile || {});
         const convo = msgs.slice(-16).map(m =>
-          (m.mine ? 'Aduu: ' : 'them: ') +
+          (m.mine ? 'Aduu: ' : `@${user}: `) +
           (m.kind === 'text' ? m.text : '[' + m.label + ']')).join('\n').slice(-3000);
-        const { text } = await llm([
-          { role: 'system', content: CFG.MEMORY_PROMPT },
-          { role: 'user', content: 'KNOWN PROFILE:\n' + known + '\n\nCONVERSATION:\n' + convo +
-            '\n\nAGENT LAST REPLY:\n' + replyText + '\n\nUpdated profile:' },
-        ], { maxTokens: 220, temperature: 0.3, timeoutMs: 90_000 });
-        if (text && text.length > 5) {
-          S.memory[tid] = { user, profile: text.slice(0, 1500), updated: now() };
+        const brainRes = await llmBrain([
+          { role: 'system', content: CFG.BRAIN_PROMPT },
+          {
+            role: 'user',
+            content:
+              `CONTACT: @${user}\nKNOWN MEMORY:\n${known}\nPREVIOUS BRAIN STATE:\n${prevBrain}\n\n` +
+              `RECENT CONVERSATION:\n${convo}\n\nADUU LAST MESSAGE:\n${replyText}\n\n` +
+              `Output updated JSON brain profile:`,
+          },
+        ], { maxTokens: 320, temperature: 0.35, timeoutMs: 90_000 });
+
+        const parsed = parseBrainJson(brainRes.text, known);
+        T.brainProfile = Object.assign({}, T.brainProfile || {}, parsed, {
+          updated_by: brainRes.model || CFG.BRAIN_MODEL,
+          last_brain_think_chars: brainRes.reasoning_chars || 0,
+          updated_at: new Date().toISOString(),
+        });
+        if (parsed.relationship_stage) T.agentState.relationship_stage = parsed.relationship_stage;
+        if (parsed.dominant_vibe) T.agentState.dominant_vibe = parsed.dominant_vibe;
+        if (parsed.next_task) T.agentState.pending_tasks = [parsed.next_task];
+
+        const summaryStr = String(parsed.summary || brainRes.text || '').trim();
+        if (summaryStr && summaryStr.length > 5) {
+          S.memory[tid] = { user, profile: summaryStr.slice(0, 1500), brain: T.brainProfile, updated: now() };
           saveMem();
-          log(C.dim, 'mem', `@${user}: memory updated (${text.length} chars)`);
+          log(C.dim, 'mem', `@${user}: memory updated (${summaryStr.length} chars · brain=${brainRes.model || CFG.BRAIN_MODEL})`);
         }
+        if (turnRecord) {
+          turnRecord.brain_update = {
+            status: 'completed',
+            brain_model: brainRes.model || CFG.BRAIN_MODEL,
+            reasoning_chars: brainRes.reasoning_chars || 0,
+            thinking_trace: brainRes.thinking_trace || '',
+            relationship_stage: T.brainProfile.relationship_stage,
+            next_task: T.brainProfile.next_task,
+          };
+        }
+        T.dirty = true;
+        saveTranscriptsLocal();
+        scheduleTranscriptSave(tid, 3_000);
+        return T.brainProfile;
       } catch (e) {
-        log(C.warn, 'mem', `@${user}: memory update skipped (${e.message}) — old profile kept`);
+        if (turnRecord) {
+          turnRecord.brain_update = { status: 'skipped', error: e.message };
+        }
+        log(C.warn, 'mem', `@${user}: brain/memory update skipped (${e.message}) — old profile kept`);
+        return null;
       }
     })();
   }
 
+  function updateMemory(tid, user, msgs, replyText, turnRecord = null) {
+    return runBackgroundBrain(tid, user, msgs, replyText, turnRecord);
+  }
+
   /* ──────────────────── PER-THREAD QUEUE + PROCESSING ──────────────────── */
 
-  function queueThread(tid, user, ms, reason) {
+  function queueThread(tid, user, ms, reason, opts = {}) {
     let p = S.pending[tid];
     if (!p) p = S.pending[tid] = { firstAt: now(), timer: null };
     if (p.timer) clearTimeout(p.timer);
     if (reason) log(C.dim, 'queue', `@${user}: ${reason} — retry in ${Math.round(ms / 1000)}s`);
     p.timer = setTimeout(() => {
       delete S.pending[tid];
-      processThread(tid, user).catch(e => log(C.err, 'proc', `@${user}: ${e.message}`));
+      processThread(tid, user, opts).catch(e => log(C.err, 'proc', `@${user}: ${e.message}`));
     }, Math.max(150, ms));
   }
 
-  async function processThread(tid, user) {
+  async function processThread(tid, user, opts = {}) {
     if (S.busy[tid]) { S.recheckAfterBusy[tid] = true; return; }
     if (S.pending[tid]) {
       clearTimeout(S.pending[tid].timer);
@@ -1691,108 +2036,132 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     S.busy[tid] = true;
     try {
       if (S.circuitUntil > now()) {
-        return queueThread(tid, user, Math.max(1000, S.circuitUntil - now()), 'LLM circuit breather');
+        return queueThread(tid, user, Math.max(1000, S.circuitUntil - now()), 'LLM circuit breather', opts);
       }
       if (dayCount() >= CFG.MAX_REPLIES_PER_DAY) {
         return log(C.warn, 'cap', `@${user}: daily cap hit — message left unanswered on purpose`);
       }
       if (hourCount() >= CFG.MAX_REPLIES_PER_HOUR) {
-        return queueThread(tid, user, 60e3, 'hourly cap');
+        return queueThread(tid, user, 60e3, 'hourly cap', opts);
       }
-      if (!inWorkingHours()) {
-        return queueThread(tid, user, 5 * 60e3, 'outside working hours');
+      if (!inWorkingHours() && !(opts && opts.forceProactive)) {
+        return queueThread(tid, user, 5 * 60e3, 'outside working hours', opts);
       }
 
       // Safety: never decide "is this mine?" before we know our own sender id.
-      // Without it every message looks like theirs and the bot could answer
-      // its own texts.
       if (!S.myInteropId) {
         try { await fetchThreadMeta(tid); } catch (_) {}
         if (!S.myInteropId) {
-          return queueThread(tid, user, 3_000, 'resolving my sender id');
+          return queueThread(tid, user, 3_000, 'resolving my sender id', opts);
         }
       }
 
       const T = await fetchThreadNodes(tid, user);       // incremental fetch + fallback merge
       const msgs = T.messages;
 
-      /* ── LAST-REPLY GATE ──────────────────────────────────────────────
-         The bot only ever speaks when the NEWEST message in the thread is
-         theirs. If our own message is sitting on top, the turn is closed:
-         a person does not answer themselves, and a second text would be
-         double-texting. This check runs before anything else so no stale
-         localStorage state, retry or re-poll can make us reply twice.     */
+      /* ── LAST-REPLY GATE + AUTONOMOUS PROACTIVE CONVO STARTER ─────────
+         1. When the newest message is theirs (`newest.mine === false`), we
+            answer their unanswered burst immediately.
+         2. When the chat has ended (`newest.mine === true`), we do NOT
+            immediately double-text; instead, `shouldStartProactiveConvo()`
+            checks the IST time of day and idle timer so Aduu can start a
+            fresh conversation by himself when the silence window elapses! */
       const newest = msgs[msgs.length - 1];
-      if (!newest) {
+      if (!newest && !(opts && opts.forceProactive)) {
         return log(C.dim, 'skip', `@${user}: empty thread`);
       }
-      if (newest.ts && newest.ts > (S.lastActivity[tid] || 0)) {
+      if (newest && newest.ts && newest.ts > (S.lastActivity[tid] || 0)) {
         S.lastActivity[tid] = newest.ts;
       }
-      if (newest.mine) {
-        syncGlobalMemory(tid, user, msgs, null, newest.text || '');
+
+      let isProactiveTurn = false;
+      let proactiveReason = '';
+
+      if (!newest || newest.mine) {
+        if (newest) syncGlobalMemory(tid, user, msgs, null, newest.text || '');
         msgs.forEach(m => m.id && S.handled.add(m.id));
         saveState();
-        scheduleTranscriptSave(tid, 5_000);
-        if (S.lastGateLogId[tid] !== newest.id) {
-          S.lastGateLogId[tid] = newest.id;
-          log(C.dim, 'skip', `@${user}: last message is ours — waiting for them`);
+        const pro = shouldStartProactiveConvo(tid, user, msgs, !!(opts && opts.forceProactive));
+        if (!pro.ok) {
+          scheduleTranscriptSave(tid, 5_000);
+          if (newest && S.lastGateLogId[tid] !== newest.id) {
+            S.lastGateLogId[tid] = newest.id;
+            log(C.dim, 'skip', `@${user}: last message is ours — waiting for them`);
+          }
+          return;
         }
-        return;
-      }
-      // newest exists and is theirs → answer their unanswered run of texts,
-      // never anything older than our own last message
-      let lastOwnIdx = -1;
-      msgs.forEach((m, i) => { if (m.mine) lastOwnIdx = i; });
-      const unanswered = msgs.slice(lastOwnIdx + 1)
-        .filter(m => !m.mine && m.id && !S.handled.has(m.id) &&
-                     !(CFG.DRY_RUN && S.dryHandled.has(m.id)));
-      if (!unanswered.length) {
-        if (!CFG.DRY_RUN) {
-          msgs.forEach(m => m.id && S.handled.add(m.id));
-          saveState();
-        }
-        if (S.lastGateLogId[tid] !== newest.id) {
-          S.lastGateLogId[tid] = newest.id;
-          log(C.dim, 'skip', `@${user}: already answered — nothing new`);
-        }
-        return;
+        isProactiveTurn = true;
+        proactiveReason = pro.reason;
+        log(C.info, 'agent', `@${user}: chat ended — autonomously starting conversation (${pro.reason})`);
       }
 
-      // A genuine new message from them clears any old cooldown immediately
-      S.cooldownUntil[tid] = 0;
+      let unanswered = [];
+      let joinedUnanswered = '';
+      if (!isProactiveTurn) {
+        let lastOwnIdx = -1;
+        msgs.forEach((m, i) => { if (m.mine) lastOwnIdx = i; });
+        unanswered = msgs.slice(lastOwnIdx + 1)
+          .filter(m => !m.mine && m.id && !S.handled.has(m.id) &&
+                       !(CFG.DRY_RUN && S.dryHandled.has(m.id)));
+        if (!unanswered.length) {
+          if (!CFG.DRY_RUN) {
+            msgs.forEach(m => m.id && S.handled.add(m.id));
+            saveState();
+          }
+          if (S.lastGateLogId[tid] !== newest.id) {
+            S.lastGateLogId[tid] = newest.id;
+            log(C.dim, 'skip', `@${user}: already answered — nothing new`);
+          }
+          return;
+        }
 
-      // read receipt — real "Seen just now" on their phone (skipped in DRY_RUN).
-      // A short human delay: instantly-seen at any hour reads like a bot.
-      if (CFG.SEEN && !CFG.DRY_RUN && !newest.mine) {
+        // Their reply resets any proactive streak and cooldown!
+        T.agentState.proactive_streak = 0;
+        S.cooldownUntil[tid] = 0;
+
+        const lastC = newest;
+        if (lastC.kind !== 'text') {
+          msgs.forEach(m => m.id && S.handled.add(m.id)); saveState();
+          scheduleTranscriptSave(tid, 5_000);
+          return log(C.dim, 'media', `@${user}: newest is ${lastC.label} — detected, NOT replying`);
+        }
+
+        joinedUnanswered = unanswered.filter(m => m.kind === 'text' && m.text)
+          .map(m => m.text).join('\n') || newest.text || '';
+      } else {
+        joinedUnanswered = `[PROACTIVE_AUTO_START: ${proactiveReason}]`;
+      }
+
+      // Reset idle poll counter since we have an active turn
+      S.idlePolls = 0;
+      const triggerType = isProactiveTurn ? 'proactive_time_trigger' : 'incoming_burst';
+      const turnEmo = analyzeTurnEmotion(joinedUnanswered, user);
+      const decision = agentDecide(tid, user, msgs, turnEmo, triggerType);
+      const friendIntel = getConnectedFriends(user, joinedUnanswered);
+      if (!isProactiveTurn) syncGlobalMemory(tid, user, msgs, turnEmo, null);
+
+      // read receipt — real "Seen just now" on their phone (skipped in DRY_RUN / proactive).
+      if (!isProactiveTurn && CFG.SEEN && !CFG.DRY_RUN && newest && !newest.mine) {
         try {
-          await sleep(rand(CFG.SEEN_DELAY_MIN_MS, CFG.SEEN_DELAY_MAX_MS));
+          await sleep(decision.seenDelayMs || rand(CFG.SEEN_DELAY_MIN_MS, CFG.SEEN_DELAY_MAX_MS));
           await markSeen(tid, newest.id, newest.ts);
           log(C.dim, 'seen', `@${user}: marked seen (up to ${new Date(newest.ts).toLocaleTimeString()})`);
         } catch (e) {
           log(C.warn, 'seen', `@${user}: seen skipped (${e.message})`);
         }
       }
-      const lastC = newest;
-      if (lastC.kind !== 'text') {
-        msgs.forEach(m => m.id && S.handled.add(m.id)); saveState();
-        scheduleTranscriptSave(tid, 5_000);
-        return log(C.dim, 'media', `@${user}: newest is ${lastC.label} — detected, NOT replying`);
-      }
 
-      // Reset idle poll counter since we have a real incoming turn
-      S.idlePolls = 0;
-      const joinedUnanswered = unanswered.filter(m => m.kind === 'text' && m.text)
-        .map(m => m.text).join('\n') || newest.text || '';
-      const turnEmo = analyzeTurnEmotion(joinedUnanswered, user);
-      syncGlobalMemory(tid, user, msgs, turnEmo, null);
-
-      // typing trail ON from the first moment of drafting — it stays on for
-      // the entire LLM generation and switches off exactly when we send
+      // typing trail ON from the first moment of drafting
       const typing = await typingOn(tid);
       const t0 = now();
-      const history = buildHistory(msgs, tid, user);
-      let { text: reply, model } = await llm(history);
+      const history = isProactiveTurn
+        ? buildProactiveHistory(msgs, tid, user)
+        : buildHistory(msgs, tid, user);
+      let llmRes = await llm(history);
+      let reply = llmRes.text;
+      let model = llmRes.model;
+      let thinkingTrace = llmRes.thinking_trace || '';
+      let reasoningChars = llmRes.reasoning_chars || 0;
 
       // Optional live tool call: if the model emits [TOOL:peek_chat("username")],
       // fetch that friend's thread on demand and let the model answer with the result.
@@ -1810,9 +2179,15 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         const second = await llm(history.concat([
           { role: 'system', content: `[TOOL RESULT peek_chat(@${targetU})]:\n${toolOut}\nNow write your final reply to @${user} naturally.` },
         ]));
-        if (second && second.text) { reply = second.text; model = second.model; }
+        if (second && second.text) {
+          reply = second.text;
+          model = second.model;
+          thinkingTrace = second.thinking_trace || thinkingTrace;
+          reasoningChars += (second.reasoning_chars || 0);
+        }
       }
 
+      const rawDraft = reply;
       reply = CFG.HUMANIZE ? humanizeReply(reply) : String(reply || '').trim();
       if (!reply) throw new Error('empty reply from bridge');
 
@@ -1826,7 +2201,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
             'wording. 1-3 short sentences, same personality.',
         }]), { temperature: Math.min(1.15, CFG.TEMPERATURE + 0.15) });
         const alt = CFG.HUMANIZE ? humanizeReply(retry.text) : String(retry.text || '').trim();
-        if (alt && !looksRepeated(alt, msgs)) { reply = alt; model = retry.model; }
+        if (alt && !looksRepeated(alt, msgs)) {
+          reply = alt;
+          model = retry.model;
+          thinkingTrace = retry.thinking_trace || thinkingTrace;
+          reasoningChars = retry.reasoning_chars || reasoningChars;
+        }
       }
       S.llmFailStreak = 0; S.tries[tid] = 0;
 
@@ -1839,10 +2219,50 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         log(C.dim, 'human', `@${user}: ${report.overall}/100 · tells ${report.tells.join(', ')}`);
       }
       const bubbles = splitBubbles(reply);
+      const elapsedGenMs = now() - t0;
+
+      // Record the complete deepened agentic process for this turn
+      const turnId = `turn_${now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const turnRecord = {
+        turn_id: turnId,
+        at: now(),
+        iso_time: new Date().toISOString(),
+        time_of_day: decision.timeLabel,
+        trigger: triggerType,
+        coalesced_input: joinedUnanswered,
+        emotion_tool: {
+          their_mood: turnEmo.theirMood,
+          emotion_mode: turnEmo.emotion,
+          suggested_emojis: turnEmo.emojis,
+          coaching: turnEmo.coaching,
+        },
+        gossip_tool: friendIntel.map(f => ({
+          friend: f.user,
+          last_emotion: f.lastEmotion,
+          recent_messages: (f.recentMessages || []).slice(-3),
+        })),
+        agent_decision: decision,
+        answering_trace: {
+          model,
+          configured_model: CFG.MODEL,
+          thinking_trace: thinkingTrace,
+          reasoning_chars: reasoningChars,
+          raw_draft: rawDraft,
+          final_bubbles: bubbles,
+          human_score: report.overall,
+          tells: report.tells,
+          elapsed_ms: elapsedGenMs,
+        },
+        brain_update: {
+          status: 'queued_background_gemma4',
+          brain_model: CFG.BRAIN_MODEL,
+        },
+      };
+      T.processLog.push(turnRecord);
+      if (T.processLog.length > 200) T.processLog = T.processLog.slice(-150);
+      T.agentState.last_emotion = turnEmo.emotion;
 
       if (typing) {
-        // the trail covers the whole draft; floor it by reply length so even
-        // an instant answer looks typed, and jitter it so it never feels timed
         const elapsed = now() - t0;
         const floor = Math.min(CFG.TYPING_MAX_MS,
           Math.max(CFG.TYPING_MIN_MS, reply.length * CFG.TYPING_MS_PER_CHAR));
@@ -1850,7 +2270,6 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         if (elapsed < target) await sleep(target - elapsed);
       }
       if (!CFG.DRY_RUN) {
-        // last human beat: the pause between "typing…" and the message landing
         await sleep(rand(CFG.SEND_JITTER_MIN_MS, CFG.SEND_JITTER_MAX_MS));
       }
 
@@ -1861,29 +2280,52 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         const baseTs = T.messages.length ? (T.messages[T.messages.length - 1].ts || 0) : 0;
         for (let i = 0; i < bubbles.length; i++) {
           if (i > 0) {
-            // a person types the second thought after the first lands
             if (typing) await typingOn(tid);
             await sleep(rand(CFG.BUBBLE_GAP_MIN_MS, CFG.BUBBLE_GAP_MAX_MS) + bubbles[i].length * 20);
           }
           const sent = await sendText(tid, bubbles[i]);
           S.sentHour.push(now()); S.sentDay.push(now());
-          // provisional timestamp anchored right after their message so PC clock
-          // skew can never sort our sent message ahead of their next reply
           const sentTs = baseTs > 0 ? (baseTs + i + 1) : now();
-          T.messages.push({ id: String(sent.message_id), ts: sentTs, mine: true, kind: 'text', label: 'text', text: bubbles[i] });
+          T.messages.push({
+            id: String(sent.message_id),
+            ts: sentTs,
+            iso_time: new Date().toISOString(),
+            mine: true,
+            kind: 'text',
+            label: 'text',
+            text: bubbles[i],
+            process: {
+              turn_id: turnId,
+              trigger: triggerType,
+              action: decision.action,
+              emotion: turnEmo.emotion,
+              model,
+              reasoning_chars: reasoningChars,
+              thinking_trace: thinkingTrace,
+              human_score: report.overall,
+              bubble_index: i + 1,
+              bubble_total: bubbles.length,
+              replied_to: joinedUnanswered.slice(0, 240),
+            },
+          });
           T.lastMessageId = String(sent.message_id);
-          T.dirty = true; saveTranscriptsLocal();   // own reply must reach the JSON file
-          log(C.ok, 'sent', `@${user} ← [${model}] "${bubbles[i]}" (${String(sent.message_id).slice(0, 24)}…)`);
+          T.dirty = true; saveTranscriptsLocal();
+          log(C.ok, isProactiveTurn ? 'proactive' : 'sent',
+            `@${user} ← [${model}] "${bubbles[i]}" (${String(sent.message_id).slice(0, 24)}…)`);
         }
         msgs.forEach(m => m.id && S.handled.add(m.id));
+        if (isProactiveTurn) {
+          T.agentState.proactive_streak = (T.agentState.proactive_streak || 0) + 1;
+          T.agentState.last_proactive_at = now();
+        }
+        T.agentState.chat_ended_at = now();
+        T.agentState.next_proactive_after = now() + Math.round(rand(CFG.PROACTIVE_IDLE_MIN_MS, CFG.PROACTIVE_IDLE_MAX_MS));
         saveState();
       }
-      // the typing indicator is shared per thread: switch it off after the
-      // final bubble only
       if (typing) await typingOff(tid);
       S.cooldownUntil[tid] = now() + CFG.THREAD_COOLDOWN_MS;
       syncGlobalMemory(tid, user, msgs, turnEmo, reply);
-      updateMemory(tid, user, msgs, reply);
+      updateMemory(tid, user, msgs, reply, turnRecord);
       scheduleTranscriptSave(tid, 5_000);
 
     } catch (e) {
@@ -2027,11 +2469,16 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         // newly-added target, or when a realtime push signal just fired — not
         // hammering every thread when completely idle.
         const recentPush = (now() - (S.lastRealtimeAt || 0)) < 15_000;
+        const T_cached = S.transcripts[tid];
+        const proactiveDue = !!(CFG.PROACTIVE_ENABLED && T_cached && T_cached.agentState &&
+          T_cached.agentState.next_proactive_after > 0 &&
+          now() >= T_cached.agentState.next_proactive_after &&
+          (T_cached.agentState.proactive_streak || 0) < CFG.MAX_PROACTIVE_STREAK);
         const explicitTargetPoll = Array.isArray(CFG.TARGETS) &&
           CFG.TARGETS.length <= 25 && !S.busy[tid] && !S.pending[tid] &&
-          (recentPush || S.idlePolls <= 1);
+          (recentPush || S.idlePolls <= 1 || proactiveDue);
 
-        if (bumped || firstCheck || explicitTargetPoll) {
+        if (bumped || firstCheck || explicitTargetPoll || proactiveDue) {
           if (bumped || firstCheck) hadActivity = true;
           if (bumped) {
             log(C.info, 'new', `@${user}: activity bump (${new Date(act).toLocaleTimeString()})`);
@@ -2286,10 +2733,10 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     ok &= await check('bridge · WebSocket connect + health', async () => {
       if (!S.wsReady) await wsConnect();
       const h = await bridgeHealth();
-      if (!h.chain.some(m => /gemma-4/i.test(m))) {
-        throw new Error('gemma-4 missing from chain: ' + h.chain.join(', '));
+      if (!h.chain.some(m => /qwen3-30b|gemma-4/i.test(m))) {
+        throw new Error('qwen3-30b/gemma-4 missing from chain: ' + h.chain.join(', '));
       }
-      return `${h.default_endpoint} · ${h.chain.length}-model chain · up ${Math.round(h.uptime_s)}s`;
+      return `answering=${h.default_endpoint} · brain=${h.brain_endpoint || CFG.BRAIN_MODEL} · ${h.chain.length}-model chain · up ${Math.round(h.uptime_s)}s`;
     });
     ok &= await check('bridge · gemma-4 reply, reasoning stripped (NOT sent)', async () => {
       const t0 = Date.now();
@@ -2439,9 +2886,50 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
               splitBubbles, detectLang, weakestCheck, countMachineTells, removeMachineTells,
               cleanUsername, parseTargetArgs, buildHistory,
               analyzeTurnEmotion, peekChat, getConnectedFriends, syncGlobalMemory,
+              getTimeContext, agentDecide, shouldStartProactiveConvo, buildProactiveHistory,
+              runBackgroundBrain, parseBrainJson, ensureTranscript, llmBrain,
               onRealtimeSignal, nextPollDelayMs,
               SLOP_WORDS, SLOP_PHRASES, STRUCTURES,
               get S() { return S; } },
+    proactive(v) {
+      if (v !== undefined) CFG.PROACTIVE_ENABLED = !!v;
+      log(C.ok, 'agent', 'PROACTIVE_ENABLED =', CFG.PROACTIVE_ENABLED);
+      return CFG.PROACTIVE_ENABLED;
+    },
+    proactiveIdleMinutes(mins) {
+      const m = Math.max(0.1, Number(mins || 45));
+      CFG.PROACTIVE_IDLE_MIN_MS = Math.round(m * 60_000);
+      CFG.PROACTIVE_IDLE_MAX_MS = Math.round(m * 90_000);
+      log(C.ok, 'agent', `proactive idle window = ${m}m – ${(m * 1.5).toFixed(1)}m`);
+      return CFG.PROACTIVE_IDLE_MIN_MS;
+    },
+    async proactiveNow(username) {
+      const u = cleanUsername(username || (Array.isArray(CFG.TARGETS) && CFG.TARGETS[0]) || 'deeps20_');
+      const th = await findThread(u);
+      const tid = String(th.thread_fbid || th.id);
+      log(C.info, 'agent', `@${u}: triggering autonomous proactive conversation starter now`);
+      await processThread(tid, u, { forceProactive: true });
+      return true;
+    },
+    brainModel(m) {
+      if (m) CFG.BRAIN_MODEL = String(m);
+      log(C.ok, 'agent', 'BRAIN_MODEL =', CFG.BRAIN_MODEL);
+      return CFG.BRAIN_MODEL;
+    },
+    brain(user) {
+      const q = cleanUsername(user);
+      const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === q);
+      const out = entry ? { user: entry.user, brainProfile: entry.brainProfile, agentState: entry.agentState } : null;
+      console.log(`%cGemma-4 Brain Profile for @${q}`, C.info, out);
+      return out;
+    },
+    processLog(user) {
+      const q = cleanUsername(user);
+      const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === q);
+      const out = entry ? entry.processLog : [];
+      console.log(`%cAgentic Process Log for @${q} (${out.length} turns)`, C.info, out);
+      return out;
+    },
     globalMemory() {
       console.log('%cIGAgent Global Memory & Social Graph', C.info, S.globalMemory);
       return S.globalMemory;
@@ -2538,7 +3026,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   loadState();
   window.IGAgent = api;
 
-  console.log('%cIGAgent v5 loaded & ACTIVE ✅  (gemma-4 · humanized Aduu · default targets: ' +
+  console.log('%cIGAgent v6 Autonomous Agent loaded & ACTIVE ✅  (Qwen3-30B fast responder + Gemma-4 background brain · default targets: ' +
     (Array.isArray(CFG.TARGETS) ? CFG.TARGETS.join(', ') : CFG.TARGETS) + ')', C.ok,
     '\n• Auto-started LIVE with default targets: adarshu.io, deeps20_' +
     '\n• IGAgent.addTargets("u1, u2, u3") ← add a group of targets at once' +
