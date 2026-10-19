@@ -1,9 +1,10 @@
-# IG Agent Bot — llmchat.in edition (v4)
+# IG Agent Bot — llmchat.in edition (v5)
 
 An autonomous Instagram DM chatbot. People message the account, an AI agent
 answers by itself — across many chats at once, remembering each person —
-with **real "Seen" receipts**, the **real typing indicator**, and a complete
-**JSON transcript of every chat**.
+with **real "Seen" receipts**, the **real typing indicator**, complete
+**JSON transcripts**, and an **experimental social agent** that comments,
+replies to comments, and manages the account's NOTE autonomously.
 
 **No API keys.** LLM power comes from [llmchat.in](https://llmchat.in)
 (23 free models) via your own provider file.
@@ -42,6 +43,11 @@ same GraphQL the site itself does (`POST /api/graphql`), tokens (`fb_dtsg`,
 | send text | `IGDirectTextSendMutation` | `26911679871773184` |
 | **mark read** | `useIGDMarkThreadAsReadMutation` | `27399783383056109` |
 | **mark read (validation)** | `useIGDMarkThreadAsReadValidationMutation` | `35211594988486314` |
+| **create comment** | `PolarisPostCommentInputRevampedMutation` | `27261905640092552` |
+| **story/reel → DM** | `IGDirectReelShareMutation` | `26212720875066239` |
+| **create note** | `usePolarisCreateInboxTrayItemSubmitMutation` | `28592645767037889` |
+| **delete note** | `usePolarisDeleteInboxTrayItemSubmitMutation` | `28419182984337833` |
+| **read notes tray** | `IGDInboxTrayQuery` | `29231580869776032` |
 
 doc_ids are stable server-registered Relay operations; if one ever dies,
 re-capture it with the spy technique (hook XHR/fetch in DevTools, click
@@ -83,6 +89,38 @@ Every targeted chat is kept as `transcripts/<user>.json`:
   restarts with an empty cache. Atomic writes, one writer at a time.
 - Browse them: `curl http://127.0.0.1:8787/transcripts` and
   `curl http://127.0.0.1:8787/transcripts/<user>`, or `IGAgent.transcripts()`.
+
+## Experimental social agent (v5 — default OFF)
+
+`IGAgent.Social` — a second agent that runs beside the DM bot. All actions
+have their own DRY_RUN and caps; nothing runs until you call `enable()`.
+
+- **Auto-comments** — watches `commentTargets(...)` for posts < 24h old and
+  writes one non-generic comment per post (the prompt explicitly bans
+  "nice post🔥"-style filler; style choice is the LLM's: hype, specific
+  detail, question, or reaction). Cap 30/day.
+- **Comment replies** — `commentReplies(true)` reads comments on MY posts
+  (private REST `/api/v1/media/<id>/comments/`) and replies in-thread
+  (mention-fallback if threading fails). Cap shared with comments.
+- **Story commenting** — `storyTargets(...)` toggles story-style replies
+  per target (ON/OFF list, off until you add someone). Sends via the
+  captured reel-share DM mutation.
+- **Agentic Notes** — the genuinely agentic one. Every ~60 min the LLM is
+  shown the current note, its age, OTHER people's notes on the tray, and
+  the recent chat mood — and outputs strict JSON:
+  `{"action":"keep"|"replace"|"delete","note":"…","reason":"…"}`.
+  It decides by itself; a replace deletes the old note and creates the
+  new one. Notes are 60 chars max (IG limit), agent-voiced.
+
+```js
+IGAgent.Social.enable()               // after IGAgent.start()
+IGAgent.Social.commentTargets('u1')   // whose posts to comment on
+IGAgent.Social.commentReplies(true)   // reply to comments on my posts
+IGAgent.Social.storyTargets('u2')     // story replies ON for u2 (off = omit)
+IGAgent.Social.notes('agentic')       // notes agent ('off' to disable)
+IGAgent.Social.dryRun(false)          // when you trust it
+IGAgent.Social.status() · .tray() · .note('text') · .deleteNote() · .notesNow()
+```
 
 ## Files
 

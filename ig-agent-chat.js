@@ -128,6 +128,24 @@
     CIRCUIT_COOLDOWN_MS: 10 * 60_000,
     RETRIES_PER_BATCH: 3,
 
+    // ── EXPERIMENTAL social agent (default OFF) ──
+    // auto-comments on targets' posts, replies to comments on my posts,
+    // story replies to targets, and a fully agentic Notes manager that
+    // decides by itself when to create / replace / delete the note.
+    SOCIAL: {
+      ENABLED: false,            // master switch — nothing runs until you flip it
+      COMMENT_TARGETS: [],       // usernames whose NEW posts get auto-comments
+      COMMENT_REPLIES: false,    // auto-reply to comments on my own posts
+      STORY_TARGETS: [],         // usernames whose stories get replies (DM)
+      NOTES_MODE: 'agentic',     // 'agentic' | 'off'
+      NOTES_INTERVAL_MS: 60 * 60e3,   // agentic note decision cadence
+      SCAN_MIN_MS: 3 * 60e3,     // social scan cadence (posts + comments)
+      SCAN_MAX_MS: 6 * 60e3,
+      MAX_COMMENTS_PER_DAY: 30,
+      MAX_STORY_REPLIES_PER_DAY: 20,
+      DRY_RUN: true,             // social actions are logged, NOT sent until false
+    },
+
     // reverse-engineered GraphQL doc ids (do not change)
     GQL: {
       inbox:   '27909866362025854',
@@ -136,6 +154,12 @@
       header:  '28784987187762419',
       seen:    '27399783383056109',   // useIGDMarkThreadAsReadMutation
       seenVal: '35211594988486314',   // useIGDMarkThreadAsReadValidationMutation
+      // experimental social layer (live-captured 2026-10-17)
+      comment: '27261905640092552',  // PolarisPostCommentInputRevampedMutation
+      reelShare: '26212720875066239', // IGDirectReelShareMutation (story/reel reply)
+      noteCreate: '28592645767037889', // usePolarisCreateInboxTrayItemSubmitMutation
+      noteDelete: '28419182984337833', // usePolarisDeleteInboxTrayItemSubmitMutation
+      tray:    '29231580869776032',  // IGDInboxTrayQuery (read notes)
     },
     APP_ID: '936619743392459',
     ASBD: '359341',
@@ -863,6 +887,329 @@
     return CFG.TARGETS.includes(String(user).toLowerCase());
   }
 
+  /* ═══════════ EXPERIMENTAL SOCIAL AGENT (comments · stories · notes) ═══════════ */
+  // Everything here is experimental: default OFF, own DRY_RUN, own caps.
+  // Captured operations (live, 2026-10-17):
+  //   comment   PolarisPostCommentInputRevampedMutation  {data:{comment_text,media_id[,reply_to_comment_id]}}
+  //   note add  usePolarisCreateInboxTrayItemSubmit      {input:{actor_id,…,note_create_params.text,audience}}
+  //   note del  usePolarisDeleteInboxTrayItemSubmit      {inbox_tray_item_id}
+  //   tray read IGDInboxTrayQuery                        {}
+  //   story/reel→DM IGDirectReelShareMutation            {ig_media_igid,otid,data,clip_share_params}
+  //   comments  GET /api/v1/media/<id>/comments/         (private REST)
+  //   own feed  GET /api/v1/feed/user/<pk>/              (private REST)
+
+  const SO = S.social = {
+    running: false, timer: null, notesTimer: null,
+    seenPosts: new Set(),          // media pks already considered (targets)
+    handledComments: new Set(),    // comment pks already replied/considered
+    commented: [], storyReplied: [], noteLog: [],
+    myPk: null,
+  };
+
+  async function rest(path) {
+    const csrf = getCookie('csrftoken') || '';
+    const res = await fetch(path, {
+      headers: { 'X-CSRFToken': csrf, 'X-IG-App-ID': CFG.APP_ID },
+      credentials: 'same-origin',
+    });
+    if (res.status === 429 || res.status === 403) {
+      throw Object.assign(new Error('IG_RATE_LIMIT status=' + res.status), { fatal: true });
+    }
+    const j = await res.json().catch(() => null);
+    if (!res.ok) throw new Error('REST HTTP ' + res.status + ' ' + path);
+    return j;
+  }
+
+  async function myPk() {
+    if (SO.myPk) return SO.myPk;
+    SO.myPk = String(getCookie('ds_user_id'));      // ds_user_id IS the REST pk
+    return SO.myPk;
+  }
+
+  async function userFeedPk(username) {
+    const j = await rest('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(username));
+    return String(j.data && j.data.user && j.data.user.id);
+  }
+
+  async function userFeed(username) {
+    const pk = await userFeedPk(username);
+    const j = await rest('/api/v1/feed/user/' + pk + '/?count=12');
+    return (j.items || []).map(it => ({
+      pk: String(it.pk),
+      type: it.media_type === 2 ? 'video' : (it.carousel_media ? 'carousel' : 'photo'),
+      caption: (it.caption && it.caption.text) || '',
+      taken_at: it.taken_at * 1000,
+      comments: it.comment_count || 0,
+    }));
+  }
+
+  async function postComment(mediaId, text, replyToCommentPk) {
+    const data = { comment_text: String(text).slice(0, 500), media_id: String(mediaId) };
+    if (replyToCommentPk) data.reply_to_comment_id = String(replyToCommentPk);
+    const out = await gql('PolarisPostCommentInputRevampedMutation', CFG.GQL.comment,
+      { connections: [], data });
+    return (out && out.xig_comment_create) || out;
+  }
+
+  async function fetchComments(mediaId) {
+    const j = await rest('/api/v1/media/' + mediaId + '/comments/?can_support_threading=true&permalink=');
+    return (j.comments || []).map(c => ({
+      pk: String(c.pk), text: c.text || '',
+      user: (c.user && c.user.username) || '?',
+      mine: (c.user && String(c.user.pk)) === (SO.myPk || getCookie('ds_user_id')),
+      created_at: (c.created_at || 0) * 1000,
+      type: c.type || '0',
+    }));
+  }
+
+  // ── notes primitives ──
+  async function trayRead() {
+    const out = await gql('IGDInboxTrayQuery', CFG.GQL.tray, {});
+    // real shape: data.response.inbox_tray_items[] {inbox_tray_item_id,
+    //   note_dict:{text,created_at,author_id}, pog_info.pog_users[0].username}
+    const items = (((out || {}).response || {}).inbox_tray_items || []).map(it => ({
+      id: String(it.inbox_tray_item_id || ''),
+      type: it.inbox_tray_item_type || '',
+      text: (it.note_dict && it.note_dict.text) || '',
+      created_at: (it.note_dict && it.note_dict.created_at) ? it.note_dict.created_at * 1000 : null,
+      authorId: String((it.note_dict && it.note_dict.author_id) || ''),
+      username: (it.pog_info && it.pog_info.pog_users && it.pog_info.pog_users[0] && it.pog_info.pog_users[0].username) || '',
+    }));
+    return { raw: out, items };
+  }
+  async function noteCreate(text, audience = 0) {
+    const out = await gql('usePolarisCreateInboxTrayItemSubmitMutation', CFG.GQL.noteCreate, {
+      input: {
+        actor_id: '17841479654032000',
+        client_mutation_id: String(Math.floor(Math.random() * 1000)),
+        additional_params: { note_create_params: { note_create_info: null, note_style: 0, text: String(text).slice(0, 60) } },
+        audience,
+        inbox_tray_item_type: 'note',
+      },
+    });
+    return out && out.xdt_create_inbox_tray_item;
+  }
+  async function noteDelete(itemId) {
+    const out = await gql('usePolarisDeleteInboxTrayItemSubmitMutation', CFG.GQL.noteDelete,
+      { inbox_tray_item_id: String(itemId) });
+    return out && out.xdt_delete_inbox_tray_item;
+  }
+
+  // ── story reply (experimental: IGDirectReelShareMutation with text) ──
+  async function storyReply(mediaPk, mediaId, text) {
+    const oti = String(BigInt(Date.now()) * 1000000n + BigInt(Math.floor(Math.random() * 999999)));
+    const out = await gql('IGDirectReelShareMutation', CFG.GQL.reelShare, {
+      ig_media_igid: String(mediaId || mediaPk),
+      otid: oti,
+      data: { text: String(text).slice(0, 500), send_attribution: 'reel', client_context: oti },
+      clip_share_params: null,
+    });
+    return out && out.xig_direct_clip_share_with_slide_msg_response;
+  }
+
+  // ── LLM helpers for social ──
+  const SOCIAL_PROMPTS = {
+    comment:
+      'You write ONE short Instagram comment as @aduagents (Adarsh\'s AI-agent brand account). ' +
+      'Pick a natural style yourself: genuine hype, a specific detail from the post, a light ' +
+      'question, or a fun emoji-reaction — NEVER generic ("nice post🔥" is banned). Match the ' +
+      'post language (Hinglish ok). Max 12 words. Output the comment text only.',
+    reply:
+      'You write ONE short friendly reply to a comment on @aduagents\'s post. You are the AI ' +
+      'agent behind the account — be warm, human-ish, answer the question or thank them, match ' +
+      'their language (Hinglish ok). Max 15 words. Output the reply text only.',
+    story:
+      'You send ONE short story-reply DM as @aduagents reacting to this user\'s story. Casual, ' +
+      'warm, specific to the story content, match their language (Hinglish ok). Max 12 words. ' +
+      'Output the message text only.',
+    note:
+      'You manage the Instagram NOTE (the 60-char status bubble) for @aduagents — Adarsh\'s ' +
+      'AI-agent account. You decide autonomously. Given the current note, its age, and recent ' +
+      'chat mood, output STRICT JSON: ' +
+      '{"action":"keep"|"replace"|"delete","note":"<max 55 chars>","reason":"<max 12 words>"} ' +
+      'Replace when stale (>2h) or mood-shifted; delete when the note no longer fits and nothing ' +
+      'better comes to mind; keep otherwise. Notes are lowercase-casual, Hinglish ok, agent ' +
+      'personality (builder of AI agents, Delhi). Output JSON only.',
+  };
+
+  async function socialLLM(kind, userContent, maxTokens = 120) {
+    const { text } = await llm([
+      { role: 'system', content: SOCIAL_PROMPTS[kind] },
+      { role: 'user', content: userContent },
+    ], { maxTokens, temperature: 0.95, timeoutMs: 60_000 });
+    return text.replace(/^["'\s]+|["'\s]+$/g, '');
+  }
+
+  function socLog(tag, msg) { log(C.bot, tag, msg); }
+
+  // ── the agentic notes cycle ──
+  async function notesCycle() {
+    if (!CFG.SOCIAL.ENABLED || CFG.SOCIAL.NOTES_MODE !== 'agentic') return;
+    try {
+      const { items } = await trayRead();
+      const meId = String(S.viewerIgId || getCookie('ds_user_id') || '');
+      const mine = items.find(it => it.authorId === meId) || null;
+      const mineText = (mine && mine.text) || '';
+      const mineAge = mine && mine.created_at ? Math.round((now() - mine.created_at) / 60000) : null;
+      const others = items.filter(it => it !== mine).slice(0, 8)
+        .map(it => '@' + (it.username || '?') + ': ' + (it.text || '').slice(0, 30)).join('\n');
+
+      const moodBits = Object.values(S.transcripts).map(T => {
+        const last = T.messages[T.messages.length - 1];
+        return last ? `@${T.user} last: ${String(last.text || '').slice(0, 50)}` : '';
+      }).filter(Boolean).slice(0, 6).join('\n');
+
+      const raw = await socialLLM('note',
+        `CURRENT NOTE: ${mineText || '(none)'}\nNOTE AGE (min): ${mineAge ?? 'unknown'}\n` +
+        `OTHERS' NOTES:\n${others || '(none)'}\nRECENT CHAT MOOD:\n${moodBits || '(quiet)'}`);
+      const json = raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1);
+      const decision = JSON.parse(json);
+
+      if (decision.action === 'keep') {
+        socLog('note', `agent decision: KEEP "${mineText}" (${decision.reason || ''})`);
+      } else if (decision.action === 'delete') {
+        if (!mine || !mine.id) return socLog('note', 'agent decision: DELETE — but no note id found, skipping');
+        if (CFG.SOCIAL.DRY_RUN) socLog('note:dry', `would DELETE note "${mineText}" (${decision.reason || ''})`);
+        else { await noteDelete(mine.id); socLog('note', `agent DELETED note "${mineText}" (${decision.reason || ''})`); }
+      } else { // replace
+        if (CFG.SOCIAL.DRY_RUN) socLog('note:dry', `would SET note "${decision.note}" (${decision.reason || ''})`);
+        else {
+          if (mine && mine.id) { try { await noteDelete(mine.id); } catch (_) {} }
+          await noteCreate(decision.note);
+          socLog('note', `agent SET note → "${decision.note}" (${decision.reason || ''})`);
+        }
+      }
+      SO.noteLog.push({ t: now(), decision }); if (SO.noteLog.length > 40) SO.noteLog.shift();
+    } catch (e) {
+      socLog('note', 'cycle skipped: ' + e.message);
+    }
+    if (SO.running) SO.notesTimer = setTimeout(notesCycle, CFG.SOCIAL.NOTES_INTERVAL_MS * rand(0.85, 1.2));
+  }
+
+  // ── the engagement scan (targets' posts + my comment inbox) ──
+  async function socialScan() {
+    if (!CFG.SOCIAL.ENABLED) return;
+    try {
+      const today = new Date().toDateString();
+      SO.commented = SO.commented.filter(x => new Date(x).toDateString() === today);
+      SO.storyReplied = SO.storyReplied.filter(x => new Date(x).toDateString() === today);
+
+      // 1) auto-comment on targets' fresh posts
+      for (const user of CFG.SOCIAL.COMMENT_TARGETS) {
+        const feed = await userFeed(user);
+        for (const post of feed.slice(0, 4)) {
+          if (SO.seenPosts.has(post.pk)) continue;
+          SO.seenPosts.add(post.pk); saveSocialLocal();
+          const ageH = (now() - post.taken_at) / 3600e3;
+          if (ageH > 24) continue;                          // only fresh posts
+          if (SO.commented.length >= CFG.SOCIAL.MAX_COMMENTS_PER_DAY) break;
+          const text = await socialLLM('comment',
+            `@${user} posted a ${post.type}:\n"${post.caption.slice(0, 300)}"`);
+          if (!text) continue;
+          if (CFG.SOCIAL.DRY_RUN) socLog('soc:dry', `@${user} post ${post.pk} ← comment (NOT SENT): "${text}"`);
+          else {
+            await postComment(post.pk, text);
+            SO.commented.push(now()); saveSocialLocal();
+            socLog('soc', `@${user} post ${post.pk} ← commented: "${text}"`);
+          }
+          await sleep(rand(20e3, 60e3));                    // don't burst
+        }
+      }
+
+      // 2) reply to comments on MY posts
+      if (CFG.SOCIAL.COMMENT_REPLIES) {
+        const pk = await myPk();
+        const j = await rest('/api/v1/feed/user/' + pk + '/?count=6');
+        for (const it of (j.items || []).slice(0, 6)) {
+          const mediaId = String(it.pk);
+          const comments = await fetchComments(mediaId);
+          for (const c of comments.slice(0, 10)) {
+            if (c.mine || SO.handledComments.has(c.pk)) continue;
+            SO.handledComments.add(c.pk); saveSocialLocal();
+            if (SO.commented.length >= CFG.SOCIAL.MAX_COMMENTS_PER_DAY) break;
+            const caption = (it.caption && it.caption.text || '').slice(0, 200);
+            const text = await socialLLM('reply',
+              `MY POST: "${caption}"\n@${c.user} commented: "${c.text}"`);
+            if (!text) continue;
+            if (CFG.SOCIAL.DRY_RUN) socLog('soc:dry', `@${c.user} (my post ${mediaId}) ← reply (NOT SENT): "${text}"`);
+            else {
+              try {
+                await postComment(mediaId, text, c.pk);      // threaded reply
+              } catch (_) {
+                await postComment(mediaId, '@' + c.user + ' ' + text);  // fallback: mention
+              }
+              SO.commented.push(now()); saveSocialLocal();
+              socLog('soc', `@${c.user} (my post ${mediaId}) ← replied: "${text}"`);
+            }
+            await sleep(rand(15e3, 45e3));
+          }
+        }
+      }
+
+      // 3) story replies to targets (experimental — story tray from inbox poll)
+      for (const user of CFG.SOCIAL.STORY_TARGETS) {
+        if (SO.storyReplied.length >= CFG.SOCIAL.MAX_STORY_REPLIES_PER_DAY) break;
+        const th = (await fetchInbox()).find(t =>
+          !t.is_group && ((t.users && t.users[0] && t.users[0].username) || '') === user);
+        if (!th || !th.last_activity_timestamp_ms) continue;
+        const key = user + ':' + new Date(th.last_activity_timestamp_ms).toDateString();
+        if (SO.handledComments.has('story:' + key)) continue;
+        SO.handledComments.add('story:' + key); saveSocialLocal();
+        // story content is not readable without the tray media id — reply to
+        // the account's freshest reel-style post instead, framed as a story ping
+        const feed = await userFeed(user);
+        const fresh = feed[0];
+        if (!fresh) continue;
+        const text = await socialLLM('story',
+          `@${user} latest post (proxy for story):\n"${fresh.caption.slice(0, 250)}"`);
+        if (!text) continue;
+        if (CFG.SOCIAL.DRY_RUN) socLog('soc:dry', `@${user} ← story reply (NOT SENT): "${text}"`);
+        else {
+          await storyReply(fresh.pk, null, text);
+          SO.storyReplied.push(now()); saveSocialLocal();
+          socLog('soc', `@${user} ← story-style reply sent: "${text}"`);
+        }
+      }
+    } catch (e) {
+      if (e.fatal) { socLog('soc', 'Instagram error — social agent stopping: ' + e.message); socialStop(); return; }
+      socLog('soc', 'scan skipped: ' + e.message);
+    }
+    if (SO.running) SO.timer = setTimeout(socialScan, rand(CFG.SOCIAL.SCAN_MIN_MS, CFG.SOCIAL.SCAN_MAX_MS));
+  }
+
+  function saveSocialLocal() {
+    try {
+      localStorage.setItem('ig_agent_social_v1', JSON.stringify({
+        seenPosts: [...SO.seenPosts].slice(-300),
+        handledComments: [...SO.handledComments].slice(-300),
+        commented: SO.commented, storyReplied: SO.storyReplied,
+      }));
+    } catch (_) {}
+  }
+  function loadSocialLocal() {
+    try {
+      const p = JSON.parse(localStorage.getItem('ig_agent_social_v1') || '{}');
+      (p.seenPosts || []).forEach(x => SO.seenPosts.add(x));
+      (p.handledComments || []).forEach(x => SO.handledComments.add(x));
+      SO.commented = p.commented || []; SO.storyReplied = p.storyReplied || [];
+    } catch (_) {}
+  }
+
+  function socialStart() {
+    if (SO.running) return;
+    SO.running = true;
+    loadSocialLocal();
+    socLog('soc', `social agent ON · dryRun=${CFG.SOCIAL.DRY_RUN} · comments→[${CFG.SOCIAL.COMMENT_TARGETS.join(',')}] · replies=${CFG.SOCIAL.COMMENT_REPLIES} · stories→[${CFG.SOCIAL.STORY_TARGETS.join(',')}] · notes=${CFG.SOCIAL.NOTES_MODE}`);
+    socialScan();
+    if (CFG.SOCIAL.NOTES_MODE === 'agentic') notesCycle();
+  }
+  function socialStop() {
+    SO.running = false;
+    if (SO.timer) { clearTimeout(SO.timer); SO.timer = null; }
+    if (SO.notesTimer) { clearTimeout(SO.notesTimer); SO.notesTimer = null; }
+    socLog('soc', 'social agent OFF');
+  }
+
   /* ──────────────────────────── PUBLIC API ──────────────────────────── */
 
   async function start() {
@@ -886,6 +1233,7 @@
         Array.isArray(CFG.TARGETS) ? CFG.TARGETS.join(',') : CFG.TARGETS}` +
       (S.myInteropId ? ` · me=${S.myInteropId}` : ''));
     pollTick();
+    if (CFG.SOCIAL.ENABLED) socialStart();
   }
 
   function stop() {
@@ -896,6 +1244,7 @@
     // clear any typing trails still showing
     for (const tid of [...S.typingThreads]) typingOff(tid);
     S.typingThreads.clear();
+    socialStop();
     log(C.warn, 'main', 'stopped' + (S.startedAt ? ` · uptime ${Math.round((now() - S.startedAt) / 1000)}s` : ''));
   }
 
@@ -1121,6 +1470,14 @@
       if (hourCount() > CFG.MAX_REPLIES_PER_HOUR) throw new Error('hourly cap already hit');
       return `today=${dayCount()}/${CFG.MAX_REPLIES_PER_DAY} hour=${hourCount()}/${CFG.MAX_REPLIES_PER_HOUR}`;
     });
+    ok &= await check('social · REST comments endpoint', async () => {
+      const j = await rest('/api/v1/media/4001768076230495548/comments/');
+      return `${(j.comments || []).length} comments readable`;
+    });
+    ok &= await check('social · tray (notes) query', async () => {
+      const { items } = await trayRead();
+      return `${items.length} tray items`;
+    });
     console.log('%c── RESULT ──', C.info);
     results.forEach(([s, n, m]) => console.log(`${s} ${n} → ${m}`));
     console.log(ok ? '%cALL CHECKS PASSED — ready. Next: IGAgent.targets("user1"), then IGAgent.start()'
@@ -1133,6 +1490,75 @@
     start, stop, status, test, threads, history, memory, forget, memories, say,
     typingDemo, markSeenNow, transcripts, saveTranscriptsNow,
     config: CFG,
+    // EXPERIMENTAL social agent: comments, comment replies, story replies,
+    // agentic notes (create/replace/delete decided by the agent itself)
+    Social: {
+      enable() {
+        if (!S.wsReady) return socLog('soc', 'start the DM bot first (IGAgent.start()) — social shares its bridge');
+        CFG.SOCIAL.ENABLED = true; socialStart();
+      },
+      disable() { CFG.SOCIAL.ENABLED = false; socialStop(); },
+      status() {
+        const out = {
+          enabled: CFG.SOCIAL.ENABLED, running: SO.running, dryRun: CFG.SOCIAL.DRY_RUN,
+          commentTargets: CFG.SOCIAL.COMMENT_TARGETS, commentReplies: CFG.SOCIAL.COMMENT_REPLIES,
+          storyTargets: CFG.SOCIAL.STORY_TARGETS, notesMode: CFG.SOCIAL.NOTES_MODE,
+          commentsToday: SO.commented.length + '/' + CFG.SOCIAL.MAX_COMMENTS_PER_DAY,
+          storyRepliesToday: SO.storyReplied.length + '/' + CFG.SOCIAL.MAX_STORY_REPLIES_PER_DAY,
+          lastNoteDecisions: SO.noteLog.slice(-5),
+        };
+        console.log('%cIGAgent.Social status', C.bot, out);
+        return out;
+      },
+      commentTargets(...users) {
+        CFG.SOCIAL.COMMENT_TARGETS = users.map(u => String(u).toLowerCase().replace(/^@/, ''));
+        socLog('soc', 'comment targets →', CFG.SOCIAL.COMMENT_TARGETS.join(', ') || '(none)');
+      },
+      storyTargets(...users) {
+        CFG.SOCIAL.STORY_TARGETS = users.map(u => String(u).toLowerCase().replace(/^@/, ''));
+        socLog('soc', 'story targets →', CFG.SOCIAL.STORY_TARGETS.join(', ') || '(none)');
+      },
+      commentReplies(v) { CFG.SOCIAL.COMMENT_REPLIES = !!v; socLog('soc', 'comment replies =', CFG.SOCIAL.COMMENT_REPLIES); },
+      dryRun(v) { CFG.SOCIAL.DRY_RUN = !!v; socLog('soc', 'SOCIAL DRY_RUN =', CFG.SOCIAL.DRY_RUN); },
+      notes(mode) { CFG.SOCIAL.NOTES_MODE = (mode === 'off' ? 'off' : 'agentic'); socLog('soc', 'notes mode =', CFG.SOCIAL.NOTES_MODE); },
+      // manual primitives (bypass DRY_RUN — explicit commands)
+      async comment(mediaPkOrUrl, text) {
+        const id = String(mediaPkOrUrl).replace(/\D*(\d+).*/, '$1');
+        const r = await postComment(id, text);
+        socLog('soc', `comment posted on ${id}: "${text}"`);
+        return r;
+      },
+      async replyToComment(mediaPk, commentPk, text) {
+        try { return await postComment(String(mediaPk), text, String(commentPk)); }
+        catch (_) { return postComment(String(mediaPk), text); }
+      },
+      async fetchComments(mediaPk) { return fetchComments(String(mediaPk)); },
+      async note(text) { const r = await noteCreate(text); socLog('soc', 'note set: "' + text + '"'); return r; },
+      async deleteNote() {
+        const { items } = await trayRead();
+        const meId = String(S.viewerIgId || getCookie('ds_user_id') || '');
+        const mine = items.find(it => it.authorId === meId);
+        if (!mine || !mine.id) throw new Error('no note found');
+        const r = await noteDelete(mine.id);
+        socLog('soc', 'note deleted');
+        return r;
+      },
+      async tray() {
+        const { items } = await trayRead();
+        console.table(items.map(it => ({
+          user: it.username || (it.authorId === String(S.viewerIgId) ? 'ME' : '?'),
+          text: (it.text || '').slice(0, 50), id: it.id,
+          age_min: it.created_at ? Math.round((now() - it.created_at) / 60000) : null,
+        })));
+        return items;
+      },
+      async notesNow() { return notesCycle(); },   // run one agentic note decision immediately
+      async scanNow() {                             // run one engagement scan immediately
+        if (SO.timer) { clearTimeout(SO.timer); SO.timer = null; }
+        socialScan();
+      },
+      get _state() { return SO; },
+    },
     // debug hooks (used to drive the pipeline manually when needed)
     _debug: { processThread, fetchMessages, fetchInbox, fetchThreadMeta, sendText, markSeen, sendTyping,
               get S() { return S; } },
@@ -1161,14 +1587,18 @@
   loadState();
   window.IGAgent = api;
 
-  console.log('%cIGAgent v4 loaded ✅  (GraphQL DM + seen receipts + typing trail + JSON transcripts)', C.ok,
+  console.log('%cIGAgent v5 loaded ✅  (DM agent + social agent: comments · stories · agentic notes)', C.ok,
     '\n0) python server.py            ← start the local bridge first' +
     '\n1) IGAgent.test()              ← verify session + inbox + bridge + typing' +
-    '\n2) IGAgent.targets("user1")    ← who gets replies (or IGAgent.allTargets())' +
-    '\n3) IGAgent.start()             ← runs in DRY_RUN; replies logged not sent' +
-    '\n4) IGAgent.dryRun(false)       ← live: real sends + seen receipts + typing trail' +
-    '\n   IGAgent.typingDemo("user")  ← test the typing trail on demand' +
-    '\n   IGAgent.markSeenNow("user") ← test the seen receipt on demand' +
-    '\n   IGAgent.transcripts()       ← per-contact JSON history (server ./transcripts/)');
+    '\n2) IGAgent.targets("user1")    ← who gets DM replies (or IGAgent.allTargets())' +
+    '\n3) IGAgent.start()             ← DM bot (DRY_RUN first, then IGAgent.dryRun(false))' +
+    '\n— EXPERIMENTAL social agent (default OFF, own DRY_RUN) —' +
+    '\n   IGAgent.Social.enable()                    ← turn it on (after IGAgent.start())' +
+    '\n   IGAgent.Social.commentTargets("user1")     ← auto-comment their new posts' +
+    '\n   IGAgent.Social.commentReplies(true)        ← reply to comments on my posts' +
+    '\n   IGAgent.Social.storyTargets("user2")       ← story-style replies' +
+    '\n   IGAgent.Social.notes("agentic")            ← agent decides the NOTE by itself' +
+    '\n   IGAgent.Social.dryRun(false)               ← when you trust it' +
+    '\n   IGAgent.Social.status() · .tray() · .note("text") · .deleteNote() · .notesNow()');
   return api;
 })();
