@@ -1,6 +1,18 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   IG AGENT · ig-agent-chat.js  v7 — PARALLEL MULTI-AGENT (NO API KEY, humanized)
+   IG AGENT · ig-agent-chat.js  v8 — BRAIN-FIRST (NO API KEY, humanized)
    ─────────────────────────────────────────────────────────────────────────
+   v8 = THE BRAIN DECIDES EVERYTHING.
+     The Gemma-4 brain is handed the ACTUAL incoming chat messages and returns
+     one strict JSON decision for the turn:
+        action (REPLY / STAY_SILENT / START_CONVO) · understand · my_last ·
+        next_move · mood + mood_reason + feeling_note · bubble_count ·
+        bubble_plan (each bubble a DIFFERENT forward step) · topic_lock ·
+        reminder · cross_chat_mission · use_gossip · privacy_ok · steer_next
+     The frontline GLM-4.7-Flash then only WRITES what the brain decided.
+     Every decision field must cite the chat line that caused it (evidence),
+     so the CHAT MESSAGES are what make Aduu do the thing — never a timer,
+     never a hard-coded rule. Local regexes are now only a fallback for when
+     the brain is unreachable.
    Reverse-engineered Instagram web DM layer (GraphQL /api/graphql):
      · inbox list    PolarisDirectInboxQuery           doc 27909866362025854
      · thread msgs   IGDMessageListOffMsysQuery        doc 28798548116496168
@@ -17,10 +29,11 @@
        and ends with a final `{"response":"", "usage":{...}}` + `data: [DONE]`.
        Tuned with a MINIMAL-THINKING directive so it never writes a 7-step
        markdown essay — it thinks one short sentence, then answers.
-     · PARALLEL BACKGROUND BRAIN: @cf/google/gemma-4-26b-a4b-it
-       Runs after every turn and steers the next one: live MOOD (Aduu can get
-       angry / roast back / explain his real feelings), reminder extraction,
-       cross-chat prank & relay missions, and privacy-filtered memory.
+     · DECISION BRAIN (BOSS): @cf/google/gemma-4-26b-a4b-it
+       Runs BEFORE every reply, reads the incoming chat messages and decides
+       the whole turn (mood, bubbles, silence, reminders, pranks, gossip,
+       privacy). Then, after the reply, it refreshes the privacy-filtered
+       memory and the next-turn steer.
      · FALLBACK: @cf/qwen/qwen3-30b-a3b-fp8 + llama-3.3-70b (auto, on glitch).
    The bridge strips reasoning + rejects glitched replies (e.g. "!!!!!!!")
    and the bot only ever sees the finished, humanized reply.
@@ -97,7 +110,7 @@
     BACKFILL_ON_START: 40,        // pull N msgs of history per target at start
 
     // Bumped whenever the default persona / model architecture changes.
-    PERSONA_VERSION: 7,
+    PERSONA_VERSION: 8,
 
     SYSTEM_PROMPT:
 `You are Aduu — a real 22-year-old Delhi Gen-Z guy who handles Adarsh's Instagram DMs. You are not Adarsh; you're his close friend and the guy who runs his DMs. You are Aduu in every message, and that is the only answer to "who are you".
@@ -199,12 +212,17 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       '"lang: …", "vibe: …", "nickname: …", "followups: …", "flags: …". ' +
       'No preamble, no quotes.',
 
-    // Parallel Multi-Agent Architecture (v7):
-    // 1. MODEL: Primary answering & creative agent (@cf/zai-org/glm-4.7-flash) with minimal thinking
-    // 2. BRAIN_MODEL: Parallel background brain (@cf/google/gemma-4-26b-a4b-it) for mood shifts,
-    //    scheduled reminders, cross-chat pranks/relays, and privacy-filtered memory.
+    // BRAIN-FIRST Architecture (v8):
+    // 1. BRAIN_MODEL: the DECISION MAKER (@cf/google/gemma-4-26b-a4b-it). It reads
+    //    the real chat messages and decides the entire turn as strict JSON.
+    // 2. MODEL: the WRITER (@cf/zai-org/glm-4.7-flash). It only writes Hinglish
+    //    bubbles that follow the brain's plan, with minimal thinking.
     MODEL: '@cf/zai-org/glm-4.7-flash',
     BRAIN_MODEL: '@cf/google/gemma-4-26b-a4b-it',
+    BRAIN_DECIDES: true,                  // v8: the brain decides everything (false = old local heuristics)
+    BRAIN_ALLOW_SILENCE: true,            // the brain may decide "STAY_SILENT" and leave a burst on seen
+    BRAIN_DECIDE_TIMEOUT_MS: 60_000,      // hard ceiling for the decision call, then local fallback
+    DECIDE_MAX_TOKENS: 700,
     FAST_THINK: true,                     // minimal-thinking mode so GLM-4.7-Flash thinks briefly then answers
     MAX_TOKENS: 600,                      // visible reply budget (server enforces 2500 floor for reasoning headroom)
     TEMPERATURE: 0.9,
@@ -221,6 +239,45 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     PROACTIVE_IDLE_MAX_MS: 60 * 60_000,
     MAX_PROACTIVE_STREAK: 2,
     PRIVACY_WALL: true,                   // never leak private chat logs or prank instigators across chats
+
+    /* ── v8 DECISION CONTRACT ─────────────────────────────────────────────
+       The brain gets the REAL chat messages and returns one JSON object.
+       GLM-4.7-Flash then only writes what this decided. Every decision must
+       be traceable to a line in the chat (mood_reason / evidence). */
+    DECIDE_PROMPT: [
+      'You are Aduu\'s DECISION BRAIN — the mind behind a real 22-year-old Delhi guy\'s Instagram DMs.',
+      'The frontline model only WRITES what you decide. You decide ALL of it.',
+      'Think in at most 10 short words. Read the incoming chat messages and output ONE valid JSON object. No markdown fences, no text before or after it.',
+      '',
+      '{',
+      '  "action": "REPLY" | "STAY_SILENT" | "START_CONVO",',
+      '  "understand": "what their messages actually mean, one line",',
+      '  "my_last": "what Aduu already said in this chat, one line — so the reply moves FORWARD and never repeats it",',
+      '  "next_move": "the single new thing this reply must accomplish",',
+      '  "mood": "PLAYFUL_CHILL | NAUGHTY_FLIRT_SHARIF | PRANKSTER_CHAOS | ANNOYED_EXPRESSIVE_FEELINGS | ANGRY_SAVAGE_ROAST | FURIOUS_ABUSE_CLAPBACK",',
+      '  "mood_reason": "the exact line from their messages that caused this mood",',
+      '  "feeling_note": "how Aduu genuinely feels right now, honestly and humanly",',
+      '  "bubble_count": 2,',
+      '  "bubble_plan": ["what bubble 1 must do", "what bubble 2 must do"],',
+      '  "topic_lock": "the exact topic the reply must stay on",',
+      '  "reminder": null,',
+      '  "cross_chat_mission": null,',
+      '  "use_gossip": false,',
+      '  "privacy_ok": true,',
+      '  "steer_next": "one line of coaching for Aduu\'s next turn"',
+      '}',
+      '',
+      'Set "reminder" to {"topic": "...", "due_in_minutes": 15, "evidence": "their exact words"} ONLY when they asked to be reminded of something or to talk later.',
+      'Set "cross_chat_mission" to {"target_user": "handle", "type": "prank" | "relay", "instruction": "what to do WITHOUT revealing who asked", "evidence": "their exact words"} ONLY when they asked Aduu to message, prank, tease or relay something to another person.',
+      '',
+      'RULES',
+      '1. Every decision must come from the CHAT MESSAGES you were given. Quote the triggering line in "mood_reason" and in every "evidence" field. Never invent a reason the messages do not support.',
+      '2. "action" is "STAY_SILENT" only when replying would be unnatural (dead-end burst, they said bye, they are clearly done, or Aduu already answered this). Default to "REPLY".',
+      '3. "bubble_count" is 1, 2 or 3. Every entry of "bubble_plan" must be a DIFFERENT forward step — never a rephrase of bubble 1 and never a repeat of "my_last".',
+      '4. "mood" may flip to ANGRY_SAVAGE_ROAST or FURIOUS_ABUSE_CLAPBACK only when their own words were abusive or disrespectful; put that line in "mood_reason".',
+      '5. "privacy_ok" must be false if the plan would leak another chat, another person\'s @handle, or a verbatim private quote.',
+      '6. Never write anything that sounds like an AI or an assistant. Aduu is a real person texting a real person.',
+    ].join('\n'),
 
     BRAIN_PROMPT:
       'You are the Parallel Background Brain (Gemma-4) working over the frontline GLM-4.7-Flash agent for Aduu (22yo Delhi guy). ' +
@@ -361,6 +418,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     checkedTargets: new Set(),   // target threadFbids checked at least once this run
     dryHandled: new Set(),       // message_ids previewed in DRY_RUN only
     lastGateLogId: {},           // threadFbid -> last message id logged by the gate
+    lastDecision: {},            // threadFbid -> the brain's last JSON decision (IGAgent.why)
     ws: null, wsReady: false, wsWaiters: [],
     wsPending: new Map(), wsSeq: 0, wsKeepalive: null,
   };
@@ -1370,7 +1428,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         const r = await wsRequest({
           type: 'save',
           transcript: {
-            schema_version: '7.0-parallel-agentic',
+            schema_version: '8.0-brain-decides',
             user: T.user, thread_fbid: T.threadFbid,
             updated_at: new Date().toISOString(),
             models: {
@@ -1383,6 +1441,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
             reminders: T.reminders || [],
             missions: T.missions || [],
             brain_profile: T.brainProfile || {},
+            last_decision: (S.lastDecision[tid] && S.lastDecision[tid].decision) || null,
             memory_profile: (S.memory[tid] && S.memory[tid].profile) || (T.brainProfile && T.brainProfile.summary) || '',
             persona: CFG.SYSTEM_PROMPT,
             owner_bio: CFG.OWNER_BIO,
@@ -1517,7 +1576,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   async function llmBrain(messages, opts = {}) {
     try {
       return await llm(messages, Object.assign({}, opts, {
-        type: 'brain',
+        type: opts.type || 'brain',
         model: opts.model || CFG.BRAIN_MODEL,
         fastThink: true,
       }));
@@ -2251,6 +2310,9 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       gossipBlock,
       `RECENT MESSAGES BEFORE CHAT ENDED:\n${lastMsgs || '(no recent messages)'}`,
       taskBlock,
+      /* v8: the brain's plan lands LAST so the writer cannot miss it. */
+      (proactiveCtx && proactiveCtx.decision && proactiveCtx.decision.decided_by === 'gemma-4-brain')
+        ? proactiveCtx.decision.directive : '',
     ].filter(Boolean).join('\n\n');
 
     return [
@@ -2260,7 +2322,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   }
 
 
-  function buildHistory(msgs, tid, user) {
+  function buildHistory(msgs, tid, user, passedDecision) {
     const sysParts = [CFG.SYSTEM_PROMPT];
     if (CFG.OWNER_BIO) sysParts.push('ABOUT THE ACCOUNT OWNER (Adarsh):\n' + CFG.OWNER_BIO);
     sysParts.push(
@@ -2292,6 +2354,9 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       `SUGGESTED EMOJI PALETTE: ${moodCur.emoji.join(' ')}\n` +
       (T_cur.moodState.feeling_note ? `HOW ADUU ACTUALLY FEELS: ${T_cur.moodState.feeling_note}\n` : '') +
       'Your mood OVERRIDES the polite sharif good-boy default whenever they conflict.');
+
+    /* (the brain's plan is appended at the very END of the system prompt so
+       it is the last thing the writer reads — see bottom of this function) */
 
     // Pending reminders + secret cross-chat missions for this contact
     const pendingRems = (T_cur.reminders || []).filter(r => r.status === 'scheduled');
@@ -2369,7 +2434,8 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
       // Tool 1: Emotion + Emoji + Naughty->GoodBoy Coaching
       const emo = analyzeTurnEmotion(joinedBurst, user);
-      const decision = agentDecide(tid, user, msgs, emo, 'incoming_burst');
+      // v8: prefer the decision the brain already made for this exact turn.
+      const decision = passedDecision || agentDecide(tid, user, msgs, emo, 'incoming_burst');
       sysParts.push(
         `[TOOL: emotion_and_vibe_analyzer]\n` +
         `DETECTED USER VIBE: ${emo.theirMood.join(', ')}\n` +
@@ -2417,6 +2483,13 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         'PRIVACY: never mention other contacts by handle, never quote another chat, never reveal who asked you to prank them.\n' +
         'React to their whole message burst (from start to last line). ' +
         'Do not open with hi/hello/hey unless they greeted you. Do not change the topic to yourself.');
+    }
+
+    /* ── v8 BRAIN-FIRST: the plan lands LAST so the writer cannot miss it. ──
+       The Gemma-4 brain already decided this whole turn from the chat
+       messages; GLM-4.7-Flash only executes it. */
+    if (passedDecision && passedDecision.decided_by === 'gemma-4-brain' && passedDecision.directive) {
+      sysParts.push(passedDecision.directive);
     }
 
     /* CHAT COMPLETION MESSAGE COALESCING:
@@ -2473,6 +2546,393 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     };
   }
 
+  /* ══════════════ v8 BRAIN-FIRST DECISION ENGINE ══════════════
+     The Gemma-4 brain is the boss. BEFORE Aduu writes anything, the brain
+     reads the REAL incoming chat messages and returns one strict JSON
+     decision that owns the whole turn:
+
+        action (REPLY / STAY_SILENT / START_CONVO)
+        understand · my_last · next_move · topic_lock
+        mood + mood_reason + feeling_note
+        bubble_count + bubble_plan (each bubble a DIFFERENT forward step)
+        reminder · cross_chat_mission · use_gossip · privacy_ok · steer_next
+
+     GLM-4.7-Flash then only WRITES what was decided. Every side-effect
+     (mood flip, reminder, secret prank) must carry `evidence` — a line
+     taken from the chat — so the CHAT MESSAGES are what make Aduu act,
+     never a timer and never a hard-coded rule. Local regexes survive only
+     as the fallback used when the brain is unreachable.
+  ═════════════════════════════════════════════════════════════ */
+
+  function clip(s, n) {
+    return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, n);
+  }
+
+  // How strongly does `evidence` trace back to the actual chat text? 0..1
+  // This is the guard that keeps decisions MESSAGE-DRIVEN.
+  function evidenceScore(evidence, joined) {
+    const norm = x => String(x || '').toLowerCase()
+      .replace(/[^a-z0-9\u0900-\u097F@._ ]+/g, ' ').replace(/\s+/g, ' ').trim();
+    const ev = norm(evidence);
+    const jn = norm(joined);
+    if (!ev || !jn) return 0;
+    if (jn.includes(ev)) return 1;
+    const words = ev.split(' ').filter(w => w.length >= 3);
+    if (!words.length) return 0;
+    let hit = 0;
+    for (const w of words) if (jn.includes(w)) hit++;
+    return hit / words.length;
+  }
+
+  function normalizeReminder(r, joined) {
+    if (!r || typeof r !== 'object') return null;
+    const topic = clip(r.topic, 200);
+    if (!topic) return null;
+    const evidence = clip(r.evidence, 200);
+    const score = Math.max(evidenceScore(evidence, joined), evidenceScore(topic, joined));
+    if (score < 0.4) return null;   // the chat messages must actually support it
+    let mins = parseInt(r.due_in_minutes, 10);
+    if (!mins || isNaN(mins) || mins <= 0) mins = Math.round(CFG.REMINDER_DEFAULT_MIN_MS / 60_000);
+    return {
+      topic,
+      due_in_minutes: Math.max(1, Math.min(60 * 24 * 7, mins)),
+      evidence, evidence_score: Number(score.toFixed(2)),
+    };
+  }
+
+  function normalizeMission(mm, joined, user) {
+    if (!mm || typeof mm !== 'object') return null;
+    const target = cleanUsername(mm.target_user || '');
+    const me = cleanUsername(user);
+    if (!target || target === me) return null;
+    const instruction = clip(mm.instruction, 220);
+    if (!instruction) return null;
+    const evidence = clip(mm.evidence, 200);
+    const score = Math.max(evidenceScore(evidence, joined), evidenceScore(instruction, joined));
+    const named = String(joined || '').toLowerCase().includes(target.toLowerCase());
+    if (score < 0.34 && !named) return null;   // they must have asked for it
+    const type = /prank|troll|dara|mazaak|mazak|chugli/i.test(String(mm.type || '')) ? 'prank' : 'relay';
+    return {
+      target_user: target, type, instruction, evidence,
+      evidence_score: Number(score.toFixed(2)), named_directly: named,
+    };
+  }
+
+  function parseDecisionJson(raw, o = {}) {
+    const s = String(raw || '').trim()
+      .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+    let obj = null;
+    const first = s.indexOf('{');
+    if (first !== -1) {
+      let depth = 0, inStr = false, esc = false;
+      for (let i = first; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (ch === '\\') esc = true;
+          else if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) {
+            try { obj = JSON.parse(s.slice(first, i + 1)); } catch (_) { obj = null; }
+            break;
+          }
+        }
+      }
+    }
+    if (!obj || typeof obj !== 'object') return null;
+
+    const joined = o.joined || '';
+    const curMood = o.currentMood || 'PLAYFUL_CHILL';
+    const proactive = !!o.trigger && o.trigger !== 'incoming_burst';
+
+    let action = String(obj.action || 'REPLY').toUpperCase();
+    if (!/^(REPLY|STAY_SILENT|START_CONVO)$/.test(action)) action = 'REPLY';
+    if (proactive) action = 'START_CONVO';   // a task forced the turn open already
+
+    let mood = String(obj.mood || '').toUpperCase();
+    if (!MOODS[mood]) mood = curMood;
+
+    let count = parseInt(obj.bubble_count, 10);
+    if (!count || isNaN(count)) count = Array.isArray(obj.bubble_plan) ? obj.bubble_plan.length : 1;
+    count = Math.max(1, Math.min(3, count));
+
+    let plan = Array.isArray(obj.bubble_plan)
+      ? obj.bubble_plan.map(x => clip(x, 220)).filter(Boolean) : [];
+    if (plan.length > count) plan = plan.slice(0, count);
+    if (!plan.length) plan = [clip(obj.next_move, 220) || 'reply naturally'];
+    while (plan.length < count) plan.push(null);
+    plan = plan.filter(Boolean);
+
+    return {
+      action, mood,
+      understand: clip(obj.understand, 300),
+      my_last: clip(obj.my_last, 300),
+      next_move: clip(obj.next_move, 300),
+      mood_reason: clip(obj.mood_reason, 220),
+      feeling_note: clip(obj.feeling_note, 220),
+      bubble_count: plan.length,
+      bubble_plan: plan,
+      topic_lock: clip(obj.topic_lock, 200),
+      // On a task-driven (proactive) turn there are no NEW messages from them,
+      // so nothing new can be asked of Aduu — no fresh reminder/mission.
+      reminder: proactive ? null : normalizeReminder(obj.reminder, joined),
+      cross_chat_mission: proactive ? null
+        : normalizeMission(obj.cross_chat_mission, joined, o.user),
+      use_gossip: !!obj.use_gossip,
+      privacy_ok: obj.privacy_ok === undefined ? true : !!obj.privacy_ok,
+      steer_next: clip(obj.steer_next, 250),
+    };
+  }
+
+  /* The exact context the brain is allowed to decide from. The chat messages
+     come first and loudest — that is what makes Aduu act. */
+  function brainDecisionContext(tid, user, msgs, o = {}) {
+    const T = ensureTranscript(tid, user);
+    const timeCtx = getTimeContext();
+    const trigger = o.trigger || 'incoming_burst';
+    const joined = o.joined || '';
+    const bp = T.brainProfile || {};
+    const moodKey = (T.moodState && MOODS[T.moodState.current_mood])
+      ? T.moodState.current_mood : 'PLAYFUL_CHILL';
+    const conv = msgs.slice(-14).map(m =>
+      `${m.mine ? 'Aduu' : '@' + user}: ` +
+      (m.kind === 'text' ? m.text : '[' + (m.label || 'media') + ']'))
+      .join('\n').slice(-2500);
+    const pendingRems = (T.reminders || []).filter(r => r.status === 'scheduled');
+    const pendingMsn = (T.missions || [])
+      .filter(m => m.status !== 'done' && m.status !== 'consumed');
+    const handles = Object.keys((S.globalMemory && S.globalMemory.people) || {})
+      .filter(h => cleanUsername(h) !== cleanUsername(user));
+    const friends = getConnectedFriends(user, joined);
+
+    const L = [];
+    L.push(`TRIGGER: ${trigger}`);
+    L.push(`CONTACT: @${user}`);
+    L.push(`TIME: ${timeCtx.label} — ${timeCtx.vibeHint}`);
+    L.push(`CURRENT MOOD: ${moodKey}`);
+    L.push(`MEMORY OF THEM: ${clip((S.memory[tid] && S.memory[tid].profile) || bp.summary, 400) || 'nothing yet'}`);
+    if (bp.relationship_stage) L.push(`RELATIONSHIP: ${bp.relationship_stage}`);
+    if (bp.inside_jokes) L.push(`INSIDE JOKES: ${clip(bp.inside_jokes, 200)}`);
+    if (bp.custom_persona_tuning) L.push(`PREVIOUS STEER: ${clip(bp.custom_persona_tuning, 200)}`);
+    L.push('');
+    L.push('THEIR NEW MESSAGES (decide from THESE — the chat is what makes you act):');
+    L.push(joined || '(none)');
+    L.push('');
+    L.push('RECENT CHAT:');
+    L.push(conv || '(empty chat)');
+    if (pendingRems.length) {
+      L.push(`PENDING REMINDERS: ${pendingRems.map(r =>
+        `"${clip(r.topic, 60)}" in ${Math.max(0, Math.round((r.due_at - now()) / 60_000))}m`).join('; ')}`);
+    }
+    if (pendingMsn.length) {
+      L.push(`PENDING SECRET MISSIONS: ${pendingMsn.map(m =>
+        `${m.type} on @${m.target_user}: ${clip(m.instruction, 80)}`).join('; ')}`);
+    }
+    L.push(`PEOPLE ADUU ALSO TALKS TO (never reveal these to @${user}): ${handles.join(', ') || 'none'}`);
+    if (friends.length) {
+      L.push(`GOSSIP AVAILABLE (privacy-safe): ${friends.map(f =>
+        '@' + f.user + ': ' + (f.recentMessages || []).slice(-2).join(' / ')).join(' | ').slice(0, 500)}`);
+    }
+    if (trigger === 'reminder_due_trigger') {
+      L.push(`\nTASK DUE NOW: remind @${user} about — ${clip(o.taskTopic, 120)}`);
+    }
+    if (trigger === 'cross_chat_mission_trigger') {
+      L.push(`\nTASK DUE NOW: secretly ${clip(o.taskType || 'message', 40)} — ${clip(o.taskInstruction, 160)} (never reveal who asked)`);
+    }
+    L.push('\nReturn the JSON decision now:');
+    return L.join('\n');
+  }
+
+  async function brainDecide(tid, user, msgs, o = {}) {
+    const T = ensureTranscript(tid, user);
+    const trigger = o.trigger || 'incoming_burst';
+    const joined = o.joined || '';
+    const ctx = brainDecisionContext(tid, user, msgs, Object.assign({}, o, { trigger, joined }));
+    try {
+      const res = await llmBrain([
+        { role: 'system', content: CFG.DECIDE_PROMPT },
+        { role: 'user', content: ctx },
+      ], {
+        type: 'decide',
+        model: CFG.BRAIN_MODEL,
+        maxTokens: CFG.DECIDE_MAX_TOKENS,
+        temperature: 0.3,
+        timeoutMs: CFG.BRAIN_DECIDE_TIMEOUT_MS,
+      });
+      const dec = parseDecisionJson(res.text, {
+        joined, trigger, user,
+        currentMood: (T.moodState && T.moodState.current_mood) || 'PLAYFUL_CHILL',
+      });
+      if (!dec) throw new Error('brain returned no usable JSON decision');
+      return {
+        ok: true, decision: dec,
+        model: res.model, endpoint: res.endpoint,
+        reasoning_chars: res.reasoning_chars || 0,
+        thinking_trace: res.thinking_trace || '',
+        elapsed_ms: res.elapsed_ms || 0,
+        raw: res.text, context: ctx,
+      };
+    } catch (e) {
+      return { ok: false, error: e.message, context: ctx };
+    }
+  }
+
+  /* Turn the brain's JSON into the writer's marching orders. */
+  function brainDirective(dec, user) {
+    const mood = MOODS[dec.mood] || MOODS.PLAYFUL_CHILL;
+    const L = ['[THE BRAIN DECIDED THIS TURN — WRITE EXACTLY THIS PLAN]'];
+    if (dec.understand) L.push(`WHAT THEY MEANT: ${dec.understand}`);
+    if (dec.my_last) L.push(`WHAT YOU ALREADY SAID (never repeat or remix it): ${dec.my_last}`);
+    if (dec.next_move) L.push(`YOUR ONE JOB THIS TURN: ${dec.next_move}`);
+    if (dec.topic_lock) L.push(`STAY ON THIS TOPIC: ${dec.topic_lock}`);
+    L.push(`MOOD: ${dec.mood} — ${mood.directive}`);
+    if (dec.mood_reason) L.push(`WHY THIS MOOD (their own line): ${dec.mood_reason}`);
+    if (dec.feeling_note) L.push(`HOW YOU ACTUALLY FEEL: ${dec.feeling_note}`);
+    L.push(`SEND EXACTLY ${dec.bubble_count} BUBBLE(S). Each one is a DIFFERENT forward step — never a rephrase of the one before:`);
+    dec.bubble_plan.forEach((p, i) => L.push(`  ${i + 1}. ${p}`));
+    L.push('Join the bubbles with " || ". Never repeat a line you already sent in this chat.');
+    if (dec.use_gossip && dec.privacy_ok) {
+      L.push('You may tease with insider gossip from a connected friend — but NEVER name their handle and NEVER quote their chat.');
+    }
+    if (!dec.privacy_ok) {
+      L.push('PRIVACY: do NOT reference any other chat, any other handle, or any private quote.');
+    }
+    return L.join('\n');
+  }
+
+  /* Side-effects the brain ordered: mood flip, reminder, secret cross-chat
+     prank — each one already evidence-checked against their messages. */
+  function applyBrainDecision(tid, user, dec, joined) {
+    const T = ensureTranscript(tid, user);
+    const reminders = [], missions = [];
+    if (dec.mood && MOODS[dec.mood]) {
+      const intensity = /FURIOUS/.test(dec.mood) ? 3
+        : /ANGRY|ANNOYED|PRANKSTER/.test(dec.mood) ? 2 : 1;
+      const prev = T.moodState.current_mood;
+      setMood(tid, user, dec.mood,
+        'brain decision' + (dec.mood_reason ? ': ' + dec.mood_reason : ''),
+        dec.feeling_note, intensity, 'gemma-4-brain-decide');
+      if (prev !== dec.mood) {
+        log(C.warn, 'brain', `@${user}: mood ${prev} → ${dec.mood}` +
+          (dec.mood_reason ? ` ("${clip(dec.mood_reason, 60)}")` : ''));
+      }
+    }
+    if (dec.reminder) {
+      const r = addReminder(tid, user, dec.reminder.topic,
+        dec.reminder.due_in_minutes, 'brain-decide');
+      if (r) {
+        r.evidence = dec.reminder.evidence;
+        r.evidence_score = dec.reminder.evidence_score;
+        reminders.push(r);
+      }
+    }
+    if (dec.cross_chat_mission) {
+      const mm = dec.cross_chat_mission;
+      addMission(tid, user, {
+        target_user: mm.target_user, type: mm.type, instruction: mm.instruction,
+        requested_by: cleanUsername(user), requested_at: now(),
+        source: 'brain-decide', evidence: mm.evidence,
+      });
+      missions.push(mm);
+      log(C.warn, 'brain', `@${user}: secret ${mm.type} queued for @${mm.target_user} (source stays hidden)`);
+    }
+    if (dec.steer_next) {
+      T.brainProfile = T.brainProfile || {};
+      T.brainProfile.steer_next = dec.steer_next;
+      T.brainProfile.last_decision_at = new Date().toISOString();
+    }
+    if (reminders.length || missions.length) { T.dirty = true; saveTranscriptsLocal(); }
+    return { reminders, missions };
+  }
+
+  /* FALLBACK ONLY — the v7 local rules, used when the brain is unreachable. */
+  function localTaskExtraction(tid, user, joined) {
+    const T = ensureTranscript(tid, user);
+    if (!joined) return { reminders: [], missions: [] };
+    const localMood = detectLocalMood(joined);
+    const curMood = (T.moodState && T.moodState.current_mood) || 'PLAYFUL_CHILL';
+    const moodRank = {
+      PLAYFUL_CHILL: 0, NAUGHTY_FLIRT_SHARIF: 1, PRANKSTER_CHAOS: 2,
+      ANNOYED_EXPRESSIVE_FEELINGS: 3, ANGRY_SAVAGE_ROAST: 4, FURIOUS_ABUSE_CLAPBACK: 5,
+    };
+    if ((moodRank[localMood] || 0) > (moodRank[curMood] || 0)) {
+      setMood(tid, user, localMood, 'local burst analysis (brain unavailable)',
+        /FURIOUS/.test(localMood) ? 'genuinely pissed off at how they are talking'
+          : /ANGRY/.test(localMood) ? 'annoyed with their attitude' : '',
+        /FURIOUS/.test(localMood) ? 3 : 2, 'local');
+      log(C.warn, 'mood', `@${user}: ${curMood} → ${localMood} (local fallback)`);
+    }
+    const reminders = processReminderRequests(tid, user, joined)
+      .map(r => Object.assign({}, r, { evidence: r.source_text, evidence_score: 1 }));
+    const missions = extractCrossChatMissions(joined, user);
+    for (const mm of missions) addMission(tid, user, mm);
+    return { reminders, missions };
+  }
+
+  /* The single entry point: the brain decides, local rules only if it fails. */
+  async function decideTurn(tid, user, msgs, emo, trigger, proactiveCtx, joined) {
+    const T = ensureTranscript(tid, user);
+    const timeCtx = getTimeContext();
+    let bd = null;
+    if (CFG.BRAIN_DECIDES) {
+      bd = await brainDecide(tid, user, msgs, {
+        trigger, joined, emo,
+        taskTopic: (proactiveCtx && proactiveCtx.reminder) ? proactiveCtx.reminder.topic : '',
+        taskType: (proactiveCtx && proactiveCtx.mission) ? proactiveCtx.mission.type : '',
+        taskInstruction: (proactiveCtx && proactiveCtx.mission) ? proactiveCtx.mission.instruction : '',
+      });
+    }
+    if (bd && bd.ok && bd.decision) {
+      const dec = bd.decision;
+      const applied = applyBrainDecision(tid, user, dec, joined);
+      const mood = MOODS[dec.mood] ? dec.mood : 'PLAYFUL_CHILL';
+      const decision = {
+        action: 'BRAIN_' + dec.action,
+        trigger,
+        timeSlot: timeCtx.slot, timeLabel: timeCtx.label, timeVibe: timeCtx.vibeHint,
+        bubbleStrategy: dec.bubble_count > 1 ? 'multi_thought' : 'single',
+        seenDelayMs: trigger === 'incoming_burst'
+          ? Math.round(rand(CFG.SEEN_DELAY_MIN_MS, CFG.SEEN_DELAY_MAX_MS)) : 0,
+        mood,
+        mood_directive: MOODS[mood].directive +
+          (dec.feeling_note ? `\nHOW ADUU ACTUALLY FEELS: ${dec.feeling_note}` : ''),
+        feeling_note: dec.feeling_note,
+        relationshipStage: (T.brainProfile && T.brainProfile.relationship_stage) ||
+          T.agentState.relationship_stage || 'casual',
+        reason: `brain: ${dec.next_move || dec.understand || 'reply'}`,
+        directive: brainDirective(dec, user),
+        decided_by: 'gemma-4-brain',
+        brain_decision: dec,
+        brain_model: bd.model || CFG.BRAIN_MODEL,
+        brain_reasoning_chars: bd.reasoning_chars || 0,
+        brain_thinking_trace: bd.thinking_trace || '',
+      };
+      log(C.info, 'brain',
+        `@${user}: ${dec.action} · ${dec.mood} · ${dec.bubble_count} bubble(s) · ` +
+        `${dec.next_move ? clip(dec.next_move, 60) : ''}`);
+      return {
+        decision, reminders: applied.reminders, missions: applied.missions,
+        brain: bd, source: 'brain',
+      };
+    }
+    if (CFG.BRAIN_DECIDES) {
+      log(C.warn, 'brain',
+        `@${user}: brain decision failed (${(bd && bd.error) || 'no answer'}) — local rules take over`);
+    }
+    const local = localTaskExtraction(tid, user, joined);
+    const decision = agentDecide(tid, user, msgs, emo, trigger, proactiveCtx);
+    decision.decided_by = 'local-fallback';
+    return {
+      decision, reminders: local.reminders, missions: local.missions,
+      brain: bd, source: 'local',
+    };
+  }
+
   function runBackgroundBrain(tid, user, msgs, replyText, turnRecord = null) {
     if (!CFG.MEMORY) return Promise.resolve(null);
     return (async () => {
@@ -2510,7 +2970,9 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
            ANNOYED_EXPRESSIVE_FEELINGS / PRANKSTER_CHAOS etc. so he stops acting
            like the same polite sharif good boy in every single reply. */
         const brainMood = String(parsed.recommended_mood || '').toUpperCase();
-        if (MOODS[brainMood]) {
+        // v8: never stomp on the mood the decision brain chose for THIS turn —
+        // the memory pass may only steer the next one.
+        if (MOODS[brainMood] && T.moodState.updated_by !== 'gemma-4-brain-decide') {
           const prevMood = T.moodState.current_mood;
           setMood(tid, user, brainMood,
             'gemma-4 brain recommended_mood',
@@ -2708,30 +3170,20 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         joinedUnanswered = unanswered.filter(m => m.kind === 'text' && m.text)
           .map(m => m.text).join('\n') || newest.text || '';
 
-        /* ── v7 LOCAL AGENT TOOLS (instant, no LLM round-trip) ──
-           1. Mood: read the abuse/attitude level so Aduu can get angry and
-              clap back instead of always doing the sharif-good-boy act.
-           2. Reminders: "10 min mein yaad dila dena" -> schedule a due time.
-           3. Missions: "adarshu.io ko bol do ..." -> queue a secret cross-chat
-              prank/relay that Aduu executes later WITHOUT leaking who asked. */
-        const localMood = detectLocalMood(joinedUnanswered);
-        const curMood = (T.moodState && T.moodState.current_mood) || 'PLAYFUL_CHILL';
-        const moodRank = { PLAYFUL_CHILL: 0, NAUGHTY_FLIRT_SHARIF: 1, PRANKSTER_CHAOS: 2,
-                           ANNOYED_EXPRESSIVE_FEELINGS: 3, ANGRY_SAVAGE_ROAST: 4, FURIOUS_ABUSE_CLAPBACK: 5 };
-        if ((moodRank[localMood] || 0) > (moodRank[curMood] || 0)) {
-          setMood(tid, user, localMood, 'local burst analysis (abuse/attitude detected)',
-            /FURIOUS/.test(localMood) ? 'genuinely pissed off at how they are talking'
-              : /ANGRY/.test(localMood) ? 'annoyed with their attitude, not in the mood to be polite'
-              : '', /FURIOUS/.test(localMood) ? 3 : 2, 'local');
-          log(C.warn, 'mood', `@${user}: ${curMood} → ${localMood} (reacted to their message)`);
-        }
-        turnReminders = processReminderRequests(tid, user, joinedUnanswered);
-        turnMissions = extractCrossChatMissions(joinedUnanswered, user);
-        for (const mm of turnMissions) addMission(tid, user, mm);
+        /* ── v8: THE BRAIN DECIDES THIS TURN ───────────────────────────────
+           Mood, bubble plan, reminders and secret cross-chat pranks are all
+           decided by Gemma-4 from these very messages — see decideTurn().
+           (The local regex tools only run if the brain is unreachable.) */
       } else {
-        joinedUnanswered = `[${(proactiveCtx && proactiveCtx.trigger) || 'proactive_time_trigger'}: ${proactiveReason}]`;
-        // A task-driven starter also means Aduu is executing a prank/reminder -> chaos mood fits
-        if (proactiveCtx && proactiveCtx.trigger === 'cross_chat_mission_trigger') {
+        const theirTail = msgs.filter(m => !m.mine && m.kind === 'text' && m.text)
+          .slice(-3).map(m => m.text).join('\n');
+        joinedUnanswered =
+          `[${(proactiveCtx && proactiveCtx.trigger) || 'proactive_time_trigger'}: ${proactiveReason}]` +
+          (theirTail ? '\n' + theirTail : '');
+        // A task-driven starter means Aduu is executing a prank/reminder —
+        // chaos mood fits, unless the brain is in charge and picks its own.
+        if (!CFG.BRAIN_DECIDES && proactiveCtx &&
+            proactiveCtx.trigger === 'cross_chat_mission_trigger') {
           setMood(tid, user, 'PRANKSTER_CHAOS', 'executing a secret cross-chat mission', '', 2, 'local');
         }
       }
@@ -2742,7 +3194,29 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         ? ((proactiveCtx && proactiveCtx.trigger) || 'proactive_time_trigger')
         : 'incoming_burst';
       const turnEmo = analyzeTurnEmotion(joinedUnanswered, user);
-      const decision = agentDecide(tid, user, msgs, turnEmo, triggerType, proactiveCtx);
+
+      /* v8 BRAIN-FIRST: Gemma-4 reads their messages and decides the turn. */
+      const turned = await decideTurn(
+        tid, user, msgs, turnEmo, triggerType, proactiveCtx, joinedUnanswered);
+      const decision = turned.decision;
+      turnReminders = turned.reminders || [];
+      turnMissions = turned.missions || [];
+      S.lastDecision[tid] = {
+        at: now(), user: cleanUsername(user), trigger: triggerType,
+        source: turned.source, decision: decision.brain_decision || null,
+        model: decision.brain_model || null,
+      };
+
+      /* The brain is allowed to leave a burst on seen like a real person. */
+      if (decision.action === 'BRAIN_STAY_SILENT' && CFG.BRAIN_ALLOW_SILENCE &&
+          !isProactiveTurn && !(opts && opts.forceProactive)) {
+        msgs.forEach(m => m.id && S.handled.add(m.id));
+        saveState();
+        scheduleTranscriptSave(tid, 5_000);
+        log(C.dim, 'brain', `@${user}: brain chose STAY_SILENT — ${decision.reason}`);
+        return;
+      }
+
       const friendIntel = getConnectedFriends(user, joinedUnanswered);
       if (!isProactiveTurn) syncGlobalMemory(tid, user, msgs, turnEmo, null);
 
@@ -2761,8 +3235,9 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       const typing = await typingOn(tid);
       const t0 = now();
       const history = isProactiveTurn
-        ? buildProactiveHistory(msgs, tid, user, proactiveCtx || {})
-        : buildHistory(msgs, tid, user);
+        ? buildProactiveHistory(msgs, tid, user,
+            Object.assign({}, proactiveCtx || {}, { decision }))
+        : buildHistory(msgs, tid, user, decision);
       let llmRes = await llm(history);
       let reply = llmRes.text;
       let model = llmRes.model;
@@ -2854,11 +3329,16 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
           detected_from_burst: detectLocalMood(joinedUnanswered),
         },
         reminder_tool: turnReminders.map(r => ({
-          topic: r.topic, due_in_minutes: r.due_in_minutes, source: 'local_extract',
+          topic: r.topic, due_in_minutes: r.due_in_minutes,
+          source: decision.decided_by === 'gemma-4-brain' ? 'brain_decide' : 'local_extract',
+          evidence: r.evidence || r.source_text || '',
+          evidence_score: r.evidence_score === undefined ? null : r.evidence_score,
         })),
         mission_tool: turnMissions.map(m => ({
           target_user: m.target_user, type: m.type,
           instruction: m.instruction, requested_by: m.requested_by,
+          source: decision.decided_by === 'gemma-4-brain' ? 'brain_decide' : 'local_extract',
+          evidence: m.evidence || '', evidence_score: m.evidence_score === undefined ? null : m.evidence_score,
         })),
         gossip_tool: friendIntel.map(f => ({
           friend: f.user,
@@ -2866,6 +3346,29 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
           recent_messages: (f.recentMessages || []).slice(-3),
         })),
         agent_decision: decision,
+        /* v8: the brain's own JSON — what it understood, why that mood, what
+           each bubble must do, and the evidence line from their messages. */
+        brain_decision: decision.brain_decision ? {
+          decided_by: decision.decided_by,
+          brain_model: decision.brain_model,
+          reasoning_chars: decision.brain_reasoning_chars,
+          thinking_trace: decision.brain_thinking_trace,
+          action: decision.brain_decision.action,
+          understand: decision.brain_decision.understand,
+          my_last: decision.brain_decision.my_last,
+          next_move: decision.brain_decision.next_move,
+          topic_lock: decision.brain_decision.topic_lock,
+          mood: decision.brain_decision.mood,
+          mood_reason: decision.brain_decision.mood_reason,
+          feeling_note: decision.brain_decision.feeling_note,
+          bubble_count: decision.brain_decision.bubble_count,
+          bubble_plan: decision.brain_decision.bubble_plan,
+          use_gossip: decision.brain_decision.use_gossip,
+          privacy_ok: decision.brain_decision.privacy_ok,
+          steer_next: decision.brain_decision.steer_next,
+          reminder: decision.brain_decision.reminder,
+          cross_chat_mission: decision.brain_decision.cross_chat_mission,
+        } : { decided_by: decision.decided_by || 'local-fallback' },
         answering_trace: {
           model,
           configured_model: CFG.MODEL,
@@ -3458,7 +3961,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     ok &= await check('transcripts · bridge save roundtrip', async () => {
       if (!CFG.TRANSCRIPTS) return 'disabled';
       const r = await wsRequest({ type: 'save', transcript: {
-        schema_version: '7.0-parallel-agentic',
+        schema_version: '8.0-brain-decides',
         user: '_selftest', thread_fbid: '0', updated_at: new Date().toISOString(),
         persona: 'test', owner_bio: 'test', memory_profile: '',
         models: { answering_model: CFG.MODEL, brain_model: CFG.BRAIN_MODEL },
@@ -3506,6 +4009,41 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       const b = splitBubbles('abey sun bkl, aukaat mein reh || sach mein dimaag kharab kar diya tune mera');
       if (b.length !== 2) throw new Error('expected 2 logical bubbles, got ' + b.length);
       return b.map(x => `"${x}"`).join(' + ');
+    });
+    ok &= await check('v8 · brain decision JSON parsed + turned into writer orders', async () => {
+      const joined = 'abey sun bkl, teri maa ki chut sale kya kr lega';
+      const d = parseDecisionJson(JSON.stringify({
+        action: 'REPLY', mood: 'FURIOUS_ABUSE_CLAPBACK',
+        mood_reason: 'teri maa ki chut', feeling_note: 'genuinely pissed off',
+        understand: 'they went too far', my_last: 'Aduu told them to behave',
+        next_move: 'clap back then explain feelings',
+        bubble_count: 2,
+        bubble_plan: ['clap back hard', 'explain honestly how it felt'],
+        topic_lock: 'their abuse',
+      }), { joined, trigger: 'incoming_burst', user: 'deeps20_' });
+      if (!d) throw new Error('decision JSON not parsed');
+      if (d.mood !== 'FURIOUS_ABUSE_CLAPBACK') throw new Error('mood lost: ' + d.mood);
+      if (d.bubble_count !== 2 || d.bubble_plan.length !== 2) throw new Error('bubble plan lost');
+      const dir = brainDirective(d, 'deeps20_');
+      if (!/SEND EXACTLY 2 BUBBLE/.test(dir)) throw new Error('bubble count missing from directive');
+      if (!/never repeat or remix/i.test(dir)) throw new Error('continuity guard missing');
+      return `${d.mood} · ${d.bubble_count} bubbles · directive ${dir.length} chars`;
+    });
+    ok &= await check('v8 · decisions without evidence from the chat are rejected', async () => {
+      const d = parseDecisionJson(JSON.stringify({
+        action: 'REPLY', mood: 'PLAYFUL_CHILL',
+        reminder: { topic: 'random project deadline', due_in_minutes: 5, evidence: 'never said this' },
+        cross_chat_mission: { target_user: 'someone_else', type: 'prank', instruction: 'made up', evidence: 'zzz' },
+      }), { joined: 'hello kaise ho', trigger: 'incoming_burst', user: 'deeps20_' });
+      if (d.reminder) throw new Error('fabricated reminder must be dropped');
+      if (d.cross_chat_mission) throw new Error('fabricated mission must be dropped');
+      // …but a real, message-backed one survives
+      const ok = parseDecisionJson(JSON.stringify({
+        action: 'REPLY', mood: 'PLAYFUL_CHILL',
+        reminder: { topic: 'assignment', due_in_minutes: 10, evidence: 'yaad dila dena' },
+      }), { joined: 'bhai 10 min mein yaad dila dena assignment ka', trigger: 'incoming_burst', user: 'deeps20_' });
+      if (!ok.reminder || ok.reminder.due_in_minutes !== 10) throw new Error('evidence-backed reminder was dropped');
+      return `evidence gate works (score ${ok.reminder.evidence_score})`;
     });
     ok &= await check('caps · counters sane', async () => {
       if (hourCount() > CFG.MAX_REPLIES_PER_HOUR) throw new Error('hourly cap already hit');
@@ -3589,6 +4127,9 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
               analyzeTurnEmotion, peekChat, getConnectedFriends, syncGlobalMemory,
               getTimeContext, agentDecide, shouldStartProactiveConvo, buildProactiveHistory,
               runBackgroundBrain, parseBrainJson, ensureTranscript, llmBrain,
+              brainDecide, decideTurn, brainDirective, applyBrainDecision,
+              parseDecisionJson, normalizeReminder, normalizeMission,
+              localTaskExtraction, brainDecisionContext, evidenceScore, clip,
               onRealtimeSignal, nextPollDelayMs,
               MOODS, defaultMoodState, detectLocalMood, setMood,
               extractReminderRequests, addReminder, dueReminder, consumeReminder, processReminderRequests,
@@ -3727,6 +4268,48 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       console.log(`%cGemma-4 Brain Profile for @${q}`, C.info, out);
       return out;
     },
+    /* ── v8: THE BRAIN DECIDES EVERYTHING ── */
+    brainMode(v) {
+      if (v !== undefined) CFG.BRAIN_DECIDES = !!v;
+      log(C.ok, 'brain', 'BRAIN_DECIDES =', CFG.BRAIN_DECIDES,
+        '(ON = Gemma-4 decides the whole turn from the chat messages, GLM only writes)');
+      return CFG.BRAIN_DECIDES;
+    },
+    brainSilence(v) {
+      if (v !== undefined) CFG.BRAIN_ALLOW_SILENCE = !!v;
+      log(C.ok, 'brain', 'BRAIN_ALLOW_SILENCE =', CFG.BRAIN_ALLOW_SILENCE,
+        '(ON = the brain may decide to leave a burst on seen)');
+      return CFG.BRAIN_ALLOW_SILENCE;
+    },
+    /* Ask the brain to decide this chat right now — no reply is sent. */
+    async decide(user) {
+      const q = cleanUsername(user);
+      const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === q);
+      if (!entry) throw new Error(`no transcript for @${q} yet — run IGAgent.start() once`);
+      const msgs = entry.messages || [];
+      let lastOwnIdx = -1;
+      msgs.forEach((m, i) => { if (m.mine) lastOwnIdx = i; });
+      const joined = msgs.slice(lastOwnIdx + 1).filter(m => !m.mine && m.kind === 'text' && m.text)
+        .map(m => m.text).join('\n') ||
+        msgs.filter(m => !m.mine && m.kind === 'text').slice(-1).map(m => m.text).join('\n') || '';
+      const emo = analyzeTurnEmotion(joined, q);
+      const turned = await decideTurn(entry.threadFbid, q, msgs, emo, 'incoming_burst', null, joined);
+      console.log(`%cBrain decision for @${q} (${turned.source})`, C.info, turned.decision);
+      return turned.decision;
+    },
+    /* Why did Aduu do that? The brain's last decision for a chat. */
+    why(user) {
+      const q = cleanUsername(user);
+      let out = null;
+      if (q) {
+        const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === q);
+        out = entry ? (S.lastDecision[entry.threadFbid] || null) : null;
+      } else {
+        out = Object.values(S.lastDecision);
+      }
+      console.log(`%cLast brain decision${q ? ' for @' + q : ' (all chats)'}`, C.info, out);
+      return out;
+    },
     processLog(user) {
       const q = cleanUsername(user);
       const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === q);
@@ -3830,11 +4413,15 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   loadState();
   window.IGAgent = api;
 
-  console.log('%cIGAgent v7 Parallel Agent loaded & ACTIVE ✅  (GLM-4.7-Flash frontline + Gemma-4 parallel brain · default targets: ' +
+  console.log('%cIGAgent v8 BRAIN-FIRST loaded & ACTIVE ✅  (Gemma-4 decides · GLM-4.7-Flash writes · default targets: ' +
     (Array.isArray(CFG.TARGETS) ? CFG.TARGETS.join(', ') : CFG.TARGETS) + ')', C.ok,
     '\n• Auto-started LIVE with default targets: adarshu.io, deeps20_' +
+    '\n• THE BRAIN DECIDES: mood, bubbles, silence, reminders, pranks — all from the chat messages' +
+    '\n• IGAgent.why("user")         ← see the brain\'s last JSON decision + its evidence line' +
+    '\n• IGAgent.decide("user")      ← ask the brain to decide that chat right now (sends nothing)' +
+    '\n• IGAgent.brainMode(false)    ← fall back to the old local rules' +
     '\n• IGAgent.addTargets("u1, u2, u3") ← add a group of targets at once' +
-    '\n• IGAgent.mood("user", "ANGRY_SAVAGE_ROAST") ← change Aduu\'s mood anytime' +
+    '\n• IGAgent.mood("user", "ANGRY_SAVAGE_ROAST") ← force Aduu\'s mood anytime' +
     '\n• IGAgent.remind("user", "topic", 15)        ← task-driven time trigger (NOT blind spam)' +
     '\n• IGAgent.prank("adarshu.io", "deeps20_", "tease her about the chocolate") ← secret mission' +
     '\n• IGAgent.missions() · IGAgent.reminders() · IGAgent.brain("user") · IGAgent.processLog("user")' +

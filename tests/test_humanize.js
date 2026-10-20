@@ -39,16 +39,17 @@ const check = (name, fn) => {
 
 console.log('\nIG-Agent humanizer / config tests\n');
 
-check('config · GLM-4.7-Flash is the frontline model + Gemma-4 is the parallel brain', () => {
+check('config · Gemma-4 brain decides + GLM-4.7-Flash writes', () => {
   assert.strictEqual(api.config.MODEL, '@cf/zai-org/glm-4.7-flash');
   assert.strictEqual(api.config.BRAIN_MODEL, '@cf/google/gemma-4-26b-a4b-it');
+  assert.strictEqual(api.config.BRAIN_DECIDES, true, 'v8: the brain must be the decision maker');
   assert.strictEqual(api.config.FAST_THINK, true);          // minimal thinking
   assert.strictEqual(api.config.PROACTIVE_ENABLED, true);
   assert.strictEqual(api.config.UNCONDITIONAL_IDLE_STARTER, false, 'must NOT blind-spam a dead chat');
   assert.strictEqual(api.config.PRIVACY_WALL, true);
   assert.strictEqual(api.config.HUMANIZE, true);
   assert.strictEqual(api.config.MAX_REPLY_CHARS, 300);
-  assert.strictEqual(api.config.PERSONA_VERSION, 7);
+  assert.strictEqual(api.config.PERSONA_VERSION, 8);
 });
 
 check('state · stale persona + llama model ignored; default targets active', () => {

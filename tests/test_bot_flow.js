@@ -103,6 +103,49 @@ global.fetch = async (url, opts = {}) => {
   };
 };
 
+/* ── v8: the fake bridge also plays the DECISION BRAIN (Gemma-4) ──────────
+   It reads the context the page script sends (the real chat messages) and
+   answers with a strict JSON decision, exactly like the real brain does. */
+function buildDecision(req) {
+  const ctx = (req.messages || []).map(m => String(m.content || '')).join('\n');
+  const abuse = /bkl|mc\b|bc\b|chutiya|madarchod|teri maa|kya kr lega|gandu/i.test(ctx);
+  const remindAsk = /yaad dila|yaad dilana|remind me|baad mein baat/i.test(ctx);
+  const missionAsk = /ko bol do|ko bata do|message kar dena|msg kar dena/i.test(ctx);
+  const byeish = /(?:^|\n)[^\n]{0,40}\b(?:bye|good night|gn|so raha hoon|so rahi hoon)\b/i.test(ctx);
+  const prankTask = /TASK DUE NOW: secretly/i.test(ctx);
+  const pick = (re, fallback) => {
+    const m = ctx.match(re);
+    return m ? m[0].trim() : fallback;
+  };
+  const evRemind = pick(/[^\n"]{0,40}(?:yaad dila|yaad dilana|remind me|baad mein baat)[^\n"]{0,40}/i, 'yaad dila dena');
+  const evMission = pick(/[a-z0-9._]{3,30}\s+ko\s+(?:bol do|bata do)|message kar dena|msg kar dena/i, 'adarshu.io ko bol do');
+  return {
+    action: byeish && !prankTask ? 'STAY_SILENT' : 'REPLY',
+    understand: abuse ? 'they crossed the line and abused Aduu'
+      : prankTask ? 'executing the secret prank a friend asked for'
+      : 'casual Hinglish banter',
+    my_last: 'Aduu teased them about the chocolates',
+    next_move: abuse ? 'clap back hard, then explain honestly how it felt'
+      : 'tease back and keep the banter moving',
+    mood: abuse ? 'FURIOUS_ABUSE_CLAPBACK' : prankTask ? 'PRANKSTER_CHAOS' : 'PLAYFUL_CHILL',
+    mood_reason: abuse ? 'their abuse' : '',
+    feeling_note: abuse ? 'genuinely pissed off at how they are talking' : '',
+    bubble_count: abuse ? 2 : 1,
+    bubble_plan: abuse
+      ? ['clap back hard in raw Delhi style', 'explain honestly how their words felt']
+      : ['tease them back and leave a hook'],
+    topic_lock: 'their last message',
+    reminder: remindAsk && !prankTask
+      ? { topic: 'assignment ka yaad dilana', due_in_minutes: 10, evidence: evRemind } : null,
+    cross_chat_mission: missionAsk && !prankTask
+      ? { target_user: 'adarshu.io', type: 'prank', instruction: 'tease him about the chocolate', evidence: evMission }
+      : null,
+    use_gossip: false,
+    privacy_ok: true,
+    steer_next: 'keep it short and human',
+  };
+}
+
 class FakeWS {
   constructor() {
     this.readyState = 0;
@@ -138,6 +181,15 @@ class FakeWS {
         model: 'google/gemma-4-26b-a4b-it',
         thinking_trace: 'Quick brain update.',
         reasoning_chars: 19,
+      });
+    } else if (req.type === 'decide') {
+      const d = buildDecision(req);
+      reply({
+        id: req.id, ok: true, role_type: 'decide',
+        text: JSON.stringify(d), decision: d, decision_valid: true,
+        model: 'google/gemma-4-26b-a4b-it',
+        thinking_trace: 'Short decision.',
+        reasoning_chars: 16,
       });
     } else if (req.type === 'reply') {
       reply({
@@ -359,7 +411,8 @@ const check = (name, fn) => {
     assert.strictEqual(IG.sent[IG.sent.length - 1], 'oii kahan gayab ho gayi aaj shaam se 👀');
     const lastTurn = T_deeps.processLog[T_deeps.processLog.length - 1];
     assert.strictEqual(lastTurn.trigger, 'reminder_due_trigger', 'turn trigger');
-    assert.strictEqual(lastTurn.agent_decision.action, 'TASK_DRIVEN_START');
+    assert.strictEqual(lastTurn.agent_decision.action, 'BRAIN_START_CONVO', lastTurn.agent_decision.action);
+    assert.strictEqual(lastTurn.brain_decision.decided_by, 'gemma-4-brain', 'the brain owned this turn');
     assert(lastTurn.reminder_tool && lastTurn.reminder_tool.length >= 0);
     // the reminder must be consumed so it never fires twice
     assert(!api._debug.dueReminder('T_DEEPS', 'deeps20_'), 'reminder not consumed');
@@ -380,8 +433,133 @@ const check = (name, fn) => {
     assert.strictEqual(IG.sent.length, msnBefore + 1, 'mission starter sent');
     const lastTurn = T_deeps.processLog[T_deeps.processLog.length - 1];
     assert.strictEqual(lastTurn.trigger, 'cross_chat_mission_trigger', 'turn trigger');
-    assert.strictEqual(T_deeps.moodState.current_mood, 'PRANKSTER_CHAOS', 'prankster mood set');
+    assert.strictEqual(T_deeps.moodState.current_mood, 'PRANKSTER_CHAOS',
+      'brain set the prankster mood: ' + T_deeps.moodState.current_mood);
     assert(!api._debug.pendingMissionFor('deeps20_'), 'mission not consumed');
+  });
+
+  /* ═════════════════════ v8 · THE BRAIN DECIDES EVERYTHING ═════════════════════
+     The Gemma-4 brain is handed the real chat messages and returns the JSON
+     that owns the turn. Every side-effect must be traceable to a line in
+     those messages (evidence), so the CHAT is what makes Aduu act.
+     ══════════════════════════════════════════════════════════════════════════ */
+  const T_BRAIN = api._debug.ensureTranscript('T_BRAIN', 'brainuser');
+  T_BRAIN.messages = [{
+    id: 'b0', ts: Date.now() - 5000, mine: true, kind: 'text', label: 'text',
+    text: 'chal chocolate ka scene bata',
+  }];
+
+  const bd1 = await api._debug.brainDecide('T_BRAIN', 'brainuser', T_BRAIN.messages, {
+    trigger: 'incoming_burst',
+    joined: 'haan bhai 10 min mein yaad dila dena assignment ka',
+  });
+  check('brain · reads the chat and schedules a REMINDER the person asked for', () => {
+    assert.strictEqual(bd1.ok, true, bd1.error);
+    assert(bd1.decision.reminder, 'brain did not pick up the reminder request');
+    assert.strictEqual(bd1.decision.reminder.due_in_minutes, 10);
+    assert(bd1.decision.reminder.evidence_score >= 0.4, 'no evidence: ' + bd1.decision.reminder.evidence_score);
+    assert(/yaad dila/i.test(bd1.decision.reminder.evidence), bd1.decision.reminder.evidence);
+  });
+
+  const bd2 = await api._debug.brainDecide('T_BRAIN', 'brainuser', T_BRAIN.messages, {
+    trigger: 'incoming_burst',
+    joined: 'adarshu.io ko bol do ki main chocolate nahi dunga',
+  });
+  check('brain · queues a SECRET cross-chat prank when the chat asks for one', () => {
+    assert.strictEqual(bd2.ok, true, bd2.error);
+    assert(bd2.decision.cross_chat_mission, 'brain did not pick up the mission');
+    assert.strictEqual(bd2.decision.cross_chat_mission.target_user, 'adarshu.io');
+    assert.strictEqual(bd2.decision.cross_chat_mission.type, 'prank');
+  });
+
+  const bd3 = await api._debug.brainDecide('T_BRAIN', 'brainuser', T_BRAIN.messages, {
+    trigger: 'incoming_burst',
+    joined: 'teri maa ki chut sale, kya kr lega?',
+  });
+  check('brain · flips Aduu to FURIOUS_ABUSE_CLAPBACK because THEIR line was abusive', () => {
+    assert.strictEqual(bd3.decision.mood, 'FURIOUS_ABUSE_CLAPBACK', bd3.decision.mood);
+    assert.strictEqual(bd3.decision.bubble_count, 2, 'clapback + feelings = 2 bubbles');
+    assert.strictEqual(bd3.decision.bubble_plan.length, 2);
+    const d = api._debug.brainDirective(bd3.decision, 'brainuser');
+    assert(/FURIOUS_ABUSE_CLAPBACK/.test(d), 'mood missing from the writer directive');
+    assert(/SEND EXACTLY 2 BUBBLE/.test(d), 'bubble count missing from the directive');
+  });
+
+  const bd4 = await api._debug.brainDecide('T_BRAIN', 'brainuser', T_BRAIN.messages, {
+    trigger: 'incoming_burst', joined: 'ok bye, good night',
+  });
+  check('brain · can decide STAY_SILENT (leave a dead burst on seen)', () => {
+    assert.strictEqual(bd4.decision.action, 'STAY_SILENT', bd4.decision.action);
+  });
+
+  check('brain · decisions with NO evidence from the chat are thrown away', () => {
+    const d = api._debug.parseDecisionJson(JSON.stringify({
+      action: 'REPLY', mood: 'PLAYFUL_CHILL',
+      reminder: { topic: 'some random project deadline', due_in_minutes: 5, evidence: 'nothing like this was said' },
+      cross_chat_mission: { target_user: 'nobody_here', type: 'prank', instruction: 'made up', evidence: 'zzz qqq' },
+    }), { joined: 'hello kaise ho', trigger: 'incoming_burst', user: 'brainuser' });
+    assert.strictEqual(d.reminder, null, 'fabricated reminder must be rejected');
+    assert.strictEqual(d.cross_chat_mission, null, 'fabricated mission must be rejected');
+  });
+
+  check('brain · bubble_plan entries are distinct forward steps (never repeats)', () => {
+    const d = api._debug.brainDirective({
+      mood: 'ANGRY_SAVAGE_ROAST', bubble_count: 2,
+      bubble_plan: ['clap back hard', 'explain how it felt'],
+      understand: 'they disrespected Aduu', my_last: 'Aduu teased them',
+      next_move: 'put them in their place', topic_lock: 'their attitude',
+      feeling_note: 'pissed off', mood_reason: 'their abuse',
+      use_gossip: false, privacy_ok: false,
+    }, 'brainuser');
+    assert(/1\. clap back hard/.test(d) && /2\. explain how it felt/.test(d));
+    assert(/never repeat or remix/i.test(d), 'continuity guard missing');
+    assert(/PRIVACY/.test(d), 'privacy guard missing when privacy_ok=false');
+  });
+
+  // The brain's decision must reach the writer's history.
+  check('brain · decision is injected into the writer prompt', () => {
+    const msgs = T_BRAIN.messages.concat([{
+      id: 'b1', ts: Date.now(), mine: false, kind: 'text', label: 'text', text: 'haan bhai bata',
+    }]);
+    const dec = {
+      decided_by: 'gemma-4-brain',
+      directive: api._debug.brainDirective(bd3.decision, 'brainuser'),
+      brain_decision: bd3.decision,
+    };
+    const hist = api._debug.buildHistory(msgs, 'T_BRAIN', 'brainuser', dec);
+    const sys = String(hist[0].content || '');
+    assert(/THE BRAIN DECIDED THIS TURN/.test(sys), 'brain plan not in the writer prompt');
+  });
+
+  check('brain · when the brain is OFF the local rules take over cleanly', async () => {
+    assert.strictEqual(api.config.BRAIN_DECIDES, true);
+  });
+
+  const T_FB = api._debug.ensureTranscript('T_FB', 'fallbackuser');
+  const fbTurned = await (async () => {
+    api.brainMode(false);
+    const t = await api._debug.decideTurn('T_FB', 'fallbackuser', [{
+      id: 'f1', ts: Date.now(), mine: false, kind: 'text', label: 'text',
+      text: 'teri maa ki chut sale',
+    }], api._debug.analyzeTurnEmotion('teri maa ki chut sale', 'fallbackuser'),
+      'incoming_burst', null, 'teri maa ki chut sale');
+    api.brainMode(true);
+    return t;
+  })();
+  check('brain · fallback path still reacts locally if the brain is disabled', () => {
+    assert.strictEqual(fbTurned.source, 'local', fbTurned.source);
+    assert.strictEqual(fbTurned.decision.decided_by, 'local-fallback');
+    assert.strictEqual(T_FB.moodState.current_mood, 'FURIOUS_ABUSE_CLAPBACK',
+      T_FB.moodState.current_mood);
+  });
+
+  check('brain · IGAgent.why() exposes the last decision for a chat', () => {
+    const T = S.transcripts.T_DEEPS;
+    const w = api.why('deeps20_');
+    assert(w, 'no decision recorded for deeps20_');
+    assert(w.source === 'brain' || w.source === 'local', w.source);
+    assert.strictEqual(w.user, 'deeps20_');
+    assert(w.decision, 'decision JSON missing');
   });
 
   // 4. Aduu's mood flips to FURIOUS when someone abuses him

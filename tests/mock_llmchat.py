@@ -40,6 +40,25 @@ FALLBACK_MODEL_WIRE = "@cf/qwen/qwen3-30b-a3b-fp8"
 REASONING = "One short sentence then answer."
 CONTENT = "Alright, I'm listening. What's up, bro?"
 
+# v8: what the Gemma-4 decision brain answers with.
+DECISION_JSON = {
+    "action": "REPLY",
+    "understand": "they are poking Aduu for a reaction after going quiet",
+    "my_last": "Aduu teased them about the chocolates",
+    "next_move": "tease back and leave a hook",
+    "mood": "PLAYFUL_CHILL",
+    "mood_reason": "",
+    "feeling_note": "",
+    "bubble_count": 2,
+    "bubble_plan": ["tease them about going quiet", "ask what they are really up to"],
+    "topic_lock": "their last message",
+    "reminder": None,
+    "cross_chat_mission": None,
+    "use_gossip": False,
+    "privacy_ok": True,
+    "steer_next": "keep it short",
+}
+
 
 # ─────────────────────────────── frame builders ───────────────────────────────
 
@@ -182,6 +201,24 @@ def build_empty_stream() -> bytes:
     return "".join(out).encode()
 
 
+def build_decision_stream(decision: dict | None = None) -> bytes:
+    """v8: the Gemma-4 brain answering with its strict JSON decision."""
+    body = json.dumps(decision or DECISION_JSON, ensure_ascii=False,
+                      separators=(", ", ": "))
+    return build_gemma_stream(content=body, reasoning="Decide from the chat.")
+
+
+def is_decide_request(body: dict) -> bool:
+    """True when the request carries the v8 DECISION BRAIN system prompt."""
+    try:
+        for m in body.get("messages") or []:
+            if isinstance(m, dict) and "DECISION BRAIN" in str(m.get("content", "")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def build_stream(model: str = "") -> bytes:
     m = (model or "").lower()
     if "gemma" in m:
@@ -233,7 +270,9 @@ class MockLLM:
                     return self._json(404, {"error": "unknown path"})
                 if any(part in model for part in outer.fail_models):
                     return self._json(500, {"error": "mock upstream failure"})
-                if any(part in model for part in outer.glitch_models):
+                if is_decide_request(body):
+                    data = build_decision_stream()
+                elif any(part in model for part in outer.glitch_models):
                     data = build_glitch_stream()
                 elif any(part in model for part in outer.empty_models):
                     data = build_empty_stream()

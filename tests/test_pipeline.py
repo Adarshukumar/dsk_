@@ -41,7 +41,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 import llmchat_provider                                    # noqa: E402
 import server                                              # noqa: E402
 from mock_llmchat import (                                 # noqa: E402
-    MockLLM, MODEL_WIRE, BRAIN_MODEL_WIRE, FALLBACK_MODEL_WIRE, CONTENT, REASONING)
+    MockLLM, MODEL_WIRE, BRAIN_MODEL_WIRE, FALLBACK_MODEL_WIRE, CONTENT, REASONING,
+    DECISION_JSON)
 
 PASS, FAIL = [], []
 
@@ -254,6 +255,8 @@ def test_server_bridge(mock):
         assert health["default_model"] == "zai-org/glm-4.7-flash", health
         assert health["brain_model"] == "google/gemma-4-26b-a4b-it", health
         assert health["default_endpoint"] == MODEL_WIRE, health
+        assert health.get("brain_decides") is True, health
+        assert health.get("decide_endpoint") == "/v1/decide", health
         assert health["chain"][0] == "zai-org/glm-4.7-flash", health["chain"]
         assert "uptime_s" in health
 
@@ -312,9 +315,23 @@ def test_server_bridge(mock):
             assert br["ok"] and br["model"] == "google/gemma-4-26b-a4b-it", br
             assert br["role_type"] == "brain", br
 
+            # v8: the BRAIN decides the turn (Gemma-4 → strict JSON)
+            send({"id": "d1", "type": "decide", "messages": [
+                {"role": "user", "content": "THEIR NEW MESSAGES: kahan gayab ho gayi aaj"},
+            ]})
+            dec = recv()
+            assert dec["ok"] and dec["role_type"] == "decide", dec
+            assert dec["model"] == "google/gemma-4-26b-a4b-it", dec["model"]
+            assert dec["decision_valid"] is True, dec
+            assert dec["decision"]["action"] == "REPLY", dec["decision"]
+            assert dec["decision"]["bubble_count"] == 2, dec["decision"]
+            assert len(dec["decision"]["bubble_plan"]) == 2, dec["decision"]
+            # the decision prompt must have been injected server-side
+            assert "DECISION BRAIN" in mock.last_body()["messages"][0]["content"]
+
             # v7 transcript save (mood_state + reminders + missions + process_log)
             send({"id": "s1", "type": "save", "transcript": {
-                "schema_version": "7.0-parallel-agentic",
+                "schema_version": "8.0-brain-decides",
                 "user": "_pipeline_test", "thread_fbid": "0",
                 "models": {"answering_model": "zai-org/glm-4.7-flash",
                            "brain_model": "google/gemma-4-26b-a4b-it"},
@@ -325,6 +342,8 @@ def test_server_bridge(mock):
                                "status": "scheduled"}],
                 "missions": [{"target_user": "deeps20_", "type": "prank"}],
                 "process_log": [{"turn_id": "t1", "trigger": "incoming_burst"}],
+                "last_decision": {"action": "REPLY", "mood": "PLAYFUL_CHILL",
+                                  "bubble_count": 2},
                 "messages": [{"id": "test:1", "ts": 1, "mine": False,
                               "kind": "text", "label": "text", "text": "hi"}],
             }})
@@ -336,6 +355,18 @@ def test_server_bridge(mock):
             assert disk["mood_state"]["current_mood"] == "FURIOUS_ABUSE_CLAPBACK"
             assert disk["reminders"][0]["topic"] == "baat karte hai"
             assert disk["missions"][0]["target_user"] == "deeps20_"
+            assert disk["last_decision"]["action"] == "REPLY", disk.get("last_decision")
+
+            # v8: REST decision endpoint (any client, not just the page script)
+            status, d = http_json("http://127.0.0.1:8791/v1/decide", {
+                "messages": [{"role": "user",
+                              "content": "THEIR NEW MESSAGES: bol na kya scene hai"}],
+            })
+            assert status == 200, d
+            assert d["decision_valid"] is True, d
+            assert d["decision"]["action"] == "REPLY", d["decision"]
+            assert d["model"] == "google/gemma-4-26b-a4b-it", d["model"]
+            assert "DECISION BRAIN" in mock.last_body()["messages"][0]["content"]
 
             send({"id": "g1", "type": "save_global", "global": {
                 "contacts": {"deeps20_": {"handle": "deeps20_", "vibe": "aggressive"}},
@@ -352,7 +383,7 @@ def test_server_bridge(mock):
             close()
 
         shutil.rmtree(tmpdir, ignore_errors=True)
-        return "health · models · OpenAI · SSE · WS reply+brain+save+global"
+        return "health · models · OpenAI · SSE · WS reply+brain+decide+save+global"
     finally:
         proc.terminate()
         try:
@@ -362,7 +393,7 @@ def test_server_bridge(mock):
 
 
 def main():
-    print("\nIG-Agent v7 pipeline tests (offline, mock llmchat.in)\n")
+    print("\nIG-Agent v8 pipeline tests (offline, mock llmchat.in)\n")
     with MockLLM() as mock:
         check("provider · GLM-4.7-Flash SSE (reasoning + content, no duplication)")(
             lambda: test_provider_glm(mock))

@@ -1,15 +1,19 @@
 """
-Local bridge server (`http://localhost:8765`) for the Instagram DM Agent (v7).
+Local bridge server (`http://localhost:8787`) for the Instagram DM Agent (v8).
 
 Features:
   - Forwards `/v1/chat/completions` and `/inference/stream` to `llmchat.in`
     using `LLMChatClient` (async `curl_cffi` with Chrome TLS impersonation).
-  - Dual-Model Parallel Architecture (v7):
-      * Primary Answering & Creative Agent Model: `@cf/zai-org/glm-4.7-flash`
-        (`zai-org/glm-4.7-flash`) with minimal-thinking prompt enforcement.
-      * Background Brain & Strategy Model: `@cf/google/gemma-4-26b-a4b-it`
-        (`google/gemma-4-26b-a4b-it`).
+  - BRAIN-FIRST v8 architecture:
+      * Brain / Decision Maker: `@cf/google/gemma-4-26b-a4b-it`. It reads the
+        ACTUAL incoming chat messages and returns one strict JSON decision that
+        drives the whole turn (reply or stay silent, live mood, bubble plan,
+        reminders, secret cross-chat pranks, privacy verdict, next-turn steer).
+      * Frontline Writer: `@cf/zai-org/glm-4.7-flash` — it only WRITES what the
+        brain decided, with minimal thinking.
       * Fast Fallback Model: `@cf/qwen/qwen3-30b-a3b-fp8`.
+  - `/v1/decide` (HTTP) and the `decide` WebSocket message type expose the
+    brain's decision to any client, so decisions are inspectable and testable.
   - Saves & loads per-user conversation transcripts, dynamic mood states,
     scheduled reminders, cross-chat prank/relay missions, and privacy-filtered
     global memory in `transcripts/` via `/transcripts` and `/global-memory`.
@@ -68,6 +72,81 @@ GLOBAL_MEMORY_FILE = TRANSCRIPTS_DIR / "_global_memory.json"
 # reasoning_content never starves the visible reply content.
 THINK_MIN_BUDGET = int(os.environ.get("IG_THINK_MIN_BUDGET", "2500"))
 
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Pull the first balanced {...} object out of a model reply (fences OK)."""
+    s = str(text or "").strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    s = re.sub(r"```\s*$", "", s).strip()
+    start = s.find("{")
+    if start == -1:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(s[start : i + 1])
+                except Exception:
+                    return None
+                return obj if isinstance(obj, dict) else None
+    return None
+
+
+# ══════════════════════════ v8: THE BRAIN DECIDES ══════════════════════════
+# The Gemma-4 brain is the decision maker for the whole agent. Every turn it is
+# handed the REAL incoming chat messages plus Aduu's memory, mood, pending
+# reminders/missions and connected-friend gossip, and it answers with one strict
+# JSON object. The frontline GLM-4.7-Flash then only writes what the brain
+# decided. Nothing about the turn is decided by hard-coded timers or regexes
+# any more — the chat messages drive every decision.
+DECIDE_SYSTEM_PROMPT = """You are Aduu's DECISION BRAIN (Gemma-4) — the mind behind a real 22-year-old Delhi guy's Instagram DMs.
+The frontline model (GLM-4.7-Flash) only WRITES what you decide. You decide ALL of it.
+Think in at most 10 short words. Read the incoming chat messages and output ONE valid JSON object. No markdown fences, no text before or after it.
+
+{
+  "action": "REPLY" | "STAY_SILENT" | "START_CONVO",
+  "understand": "what their messages actually mean, one line",
+  "my_last": "what Aduu already said in this chat, one line — so the reply moves FORWARD and never repeats it",
+  "next_move": "the single new thing this reply must accomplish",
+  "mood": "PLAYFUL_CHILL | NAUGHTY_FLIRT_SHARIF | PRANKSTER_CHAOS | ANNOYED_EXPRESSIVE_FEELINGS | ANGRY_SAVAGE_ROAST | FURIOUS_ABUSE_CLAPBACK",
+  "mood_reason": "the exact line from their messages that caused this mood",
+  "feeling_note": "how Aduu genuinely feels right now, honestly and humanly",
+  "bubble_count": 2,
+  "bubble_plan": ["what bubble 1 must do", "what bubble 2 must do"],
+  "topic_lock": "the exact topic the reply must stay on",
+  "reminder": null,
+  "cross_chat_mission": null,
+  "use_gossip": false,
+  "privacy_ok": true,
+  "steer_next": "one line of coaching for Aduu's next turn"
+}
+
+Set "reminder" to {"topic": "...", "due_in_minutes": 15, "evidence": "their exact words"} ONLY when they asked to be reminded of something or to talk later.
+Set "cross_chat_mission" to {"target_user": "handle", "type": "prank" | "relay", "instruction": "what to do WITHOUT revealing who asked", "evidence": "their exact words"} ONLY when they asked Aduu to message, prank, tease or relay something to another person.
+
+RULES
+1. Every decision must come from the CHAT MESSAGES you were given. Quote the triggering line in "mood_reason" and in every "evidence" field. Never invent a reason the messages do not support.
+2. "action" is "STAY_SILENT" only when replying would be unnatural (dead-end burst, they said bye, they are clearly done, or Aduu already answered this). Default to "REPLY".
+3. "bubble_count" is 1, 2 or 3. Every entry of "bubble_plan" must be a DIFFERENT forward step — never a rephrase of bubble 1 and never a repeat of "my_last".
+4. "mood" may flip to ANGRY_SAVAGE_ROAST or FURIOUS_ABUSE_CLAPBACK only when their own words were abusive or disrespectful; put that line in "mood_reason".
+5. "privacy_ok" must be false if the plan would leak another chat, another person's @handle, or a verbatim private quote.
+6. Never write anything that sounds like an AI or an assistant. Aduu is a real person texting a real person."""
+
 START = time.time()
 BOT_SCRIPT_PATH = Path(__file__).resolve().parent / "ig-agent-chat.js"
 
@@ -117,6 +196,7 @@ def _load_transcript(username: str) -> dict[str, Any]:
             "reminders": [],
             "missions": [],
             "process_log": [],
+            "last_decision": None,
             "messages": [],
         }
     try:
@@ -131,6 +211,7 @@ def _load_transcript(username: str) -> dict[str, Any]:
         data.setdefault("reminders", [])
         data.setdefault("missions", [])
         data.setdefault("process_log", [])
+        data.setdefault("last_decision", None)
         data["message_count"] = len(data["messages"])
         return data
     except Exception as exc:
@@ -161,6 +242,7 @@ def _save_transcript(
     missions: list[dict[str, Any]] | None = None,
     process_entry: dict[str, Any] | None = None,
     process_log: list[dict[str, Any]] | None = None,
+    last_decision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     existing = _load_transcript(username)
     by_key: dict[str, dict[str, Any]] = {}
@@ -243,6 +325,11 @@ def _save_transcript(
             else existing.get("missions", [])
         ),
         "process_log": merged_process_log,
+        "last_decision": (
+            last_decision
+            if last_decision is not None
+            else existing.get("last_decision")
+        ),
         "messages": merged,
     }
     safe = _safe_filename(username)
@@ -430,11 +517,11 @@ class BridgeServer:
             self._handle_client, self.host, self.port
         )
         log.info(
-            "IG Bridge Server v7 listening on http://%s:%d (answering=%s, brain=%s -> %s)",
+            "IG Bridge Server v8 (brain-first) listening on http://%s:%d (brain=%s decides, %s writes -> %s)",
             self.host,
             self.port,
-            DEFAULT_MODEL,
             DEFAULT_BRAIN_MODEL,
+            DEFAULT_MODEL,
             LLMCHAT_BASE_URL,
         )
 
@@ -530,7 +617,8 @@ class BridgeServer:
                     200,
                     {
                         "status": "ok",
-                        "version": "7.0",
+                        "version": "8.0",
+                        "architecture": "brain-first (gemma-4 decides, glm-4.7-flash writes)",
                         "provider": "llmchat.in",
                         "default_model": DEFAULT_MODEL,
                         "default_endpoint": resolve_wire_model(DEFAULT_MODEL),
@@ -538,6 +626,8 @@ class BridgeServer:
                         "brain_model": DEFAULT_BRAIN_MODEL,
                         "brain_endpoint": resolve_wire_model(DEFAULT_BRAIN_MODEL),
                         "brain_wire_model": resolve_wire_model(DEFAULT_BRAIN_MODEL),
+                        "brain_decides": True,
+                        "decide_endpoint": "/v1/decide",
                         "fallback_chain": FALLBACK_CHAIN,
                         "chain": FALLBACK_CHAIN,
                         "models": list(MODEL_REGISTRY.keys()),
@@ -630,12 +720,52 @@ class BridgeServer:
                         missions=payload.get("missions"),
                         process_entry=payload.get("process_entry"),
                         process_log=payload.get("process_log"),
+                        last_decision=payload.get("last_decision"),
                     )
                     await self._send_json(writer, 200, saved)
                     return
 
             if path in ("/v1/chat/completions", "/inference/stream") and method == "POST":
                 await self._handle_completions(writer, path, body_bytes)
+                return
+
+            # ── v8: ask the BRAIN to decide the whole turn ──────────────────
+            # Body: {"messages": [...], "context": {...}, "model": optional}
+            # Returns: {"decision": {...}, "decision_valid": bool, "raw": "..."}
+            if path == "/v1/decide" and method == "POST":
+                payload = json.loads(body_bytes.decode("utf-8") or "{}")
+                msgs = payload.get("messages")
+                if not isinstance(msgs, list) or not msgs:
+                    await self._send_json(
+                        writer, 400, {"error": "'messages' must be a non-empty list"}
+                    )
+                    return
+                model_q = payload.get("model") or DEFAULT_BRAIN_MODEL
+                messages = [{"role": "system", "content": DECIDE_SYSTEM_PROMPT}] + msgs
+                max_tokens = max(int(payload.get("max_tokens") or 700), THINK_MIN_BUDGET)
+                result = await self.client.chat_completion(
+                    messages=messages,
+                    model=model_q,
+                    max_tokens=max_tokens,
+                    temperature=float(payload.get("temperature", 0.3)),
+                    low_think=bool(payload.get("fast_think", True)),
+                )
+                decision = _extract_json_object(result.content)
+                await self._send_json(
+                    writer,
+                    200,
+                    {
+                        "decision": decision,
+                        "decision_valid": decision is not None,
+                        "raw": result.content,
+                        "model": result.model,
+                        "endpoint": result.wire_model,
+                        "thinking_trace": result.reasoning,
+                        "reasoning_chars": len(result.reasoning),
+                        "elapsed_ms": result.elapsed_ms,
+                        "usage": result.usage,
+                    },
+                )
                 return
 
             await self._send_json(
@@ -682,7 +812,7 @@ class BridgeServer:
                 if not isinstance(req, dict):
                     continue
                 rtype = req.get("type") or "reply"
-                if rtype in ("reply", "brain", "llm"):
+                if rtype in ("reply", "brain", "decide", "llm"):
                     # Never block the socket while the model streams: each
                     # request carries its own id so answers may land in any order.
                     asyncio.create_task(self._ws_llm_worker(conn, req, rtype))
@@ -707,6 +837,7 @@ class BridgeServer:
                     "default_endpoint": resolve_wire_model(DEFAULT_MODEL),
                     "brain_model": DEFAULT_BRAIN_MODEL,
                     "brain_endpoint": resolve_wire_model(DEFAULT_BRAIN_MODEL),
+                    "brain_decides": True,
                     "chain": FALLBACK_CHAIN,
                     "models": list(MODEL_REGISTRY.keys()),
                     "uptime_s": round(time.time() - START),
@@ -736,6 +867,7 @@ class BridgeServer:
                     missions=tr.get("missions"),
                     process_entry=tr.get("process_entry"),
                     process_log=tr.get("process_log"),
+                    last_decision=tr.get("last_decision"),
                 )
                 await conn.send_json({
                     "id": rid, "ok": True,
@@ -768,16 +900,22 @@ class BridgeServer:
             await conn.send_json({"id": rid, "ok": False, "error": str(e)[:300]})
 
     async def _ws_llm_worker(self, conn: _WSConn, req: dict, rtype: str) -> None:
-        """Frontline `reply` (GLM-4.7-Flash) and background `brain` (Gemma-4) calls."""
+        """Frontline `reply` (GLM-4.7-Flash), brain `brain`/`decide` (Gemma-4) calls."""
         rid = req.get("id")
         try:
             messages = req.get("messages")
             if not isinstance(messages, list) or not messages:
                 raise ValueError("'messages' must be a non-empty list")
 
-            default_m = DEFAULT_BRAIN_MODEL if rtype == "brain" else DEFAULT_MODEL
+            # v8: `decide` is the brain acting as the decision maker for the turn.
+            is_decide = rtype == "decide"
+            is_brain = rtype == "brain" or is_decide
+            default_m = DEFAULT_BRAIN_MODEL if is_brain else DEFAULT_MODEL
             model_q = req.get("model") or default_m
-            req_max = int(req.get("max_tokens") or (320 if rtype == "brain" else 500))
+            if is_decide:
+                req_max = int(req.get("max_tokens") or 700)
+            else:
+                req_max = int(req.get("max_tokens") or (320 if is_brain else 500))
             if is_thinking_model(model_q):
                 max_tokens = max(req_max, THINK_MIN_BUDGET)
             else:
@@ -789,15 +927,23 @@ class BridgeServer:
                 len(messages), max_tokens,
             )
 
+            if is_decide and req.get("inject_system_prompt", True):
+                messages = [{"role": "system", "content": DECIDE_SYSTEM_PROMPT}] + [
+                    m for m in messages if not (isinstance(m, dict)
+                                                and m.get("role") == "system"
+                                                and m.get("__decide_prompt"))
+                ]
+
+            default_temp = 0.3 if is_decide else (0.35 if is_brain else 0.85)
             result = await self.client.chat_completion(
                 messages=messages,
                 model=model_q,
                 max_tokens=max_tokens,
-                temperature=float(req.get("temperature", 0.85 if rtype != "brain" else 0.35)),
+                temperature=float(req.get("temperature", default_temp)),
                 low_think=bool(req.get("fast_think", True)),
             )
 
-            await conn.send_json({
+            payload = {
                 "id": rid,
                 "ok": True,
                 "role_type": rtype,
@@ -811,7 +957,11 @@ class BridgeServer:
                 "fallback_index": (FALLBACK_CHAIN.index(result.model)
                                    if result.model in FALLBACK_CHAIN else 0),
                 "fallback_used": result.fallback_used,
-            })
+            }
+            if is_decide:
+                payload["decision"] = _extract_json_object(result.content)
+                payload["decision_valid"] = payload["decision"] is not None
+            await conn.send_json(payload)
         except Exception as e:
             log.warning("WS %s failed: %s", rtype, e)
             try:
