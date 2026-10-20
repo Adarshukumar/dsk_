@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   IG AGENT · ig-agent-chat.js  v5 — gemma-4 edition (NO API KEY, humanized)
+   IG AGENT · ig-agent-chat.js  v7 — PARALLEL MULTI-AGENT (NO API KEY, humanized)
    ─────────────────────────────────────────────────────────────────────────
    Reverse-engineered Instagram web DM layer (GraphQL /api/graphql):
      · inbox list    PolarisDirectInboxQuery           doc 27909866362025854

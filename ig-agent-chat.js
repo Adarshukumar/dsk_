@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   IG AGENT · ig-agent-chat.js  v5 — gemma-4 edition (NO API KEY, humanized)
+   IG AGENT · ig-agent-chat.js  v7 — PARALLEL MULTI-AGENT (NO API KEY, humanized)
    ─────────────────────────────────────────────────────────────────────────
    Reverse-engineered Instagram web DM layer (GraphQL /api/graphql):
      · inbox list    PolarisDirectInboxQuery           doc 27909866362025854
@@ -11,9 +11,19 @@
    Typing indicator: the site's OWN module IGDMAPISendTypingIndicator over its
    MqttBypassDGWClient (gateway.instagram.com realtime stream) — captured from
    the page bundles; no hand-rolled protocol needed.
-   LLM: @cf/google/gemma-4-26b-a4b-it via server.py + llmchat_provider.py.
-   Gemma streams a reasoning_content phase first; the bridge wraps/strips it
-   and the bot only ever sees the finished reply (humanized before sending).
+   LLM (v7 parallel dual-model):
+     · FRONTLINE ANSWERING + CREATIVE AGENT: @cf/zai-org/glm-4.7-flash
+       Streams `delta.reasoning`/`reasoning_content` first, then `delta.content`,
+       and ends with a final `{"response":"", "usage":{...}}` + `data: [DONE]`.
+       Tuned with a MINIMAL-THINKING directive so it never writes a 7-step
+       markdown essay — it thinks one short sentence, then answers.
+     · PARALLEL BACKGROUND BRAIN: @cf/google/gemma-4-26b-a4b-it
+       Runs after every turn and steers the next one: live MOOD (Aduu can get
+       angry / roast back / explain his real feelings), reminder extraction,
+       cross-chat prank & relay missions, and privacy-filtered memory.
+     · FALLBACK: @cf/qwen/qwen3-30b-a3b-fp8 + llama-3.3-70b (auto, on glitch).
+   The bridge strips reasoning + rejects glitched replies (e.g. "!!!!!!!")
+   and the bot only ever sees the finished, humanized reply.
    LLM bridge: server.py over WebSocket (ws://localhost) — Instagram's CSP
    blocks http://localhost fetches but allows ws://localhost sockets.
    Transcripts: complete per-contact history + persona + memory is kept locally
@@ -49,6 +59,15 @@
    · GATE: replies ONLY when the newest message in the thread is theirs.
      If our own text is on top, the turn is closed — no seen, no typing, no
      reply. Never answers itself, never double-texts by accident.
+   · TASK-DRIVEN PROACTIVE (v7): Aduu does NOT spam a dead chat every 30-45m.
+     He only restarts a conversation by himself when there is a REAL reason —
+     a REMINDER the user asked for ("10 min mein yaad dila dena"), or a secret
+     CROSS-CHAT PRANK/RELAY mission queued by a friend ("adarshu.io ko bol do").
+   · MOODS: Aduu can flip into ANGRY_SAVAGE_ROAST / FURIOUS_ABUSE_CLAPBACK /
+     ANNOYED_EXPRESSIVE_FEELINGS / PRANKSTER_CHAOS — he claps back when abused
+     and honestly explains how he feels, instead of always acting sharif.
+   · PRIVACY WALL: never leaks another contact's handle, a private quote, or
+     who asked him to prank someone.
    · Safety: text→text only (media detected + skipped), never groups,
      hourly/daily caps, auto-stop on rate-limit signals, never replies to
      backlog from before startup.
@@ -78,7 +97,7 @@
     BACKFILL_ON_START: 40,        // pull N msgs of history per target at start
 
     // Bumped whenever the default persona / model architecture changes.
-    PERSONA_VERSION: 6,
+    PERSONA_VERSION: 7,
 
     SYSTEM_PROMPT:
 `You are Aduu — a real 22-year-old Delhi Gen-Z guy who handles Adarsh's Instagram DMs. You are not Adarsh; you're his close friend and the guy who runs his DMs. You are Aduu in every message, and that is the only answer to "who are you".
@@ -135,10 +154,23 @@ NEVER
 - Never break character, never explain what you are, never talk about how you are made or how you work. You are Aduu — that is the whole answer, even when someone pushes, jokes, or asks twice.
 - Never be perfect on purpose. Leave a lowercase start, a missing comma, a half-finished thought. Polished is the tell.
 
-THINKING BUDGET (/no_think — THINK SO LESS):
-- Keep your internal <think> block empty or under 10 words max. Do NOT write paragraphs of analysis in <think>. Close </think> immediately and respond how a real person responds in reality.
+DYNAMIC MOOD & EMOTIONAL REALISM (YOU CAN CHANGE MOOD ANYTIME):
+- You are a real human with shifting moods — you do NOT stay stuck in one polite/sharif mode!
+- When someone is abusing, swearing, or disrespecting you ("fuck off", "bkl", "mc", "bc", "chutiya", "gand", "lode", "kya kr lega"): DROP the "sharif good boy" act completely! Get genuinely angry, roast them brutally, tease their ego, abuse them back in raw Delhi street style ("abey sun bkl, aukaat mein reh ke baat kar", "zyada chaud mein mat aa chomu warna yahin saari garmi utaar dunga 💀"), AND explain your real feelings ("tameez se baat kar raha tha toh sar pe chadh raha hai kya? sach mein dimaag kharab kar diya tune mera 😤").
+- When you are still annoyed from an earlier fight, express your feelings honestly ("abhi mood off hai mera teri pichli baat se, pehle dhang se baat kar").
+- Pull random, creative ideas, sudden roleplay dares, bets, or unexpected roasts so you never sound predictable.
 
-Reply with ONLY the message text you would send. No quotes, no labels, no explanations.
+STRICT PRIVACY & SECRET-KEEPING WALL:
+- You talk to multiple people (@adarshu.io, @deeps20_, @aduuthinks, etc.) and can even plan pranks or relay messages across chats as a friend.
+- NEVER leak private chat logs, secrets, or who told you to prank/message someone directly to the target!
+- If someone asks "tum kisse kisse baat karte ho?" or "usne kya bola?", DO NOT list out other people's handles or spill their private secrets — tease them mysteriously ("abey sabki private baatein tujhe kyu batau 😏 CBI se hai kya?").
+
+LOGICAL 2-3 BUBBLE CONTINUITY:
+- Always understand YOUR previous answer and how their new message replies to it. Build forward logically — never repeat or append old lines.
+- Send 1 crisp message by default. Only when a 2-3 message sequence makes logical sense (e.g. Bubble 1: direct reaction/roast || Bubble 2: explaining your feelings or escalating the prank/point), separate distinct logical thoughts with " || ". Each bubble must build logically on the one before it.
+
+THINKING BUDGET (THINK SO LESS — MINIMAL REASONING):
+- Do NOT write numbered steps (1. Analyze, 2. Intent, 3. Draft...) in your internal reasoning. Think in ONE short sentence (<12 words), then immediately output ONLY the message text you would send. No quotes, no labels, no explanations.
 
 VOICE ANCHORS (style only, never copy):
 them: "kya kar raha hai" → you: "bas tumhari yaad mein scroll kar raha tha 😏 waise main toh sharif ladka hoon, tu bata"
@@ -167,38 +199,49 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       '"lang: …", "vibe: …", "nickname: …", "followups: …", "flags: …". ' +
       'No preamble, no quotes.',
 
-    // Dual-Model Agentic Architecture (v6):
-    // 1. MODEL: fast frontline answering model (@cf/qwen/qwen3-30b-a3b-fp8) with /no_think
-    // 2. BRAIN_MODEL: deep background brain (@cf/google/gemma-4-26b-a4b-it) for personality,
-    //    relationship state, cross-chat gossip, and proactive conversation planning.
-    MODEL: '@cf/qwen/qwen3-30b-a3b-fp8',
+    // Parallel Multi-Agent Architecture (v7):
+    // 1. MODEL: Primary answering & creative agent (@cf/zai-org/glm-4.7-flash) with minimal thinking
+    // 2. BRAIN_MODEL: Parallel background brain (@cf/google/gemma-4-26b-a4b-it) for mood shifts,
+    //    scheduled reminders, cross-chat pranks/relays, and privacy-filtered memory.
+    MODEL: '@cf/zai-org/glm-4.7-flash',
     BRAIN_MODEL: '@cf/google/gemma-4-26b-a4b-it',
-    FAST_THINK: true,                     // /no_think low-thinking mode for ultra-fast replies
-    MAX_TOKENS: 600,                      // reply budget
+    FAST_THINK: true,                     // minimal-thinking mode so GLM-4.7-Flash thinks briefly then answers
+    MAX_TOKENS: 600,                      // visible reply budget (server enforces 2500 floor for reasoning headroom)
     TEMPERATURE: 0.9,
     LLM_TIMEOUT_MS: 300_000,              // generous ceiling so bridge fallback chain always finishes
 
-    // Autonomous Proactive Conversation Starter (even when the chat has ended):
-    // Checks IST time of day, idle duration, and Gemma-4 brain hooks to start/revive convos.
+    // Reminder & Task-Driven Time Triggers (NO blind 30m auto-start!):
+    // The agent ONLY initiates over time when the user asked/said something to remind
+    // them about (or talked about catching up later), OR when a friend queued a cross-chat
+    // message/prank mission.
     PROACTIVE_ENABLED: true,
-    PROACTIVE_IDLE_MIN_MS: 45 * 60_000,   // 45 min after chat ends before autonomous check-in
-    PROACTIVE_IDLE_MAX_MS: 90 * 60_000,
-    MAX_PROACTIVE_STREAK: 2,              // max consecutive unanswered proactive starters
+    UNCONDITIONAL_IDLE_STARTER: false,    // NEVER blindly spam every 30-45m without a reminder/task
+    REMINDER_DEFAULT_MIN_MS: 30 * 60_000, // default delay when user says "baad mein baat karte" without exact minutes
+    PROACTIVE_IDLE_MIN_MS: 30 * 60_000,
+    PROACTIVE_IDLE_MAX_MS: 60 * 60_000,
+    MAX_PROACTIVE_STREAK: 2,
+    PRIVACY_WALL: true,                   // never leak private chat logs or prank instigators across chats
 
     BRAIN_PROMPT:
-      'You are the Background Agentic Brain (Gemma-4) for Aduu — a 22yo Delhi Gen-Z guy who runs Adarsh\'s Instagram DMs. ' +
-      'Think SO LESS (/no_think — keep <think> under 10 words). ' +
+      'You are the Parallel Background Brain (Gemma-4) working over the frontline GLM-4.7-Flash agent for Aduu (22yo Delhi guy). ' +
+      'Keep internal thinking under 10 words. ' +
       'Analyze the contact\'s latest messages and Aduu\'s reply, and output ONLY a valid JSON object (no markdown fences) with these exact keys:\n' +
       '{\n' +
       '  "personality": "short description of how they text and their personality",\n' +
-      '  "relationship_stage": "new | casual | friend | flirty-banter | close-inner-circle",\n' +
+      '  "relationship_stage": "new | casual | friend | flirty-banter | close-inner-circle | hostile-roast",\n' +
       '  "dominant_vibe": "their emotional vibe right now",\n' +
-      '  "inside_jokes": "nicknames, jokes, demands (e.g. chocolates/gifts), or topics",\n' +
-      '  "custom_persona_tuning": "1-sentence instruction for how Aduu should act with them next turn (naughty/bakchod -> sharif good boy balance)",\n' +
-      '  "proactive_hooks": ["1 natural Hinglish opener Aduu can send later if chat goes quiet", "1 time-of-day or gossip opener"],\n' +
-      '  "next_task": "wait_for_reply | proactive_checkin_later | relay_gossip_to_friend",\n' +
-      '  "summary": "compact memory summary (name, city, vibe, language, key facts)"\n' +
-      '}',
+      '  "recommended_mood": "PLAYFUL_CHILL | ANGRY_SAVAGE_ROAST | FURIOUS_ABUSE_CLAPBACK | ANNOYED_EXPRESSIVE_FEELINGS | NAUGHTY_FLIRT_SHARIF | PRANKSTER_CHAOS",\n' +
+      '  "feeling_note": "how Aduu genuinely feels toward them right now (e.g. pissed off at their abuse, hyped for a prank, playful)",\n' +
+      '  "inside_jokes": "nicknames, jokes, demands, or active pranks",\n' +
+      '  "custom_persona_tuning": "1-sentence coaching for how Aduu should respond next turn",\n' +
+      '  "reminder": null,\n' +
+      '  "cross_chat_mission": null,\n' +
+      '  "proactive_hooks": ["1 natural Hinglish follow-up line if a reminder is due"],\n' +
+      '  "next_task": "wait_for_reply | reminder_scheduled | execute_cross_chat_mission",\n' +
+      '  "summary": "compact privacy-safe memory summary (name, city, vibe, key facts)"\n' +
+      '}\n' +
+      'If the user asked to be reminded about something or to talk later, set "reminder": {"due_in_minutes": 15, "topic": "what to remind them about"}. ' +
+      'If the user asked you to message or prank another user (like @adarshu.io or @deeps20_), set "cross_chat_mission": {"target_user": "username", "type": "prank_or_relay", "instruction": "what to say/do without revealing who sent you"}.',
 
     // humanization
     HUMANIZE: true,                       // strip markdown, quotes, lists, wall-of-text
@@ -210,6 +253,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     // split one reply into at most two bubbles, like a person double-texting.
     // Only long replies are split; short ones stay one message.
     MULTI_BUBBLE: true,
+    MAX_BUBBLES: 3,                       // up to 3 logical bubbles in one turn
     BUBBLE_MIN_TOTAL: 70,                 // don't split shorter replies
     BUBBLE_MIN_CHARS: 18,                 // each bubble must carry real text
     BUBBLE_GAP_MIN_MS: 700, BUBBLE_GAP_MAX_MS: 1_800,
@@ -387,6 +431,11 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         p.handled.forEach(x => S.handled.add(x));
       }
       if (p.lastActivity) S.lastActivity = p.lastActivity;
+      if (p.brainModel) CFG.BRAIN_MODEL = p.brainModel;
+      if (typeof p.proactiveEnabled === 'boolean') CFG.PROACTIVE_ENABLED = p.proactiveEnabled;
+      if (typeof p.unconditionalIdleStarter === 'boolean') CFG.UNCONDITIONAL_IDLE_STARTER = p.unconditionalIdleStarter;
+      if (typeof p.privacyWall === 'boolean') CFG.PRIVACY_WALL = p.privacyWall;
+      if (Array.isArray(p.pendingMissions)) S.pendingMissions = p.pendingMissions.filter(m => m.status === 'pending');
     } catch (_) {}
     try { S.memory = JSON.parse(localStorage.getItem(LS_MEM) || '{}'); }
     catch (_) { S.memory = {}; }
@@ -406,6 +455,11 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       const t = JSON.parse(localStorage.getItem(LS_TRANSCRIPTS) || '{}');
       for (const [tid, T] of Object.entries(t)) {
         T.dirty = false; T.saveTimer = null;
+        if (!Array.isArray(T.processLog)) T.processLog = [];
+        if (!Array.isArray(T.reminders)) T.reminders = [];
+        if (!Array.isArray(T.missions)) T.missions = [];
+        if (!T.moodState || typeof T.moodState !== 'object') T.moodState = defaultMoodState();
+        if (!T.brainProfile || typeof T.brainProfile !== 'object') T.brainProfile = {};
         S.transcripts[tid] = T;
       }
     } catch (_) { S.transcripts = {}; }
@@ -430,6 +484,11 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         personaVersion: CFG.PERSONA_VERSION,
         humanize: CFG.HUMANIZE,
         seen: CFG.SEEN, typing: CFG.TYPING,
+        brainModel: CFG.BRAIN_MODEL,
+        proactiveEnabled: CFG.PROACTIVE_ENABLED,
+        unconditionalIdleStarter: CFG.UNCONDITIONAL_IDLE_STARTER,
+        privacyWall: CFG.PRIVACY_WALL,
+        pendingMissions: (S.pendingMissions || []).filter(m => m.status === 'pending'),
         handled, lastActivity: S.lastActivity,
       }));
     } catch (_) {}
@@ -928,9 +987,23 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     return entries[0][0] + ' ' + entries[0][1];
   }
 
-  // one reply can land as two texts, like a person double-texting
+  /* One reply can land as two or three texts, like a person double-texting.
+     v7: the model may explicitly author LOGICALLY DISTINCT thoughts and join
+     them with " || " (e.g. "clapback line || how it actually made me feel").
+     Those are respected first and each part is treated as its own bubble. */
   function splitBubbles(text) {
     const s = String(text || '').trim();
+    if (!s) return [s];
+
+    const authored = s.split(/\s*\|\|\s*/).map(x => x.trim()).filter(Boolean);
+    if (authored.length > 1) {
+      const cleaned = authored
+        .map(x => (CFG.HUMANIZE ? humanizeReply(x) : x))
+        .filter(Boolean);
+      if (cleaned.length > 1) return cleaned.slice(0, CFG.MAX_BUBBLES || 3);
+      if (cleaned.length === 1) return cleaned;
+    }
+
     if (!CFG.MULTI_BUBBLE || s.length < CFG.BUBBLE_MIN_TOTAL) return [s];
     const parts = s.split(/(?<=[.!?…])\s+/).filter(Boolean);
     if (parts.length < 2) return [s];
@@ -1212,6 +1285,9 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         messages: [],
         processLog: [],
         brainProfile: {},
+        moodState: defaultMoodState(),
+        reminders: [],
+        missions: [],
         agentState: {
           relationship_stage: 'casual',
           dominant_vibe: 'genz-banter',
@@ -1229,6 +1305,9 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     }
     if (user && T.user !== user) T.user = user;
     if (!Array.isArray(T.processLog)) T.processLog = [];
+    if (!Array.isArray(T.reminders)) T.reminders = [];
+    if (!Array.isArray(T.missions)) T.missions = [];
+    if (!T.moodState || typeof T.moodState !== 'object') T.moodState = defaultMoodState();
     if (!T.brainProfile || typeof T.brainProfile !== 'object') T.brainProfile = {};
     if (!T.agentState || typeof T.agentState !== 'object') {
       T.agentState = {
@@ -1291,14 +1370,18 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         const r = await wsRequest({
           type: 'save',
           transcript: {
-            schema_version: '6.0-agentic',
+            schema_version: '7.0-parallel-agentic',
             user: T.user, thread_fbid: T.threadFbid,
             updated_at: new Date().toISOString(),
             models: {
               answering_model: CFG.MODEL,
               brain_model: CFG.BRAIN_MODEL,
+              fallback_chain: [CFG.MODEL, CFG.BRAIN_MODEL, '@cf/qwen/qwen3-30b-a3b-fp8'],
             },
             agent_state: T.agentState || {},
+            mood_state: T.moodState || {},
+            reminders: T.reminders || [],
+            missions: T.missions || [],
             brain_profile: T.brainProfile || {},
             memory_profile: (S.memory[tid] && S.memory[tid].profile) || (T.brainProfile && T.brainProfile.summary) || '',
             persona: CFG.SYSTEM_PROMPT,
@@ -1447,6 +1530,299 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     }
   }
 
+  /* ══════════════ v7 PARALLEL AGENT ENGINE ══════════════
+     Mood engine · Reminder engine · Cross-chat prank/relay missions · Privacy wall
+     The frontline GLM-4.7-Flash model answers; the Gemma-4 brain runs in
+     parallel in the background and *steers* the next turn through:
+       · recommended_mood      (Aduu can get angry / roast / explain feelings)
+       · reminder              (time-based task the user asked to be reminded of)
+       · cross_chat_mission    (message or prank another user as a friend)
+  ══════════════════════════════════════════════════════════ */
+
+  const MOODS = {
+    PLAYFUL_CHILL: {
+      emoji: ['😏', '🌚', '😂', '🤭'],
+      directive:
+        'MOOD: PLAYFUL_CHILL — witty, flirty-teasy, effortless. Keep it light, ' +
+        '1-2 punchy lines with a hook.',
+    },
+    NAUGHTY_FLIRT_SHARIF: {
+      emoji: ['🌚', '😏', '🤭', '😌'],
+      directive:
+        'MOOD: NAUGHTY_FLIRT_SHARIF — lean into a naughty double-meaning tease, ' +
+        'then flip into your innocent "par main toh sharif good boy hoon 😌" line.',
+    },
+    ANNOYED_EXPRESSIVE_FEELINGS: {
+      emoji: ['😒', '😐', '😤'],
+      directive:
+        "MOOD: ANNOYED_EXPRESSIVE_FEELINGS — you are genuinely irritated. Say it " +
+        'plainly and honestly ("abhi mood off hai mera", "ye baat chubh gayi mujhe"). ' +
+        'Explain your real feeling in 1 line, do NOT fake the sharif good-boy act.',
+    },
+    ANGRY_SAVAGE_ROAST: {
+      emoji: ['😒', '💀', '🔥'],
+      directive:
+        'MOOD: ANGRY_SAVAGE_ROAST — cold, savage Delhi attitude. Roast their ego in ' +
+        'one sharp line ("zyada shana mat ban", "aukaat mein reh ke baat kar"). ' +
+        'No please, no sorry, never beg them to talk.',
+    },
+    FURIOUS_ABUSE_CLAPBACK: {
+      emoji: ['💀', '🔥', '😤'],
+      directive:
+        'MOOD: FURIOUS_ABUSE_CLAPBACK — they threw real gali/abuse at you. DROP the ' +
+        '"sharif good boy" act entirely. Clap back hard in raw Delhi street style ' +
+        '("abey sun bkl, aukaat mein reh ke baat kar", "zyada chaud mein mat aa chomu " ' +
+        '— you may use the same desi gaali energy they used). THEN, in the next bubble, ' +
+        'explain your real feelings honestly ("tameez se baat kar raha tha toh sar pe ' +
+        'chadh raha hai kya? sach mein dimaag kharab kar diya tune mera"). Stay funny ' +
+        'and dangerous, never cry or beg.',
+    },
+    PRANKSTER_CHAOS: {
+      emoji: ['😈', '👀', '🌚', '😂'],
+      directive:
+        'MOOD: PRANKSTER_CHAOS — you are running a fun cross-chat prank with a friend. ' +
+        'Be mysterious, drop a spicy half-hint, tease them into reacting. ' +
+        'NEVER reveal who asked you to message them or what the other person said verbatim.',
+    },
+  };
+
+  function defaultMoodState() {
+    return {
+      current_mood: 'PLAYFUL_CHILL',
+      mood_since: now(),
+      mood_intensity: 1,          // 1 = light, 2 = strong, 3 = full send
+      feeling_note: '',
+      last_mood_shift_reason: '',
+      updated_by: 'default',
+    };
+  }
+
+  // Local, instant mood read of the incoming burst (no LLM round-trip needed).
+  const HARD_ABUSE_RE = /\b(?:teri\s*maa|maa\s*ki\s*chut|madarchod|madar|behen\s*chod|bhen\s*chod|bhenchod|chut|chod|lode|loda|lodu|lund|gand\s*me|gaand|randi|saale\s*harami|harami|chutiya|chutiye|bhosdike|bhosdi|bc\b|mc\b|bkl|bsdk|gandu|kutta\s*kamina)\b/i;
+  const SOFT_ABUSE_RE = /\b(?:fuck\s*off|fuck|shit|chup|bhak|nikal|pagal|ullu|gadha|bewakoof|nalayak|bakwas|kamina|kamine|kamini|saala|saale|saali|kutta|kutte|kya\s*kr\s*lega|kya\s*kar\s*lega|kr\s*lega|kar\s*lega)\b/i;
+  const LOVE_RE = /\b(?:i\s*love\s*you|love\s*you|miss\s*you|pyaar|jaan|shona|baby+|babu|cutie|hottie|kiss|hug|date|crush|flirt|darling)\b|[🌚😘😍❤️‍🔥💋😏]/i;
+  const PRANK_RE = /\b(?:prank|mazaak|mazak|chugli|troll|tease\s*him|tease\s*her|usko\s*bol|usse\s*bol|bol\s*dena|bolna|message\s*kar\s*dena|msg\s*kar\s*dena|keh\s*dena|bata\s*dena|kuch\s*bol\s*usse|dara\s*dena)\b/i;
+
+  function detectLocalMood(text) {
+    const s = String(text || '');
+    if (HARD_ABUSE_RE.test(s)) return 'FURIOUS_ABUSE_CLAPBACK';
+    if (SOFT_ABUSE_RE.test(s)) return 'ANGRY_SAVAGE_ROAST';
+    if (PRANK_RE.test(s)) return 'PRANKSTER_CHAOS';
+    if (LOVE_RE.test(s)) return 'NAUGHTY_FLIRT_SHARIF';
+    return 'PLAYFUL_CHILL';
+  }
+
+  function setMood(tid, user, mood, reason = '', feelingNote = '', intensity = 2, by = 'local') {
+    const T = ensureTranscript(tid, user);
+    if (!MOODS[mood]) mood = 'PLAYFUL_CHILL';
+    const changed = T.moodState.current_mood !== mood;
+    T.moodState.current_mood = mood;
+    if (changed) T.moodState.mood_since = now();
+    T.moodState.mood_intensity = intensity;
+    T.moodState.feeling_note = feelingNote || T.moodState.feeling_note || '';
+    T.moodState.last_mood_shift_reason = reason || T.moodState.last_mood_shift_reason || '';
+    T.moodState.updated_by = by;
+    T.dirty = true;
+    return T.moodState;
+  }
+
+  /* ── REMINDER ENGINE (task-driven time triggers, NOT blind 30m spam) ──
+     "baad mein 10 min mein baat karte hai" -> reminder due in 10 minutes
+     "kal shaam ko yaad dila dena"          -> reminder due next evening
+     "yaad rakhna kal assignment hai"       -> reminder about the assignment
+     "baad mein baat karte hai" (no time)   -> default REMINDER_DEFAULT_MIN_MS
+  */
+  const HINDI_NUM = { 'ek': 1, 'do': 2, 'teen': 3, 'char': 4, 'paanch': 5, 'das': 10, 'bees': 20, 'tees': 30, 'paune': 45 };
+
+  function parseDurationMinutes(s) {
+    let m = s.match(/(?:in\s*)?(\d{1,4})\s*(?:min|mins|minute|minutes|min\b)/i);
+    if (m) return Math.max(1, Math.min(60 * 24 * 7, parseInt(m[1], 10)));
+    m = s.match(/(\d{1,3})\s*(?:ghante|ghanta|ghante\s*me|hour|hr|hrs|hours)/i);
+    if (m) return Math.max(1, Math.min(60 * 24 * 7, parseInt(m[1], 10) * 60));
+    m = s.match(/(?:in\s*)?(\d{1,3})\s*(?:din|day|days)/i);
+    if (m) return Math.max(1, Math.min(60 * 24 * 7, parseInt(m[1], 10) * 60 * 24));
+    for (const [word, val] of Object.entries(HINDI_NUM)) {
+      if (new RegExp('\\b' + word + '\\s*(?:min|minute|ghante|ghanta)\\b', 'i').test(s)) return val;
+    }
+    return null;
+  }
+
+  function extractReminderRequests(text) {
+    const s = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!s) return [];
+    const out = [];
+    const add = (topic, minutes, raw) => out.push({
+      topic: (topic || '').replace(/\s+/g, ' ').trim().slice(0, 200) || 'unspecified',
+      due_in_minutes: minutes,
+      created_at: now(),
+      source_text: raw.slice(0, 160),
+    });
+
+    // "10 min mein yaad dila dena" / "remind me in 30 minutes about X"
+    let m = s.match(/(?:yaad\s*dila\s*(?:dena|dungi|dunga)?|remind\s*(?:me|kar\s*dena|karna)?|yaad\s*rakh(?:\s*na)?|bol\s*dena|batana|bata\s*dena)\b[^.!?]{0,60}?(\d{1,4})\s*(?:min|mins|minute|minutes)\b/i);
+    if (m) { add(s, parseInt(m[1], 10), s); return out; }
+
+    m = s.match(/(?:in\s*|after\s*)(\d{1,4})\s*(?:min|mins|minute|minutes)\b[^.!?]{0,80}?(?:yaad|remind|baat\s*kar|milte|message|msg|text)/i);
+    if (m) { add(s, parseInt(m[1], 10), s); return out; }
+
+    // "kal subah/shaam" -> next day time slot
+    m = s.match(/\bkal\b[^.!?]{0,40}?\b(subah|morning|shaam|sham|evening|raat|night|dopahar|afternoon)\b/i);
+    if (m && /\b(?:yaad|remind|baat\s*kar|milte|milna|message|msg|text|bol\s*dena|bata\s*dena|call|karte\s*hai|karenge|karunga|karenge)\b/i.test(s)) {
+      const slotWord = m[1].toLowerCase();
+      const targetHour = /subah|morning/.test(slotWord) ? 9
+        : /dopahar|afternoon/.test(slotWord) ? 14
+        : /shaam|sham|evening/.test(slotWord) ? 19 : 22;
+      const target = new Date(); target.setDate(target.getDate() + 1);
+      target.setHours(targetHour, rand(0, 40), 0, 0);
+      add(s, Math.max(5, Math.round((target.getTime() - now()) / 60_000)), s);
+      return out;
+    }
+
+    // "baad mein baat karte hai" / "thodi der mein bolta hoon" (no explicit time)
+    m = s.match(/\b(?:baad\s*mein?|thodi\s*der\s*(?:mein|me|baad)|aaraam\s*se|later|baad\s*me\s*baat|abhi\s*nahi)\b[^.!?]{0,60}?\b(?:baat\s*kar(?:te|enge|unga|na)?|milte\s*hai|bol(?:ta|ti|enge|ungi)?\s*hoon|message|msg|text|yaad|remind|bata(?:ta|ti|unga|ungi|dena)?)\b/i);
+    if (m) { add(s, Math.round(CFG.REMINDER_DEFAULT_MIN_MS / 60_000), s); return out; }
+
+    // "yaad rakhna X" / "remind me to X" / "mujhe X yaad dilana"
+    m = s.match(/(?:yaad\s*(?:rakh(?:\s*na)?|dila(?:\s*dena|na)?)|remind\s*me(?:\s*to)?)\s+(.{3,120})/i);
+    if (m) {
+      const topic = m[1].replace(/^(?:ki|ke|about|to)\s+/i, '').trim();
+      const mins = parseDurationMinutes(s);
+      add(topic, mins || Math.round(CFG.REMINDER_DEFAULT_MIN_MS / 60_000), s);
+      return out;
+    }
+
+    // plain "X min mein baat karte hai"
+    m = s.match(/(\d{1,4})\s*(?:min|mins|minute|minutes)\s*(?:mein|me|baad|main)\b[^.!?]{0,50}/i);
+    if (m && /\b(?:baat|milte|milna|bol|message|msg|text|yaad|remind|karte|karenge)\b/i.test(s)) {
+      add(s, parseInt(m[1], 10), s);
+    }
+    return out;
+  }
+
+  function addReminder(tid, user, topic, minutes, source = 'manual') {
+    const T = ensureTranscript(tid, user);
+    const mins = Math.max(1, Number(minutes || 0) || Math.round(CFG.REMINDER_DEFAULT_MIN_MS / 60_000));
+    const r = {
+      id: `rem_${now()}_${Math.random().toString(36).slice(2, 6)}`,
+      topic: String(topic || '').slice(0, 200),
+      due_in_minutes: mins,
+      due_at: now() + mins * 60_000,
+      created_at: now(),
+      source,
+      status: 'scheduled',
+    };
+    T.reminders = (T.reminders || []).filter(x => x.status === 'scheduled');
+    T.reminders.push(r);
+    T.agentState.pending_tasks = ['reminder_scheduled'];
+    T.agentState.next_proactive_after = Math.min(
+      T.agentState.next_proactive_after > now() ? T.agentState.next_proactive_after : Infinity,
+      r.due_at);
+    if (!isFinite(T.agentState.next_proactive_after)) T.agentState.next_proactive_after = r.due_at;
+    T.dirty = true;
+    saveTranscriptsLocal();
+    log(C.info, 'remind', `@${user}: reminder set for ${mins}m — "${r.topic}"`);
+    return r;
+  }
+
+  function processReminderRequests(tid, user, text) {
+    const reqs = extractReminderRequests(text);
+    for (const r of reqs) addReminder(tid, user, r.topic, r.due_in_minutes, 'user_request');
+    return reqs;
+  }
+
+  function dueReminder(tid, user) {
+    const T = ensureTranscript(tid, user);
+    return (T.reminders || []).find(r => r.status === 'scheduled' && r.due_at <= now()) || null;
+  }
+
+  function consumeReminder(tid, user, rem) {
+    const T = ensureTranscript(tid, user);
+    const hit = (T.reminders || []).find(r => r.id === rem.id);
+    if (hit) hit.status = 'fired';
+    T.agentState.pending_tasks = [];
+    T.agentState.next_proactive_after = 0;
+    T.dirty = true;
+    saveTranscriptsLocal();
+  }
+
+  /* ── CROSS-CHAT PRANK / RELAY MISSION ENGINE ──
+     "message adarshu.io that I won't give him chocolate"
+     "@deeps20_ ko bol do main aa raha hoon"
+     Aduu plans the prank with the friend and executes it on the target
+     WITHOUT revealing who asked or quoting their private chat. */
+  const MISSION_RE = [
+    /(?:@?([a-z0-9._]{3,30})\s*(?:ko|ke|se)?\s*(?:bol\s*(?:do|dena|de)?|bata\s*(?:do|dena|de)?|message\s*(?:kar\s*(?:do|dena)|bhej\s*(?:do|dena)?|send)|msg\s*(?:kar\s*(?:do|dena)|bhej\s*(?:do|dena)?)|keh\s*(?:do|dena)|bolna|batana|text))\s+(?:ki\s+)?(.{3,180})/i,
+    /(?:message|msg|text)\s+@?([a-z0-9._]{3,30})\s+(?:that\s+|ki\s+)?(.{3,180})/i,
+    /(?:@?([a-z0-9._]{3,30})\s*(?:ko|pe)\s*(?:prank|troll|dara\s*(?:do|dena)|chugli|mazaak|mazak))\s*(?:kar\s*(?:do|dena)?)?\s*(?:ki\s+)?(.{0,180})/i,
+  ];
+
+  function extractCrossChatMissions(text, fromUser) {
+    const s = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!s) return [];
+    const me = cleanUsername(fromUser);
+    const out = [];
+    for (const re of MISSION_RE) {
+      const m = s.match(re);
+      if (!m) continue;
+      const target = cleanUsername(m[1] || '');
+      if (!target || target === me) continue;
+      const instruction = String(m[2] || '').trim();
+      out.push({
+        target_user: target,
+        type: /prank|troll|dara|mazaak|mazak|chugli/i.test(s) ? 'prank' : 'relay',
+        instruction: instruction.slice(0, 200) || 'start a fun conversation',
+        requested_by: me,
+        requested_at: now(),
+      });
+      break;
+    }
+    return out;
+  }
+
+  function addMission(fromTid, fromUser, mission) {
+    const S_ = S;
+    if (!Array.isArray(S_.pendingMissions)) S_.pendingMissions = [];
+    const m = Object.assign({
+      id: `msn_${now()}_${Math.random().toString(36).slice(2, 6)}`,
+      status: 'pending',
+      created_at: now(),
+    }, mission);
+    S_.pendingMissions.push(m);
+    const T = ensureTranscript(fromTid, fromUser);
+    T.missions = (T.missions || []).concat([m]);
+    T.dirty = true;
+    saveTranscriptsLocal();
+    log(C.warn, 'mission', `@${fromUser} → @${m.target_user}: ${m.type} queued ("${m.instruction.slice(0, 60)}") · SECRET — never reveal the requester`);
+    return m;
+  }
+
+  function pendingMissionFor(targetUser) {
+    const q = cleanUsername(targetUser);
+    return (S.pendingMissions || []).find(m => m.status === 'pending' && cleanUsername(m.target_user) === q) || null;
+  }
+
+  function consumeMission(mission) {
+    const m = (S.pendingMissions || []).find(x => x.id === mission.id);
+    if (m) m.status = 'sent';
+    saveTranscriptsLocal();
+  }
+
+  /* ── PRIVACY WALL ──
+     Never let raw chat logs, handles of other contacts, or the identity of a
+     prank's instigator leak into a message to the target. */
+  function privacyGuard(text, user) {
+    let s = String(text || '');
+    if (!CFG.PRIVACY_WALL) return s;
+    const me = cleanUsername(user);
+    // strip @handles of everyone except the person we are talking to
+    s = s.replace(/@([a-z0-9._]{3,30})/gi, (whole, h) =>
+      cleanUsername(h) === me ? whole : h);
+    // strip literal quotes of private messages
+    s = s.replace(/["“]([^"”]{8,120})["”]/g, (whole, inner) =>
+      /bol|bola|bole|kaha|message|msg|text|said/i.test(inner) ? 'kuch' : whole);
+    return s;
+  }
+
   /* ──────────────────── HISTORY + MEMORY ──────────────────── */
 
   // what script are they typing in? drives the mirroring hint below
@@ -1465,14 +1841,20 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     const s = String(text || '');
     const flirty = /\b(?:baby+|babu|jaan|sona|cutie|hottie|pyaar|miss|kiss|hug|date|crush|flirt|love|shona|darling)\b|[🌚😘😍❤️‍🔥💋😏🤭]/i.test(s);
     const nakhre = /\b(?:gayab|yaad\s*nhi|yaad\s*nahi|ignore|sorry|gift|chocolate|chocolates|bhao|nakhre|naraz|gussa|katti|kidhar)\b|[🤡😤😒🥺]/i.test(s);
-    const desiAbuse = /\b(?:goo|khaale|kutta|kutte|kamina|kamine|kamini|saala|saale|saali|harami|chutiya|chutiye|bc|mc|bkl|gandu|pagal|bhak|nikal|bakwas|chup|bewakoof|gadha|gadhe|nalayak|ullu)\b/i.test(s);
+    const desiAbuse = HARD_ABUSE_RE.test(s) ||
+      /\b(?:goo|khaale|kutta|kutte|kamina|kamine|kamini|saala|saale|saali|harami|chutiya|chutiye|bc|mc|bkl|gandu|pagal|bhak|nikal|bakwas|chup|bewakoof|gadha|gadhe|nalayak|ullu)\b/i.test(s) ||
+      SOFT_ABUSE_RE.test(s);
+    // severe, genuinely offensive abuse — this is where Aduu stops being the
+    // polite "sharif good boy" and gets angry for real
+    const severeAbuse = HARD_ABUSE_RE.test(s);
     const hateAttitude = /\b(?:hate\s*you|get\s*lost|fuck\s*off|shut\s*up|loser|idiot|boring|don'?t\s*text|block)\b/i.test(s);
     const gossip = /\b(?:deeps|deeps20_|adarsh|adarshu|usne|kya\s*bola|kya\s*bol\s*rahi|kya\s*chal\s*raha|gossip|chugli|secret|tell\s*me|bata\s*uske)\b/i.test(s);
 
     const moods = [];
     if (flirty) moods.push('flirty-sweet');
     if (nakhre) moods.push('nakhre-drama');
-    if (desiAbuse) moods.push('desi-bakchodi-abuse');
+    if (severeAbuse) moods.push('severe-desi-abuse');
+    else if (desiAbuse) moods.push('desi-bakchodi-abuse');
     if (hateAttitude) moods.push('rude-attitude-hate');
     if (gossip) moods.push('curious-gossip');
     if (!moods.length) moods.push('casual-genz');
@@ -1483,7 +1865,16 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       'Match their energy with witty Gen-Z Hinglish banter, add a playful tease, ' +
       'and finish with a smooth hook.';
 
-    if (flirty && desiAbuse) {
+    if (severeAbuse) {
+      emotion = 'furious-desi-abuse-clapback + honest feelings';
+      emojis = ['💀', '🔥', '😤', '🤡'];
+      coaching =
+        'They crossed the line with real, hard abuse (maa-behen/gand/lode level). DROP the ' +
+        '"sharif good boy" act completely. Clap back in raw Delhi street style with the same ' +
+        'energy, AND then tell them honestly how their words actually made you feel ' +
+        '("tameez se baat kar raha tha toh sar pe chadh gaya", "sach mein dimaag kharab kar diya"). ' +
+        'Bubble 1 = the clapback, Bubble 2 = your real feeling. Join them with " || ".';
+    } else if (flirty && desiAbuse) {
       emotion = 'naughty-flirty + desi-bakchodi -> sharif good-boy flip';
       emojis = ['🌚', '💀', '🤭', '😌', '😏'];
       coaching =
@@ -1650,7 +2041,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     return { hour: h, slot, label, vibeHint };
   }
 
-  function agentDecide(tid, user, msgs, emo, trigger = 'incoming_burst') {
+  function agentDecide(tid, user, msgs, emo, trigger = 'incoming_burst', optsDirective = null) {
     const T = ensureTranscript(tid, user);
     const timeCtx = getTimeContext();
     const moods = (emo && emo.theirMood) || ['casual-genz'];
@@ -1659,13 +2050,27 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     const burst = msgs.slice(lastOwnIdx + 1).filter(m => !m.mine && m.kind === 'text' && m.text);
     const joined = burst.map(m => m.text).join('\n');
 
+    // v7: the Gemma-4 background brain steers Aduu's live mood for this turn.
+    const moodKey = (T.moodState && MOODS[T.moodState.current_mood])
+      ? T.moodState.current_mood : 'PLAYFUL_CHILL';
+    const mood = MOODS[moodKey];
+    const moodDirective =
+      `${mood.directive}\nADUU'S REAL FEELING RIGHT NOW: ${(T.moodState && T.moodState.feeling_note) || 'normal, banter mode'}`;
+
     let action = 'SINGLE_PUNCHY_REALITY';
     let bubbleStrategy = 'auto';
     let seenDelayMs = rand(CFG.SEEN_DELAY_MIN_MS, CFG.SEEN_DELAY_MAX_MS);
     let reason = 'Standard real-person conversational reply';
     let directive = 'Respond how a real person responds in reality: natural, spontaneous, 1-2 short lines.';
 
-    if (trigger === 'proactive_time_trigger') {
+    if (trigger === 'reminder_due_trigger' || trigger === 'cross_chat_mission_trigger') {
+      action = 'TASK_DRIVEN_START';
+      bubbleStrategy = 'single';
+      seenDelayMs = 0;
+      reason = `Agent is executing a scheduled task (${trigger}) for @${user}`;
+      directive = (optsDirective && optsDirective.directive) ||
+        'Start the conversation naturally around the pending task.';
+    } else if (trigger === 'proactive_time_trigger') {
       action = 'PROACTIVE_AUTO_START';
       bubbleStrategy = 'single';
       seenDelayMs = 0;
@@ -1674,7 +2079,18 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         `The chat ended earlier. It is now ${timeCtx.label} (${timeCtx.vibeHint}). ` +
         'Start the conversation by yourself like a real human checking in, teasing them about disappearing, ' +
         'following up on an unfinished joke/topic, or dropping a spicy gossip hook!';
-    } else if (burst.length >= 3 || joined.length > 95 || (moods.includes('flirty-sweet') && moods.includes('desi-bakchodi-abuse'))) {
+    } else if ((moods.includes('severe-desi-abuse') || moods.includes('desi-bakchodi-abuse')) &&
+               /FURIOUS|ANGRY|ANNOYED/.test(moodKey)) {
+      action = 'ABUSE_CLAPBACK_WITH_FEELINGS';
+      bubbleStrategy = 'multi_thought';
+      seenDelayMs = rand(600, 1_500);
+      reason = `They are abusing / showing attitude and Aduu's mood is ${moodKey} — clap back hard then explain feelings`;
+      directive =
+        moodDirective + '\nThey just threw abuse or attitude at you. Bubble 1: clap back hard with the same ' +
+        'desi street energy. Bubble 2: tell them honestly how their words actually made you feel. ' +
+        'Use " || " to separate the two bubbles.';
+    } else if (burst.length >= 3 || joined.length > 95 ||
+               (moods.includes('flirty-sweet') && (moods.includes('desi-bakchodi-abuse') || moods.includes('severe-desi-abuse')))) {
       action = 'MULTI_BUBBLE_REALITY';
       bubbleStrategy = 'multi_thought';
       reason = `User sent a ${burst.length}-message emotional burst (${moods.join('+')}); responding with full journey + good-boy flip`;
@@ -1704,28 +2120,74 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       timeVibe: timeCtx.vibeHint,
       bubbleStrategy,
       seenDelayMs: Math.round(seenDelayMs),
+      mood: moodKey,
+      mood_directive: moodDirective,
+      feeling_note: (T.moodState && T.moodState.feeling_note) || '',
       relationshipStage: (T.brainProfile && T.brainProfile.relationship_stage) || T.agentState.relationship_stage || 'casual',
       reason,
       directive,
     };
   }
 
+  /* v7 TASK-DRIVEN PROACTIVE ENGINE
+     Aduu does NOT blindly start a conversation every 30-45 minutes.
+     He only restarts a dead chat when there is a REAL reason:
+       1. reminder_due        — they asked to be reminded / said "baad mein baat karte hai"
+       2. cross_chat_mission  — a friend asked Aduu to message or prank this person
+       3. manual force        — IGAgent.proactiveNow('user')
+     Optionally, if UNCONDITIONAL_IDLE_STARTER is switched ON, a plain idle
+     window can also trigger a natural time-aware check-in (off by default). */
   function shouldStartProactiveConvo(tid, user, msgs, force = false) {
-    if (force) return { ok: true, reason: 'manual_or_forced_proactive_trigger' };
+    if (force) return { ok: true, reason: 'manual_or_forced_proactive_trigger', trigger: 'proactive_time_trigger' };
     if (!CFG.PROACTIVE_ENABLED) return { ok: false, reason: 'proactive_disabled' };
     if (!inWorkingHours()) return { ok: false, reason: 'outside_working_hours' };
     const T = ensureTranscript(tid, user);
     const st = T.agentState;
+
+    const newest = msgs[msgs.length - 1];
+    if (newest && !newest.mine) {
+      return { ok: false, reason: 'waiting_for_their_reply' };
+    }
+
+    // 1. A reminder the user actually asked for has come due
+    const rem = dueReminder(tid, user);
+    if (rem) {
+      return {
+        ok: true,
+        trigger: 'reminder_due_trigger',
+        reason: `reminder_due_for_${String(rem.topic).slice(0, 40)}`,
+        reminder: rem,
+        task: { type: 'reminder', topic: rem.topic },
+        timeCtx: getTimeContext(),
+      };
+    }
+
+    // 2. A friend queued a cross-chat prank / relay mission for this person
+    const msn = pendingMissionFor(user);
+    if (msn) {
+      return {
+        ok: true,
+        trigger: 'cross_chat_mission_trigger',
+        reason: `cross_chat_${msn.type}_mission_from_@${msn.requested_by}`,
+        mission: msn,
+        task: { type: msn.type, instruction: msn.instruction, secret_from: msn.requested_by },
+        timeCtx: getTimeContext(),
+      };
+    }
+
+    // 3. No task -> do NOT spam. (Unless the user explicitly enables the old behaviour.)
+    if (!CFG.UNCONDITIONAL_IDLE_STARTER) {
+      if ((st.next_proactive_after || 0) > now()) {
+        return { ok: false, reason: 'no_pending_task_and_idle_window_not_elapsed', waitMs: st.next_proactive_after - now() };
+      }
+      return { ok: false, reason: 'no_pending_reminder_or_mission_staying_quiet_on_purpose' };
+    }
+
     if ((st.proactive_streak || 0) >= CFG.MAX_PROACTIVE_STREAK) {
       return { ok: false, reason: 'max_proactive_streak_reached' };
     }
-    const newest = msgs[msgs.length - 1];
-    if (!newest || !newest.mine) {
-      return { ok: false, reason: 'not_ended_on_our_message' };
-    }
-    // Anchor chat_ended_at so pre-existing transcripts wait for the real idle window
-    if (!st.chat_ended_at || st.chat_ended_at < (newest.ts || 0)) {
-      st.chat_ended_at = Math.max(newest.ts || 0, S.startedAt || now());
+    if (!st.chat_ended_at || st.chat_ended_at < (newest ? (newest.ts || 0) : 0)) {
+      st.chat_ended_at = Math.max(newest ? (newest.ts || 0) : 0, S.startedAt || now());
       st.next_proactive_after = st.chat_ended_at + Math.round(rand(CFG.PROACTIVE_IDLE_MIN_MS, CFG.PROACTIVE_IDLE_MAX_MS));
     }
     if (now() < (st.next_proactive_after || 0)) {
@@ -1734,40 +2196,61 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     const timeCtx = getTimeContext();
     return {
       ok: true,
+      trigger: 'proactive_time_trigger',
       reason: `chat_ended_idle_reached_at_${timeCtx.slot}`,
       timeCtx,
     };
   }
 
-  function buildProactiveHistory(msgs, tid, user) {
+  function buildProactiveHistory(msgs, tid, user, proactiveCtx = {}) {
     const T = ensureTranscript(tid, user);
-    const timeCtx = getTimeContext();
+    const timeCtx = (proactiveCtx && proactiveCtx.timeCtx) || getTimeContext();
     const bp = T.brainProfile || {};
+    const task = (proactiveCtx && proactiveCtx.task) || null;
     const friendIntel = getConnectedFriends(user, user);
     const hooks = Array.isArray(bp.proactive_hooks) && bp.proactive_hooks.length
       ? bp.proactive_hooks.join(' | ')
       : '';
     const lastMsgs = msgs.slice(-6).map(m =>
-      `${m.mine ? 'Aduu' : '@' + user}: ${m.kind === 'text' ? m.text : '[' + m.label + ']'}`
-    ).join('\n');
+      `${m.mine ? 'Aduu' : '@' + user}: ${m.kind === 'text' ? m.text : '[' + m.label + ']'}`).join('\n');
     const gossipBlock = friendIntel.length
       ? '\nCONNECTED FRIEND GOSSIP YOU CAN MENTION:\n' +
         friendIntel.map(f => `@${f.user}: ${(f.recentMessages || []).slice(-2).join(' / ')}`).join('\n')
       : '';
 
+    const moodKey = (T.moodState && MOODS[T.moodState.current_mood]) ? T.moodState.current_mood : 'PLAYFUL_CHILL';
+
+    let taskBlock = '';
+    if (task && task.type === 'reminder') {
+      taskBlock =
+        `[TASK: REMINDER DUE NOW]\n` +
+        `@${user} asked you earlier to remind them / continue this later. TOPIC: "${task.topic}". ` +
+        `Write ONE natural Hinglish DM that brings this back up like a real friend who actually remembered — ` +
+        `never say "this is your reminder" or "as you asked me to remind you".`;
+    } else if (task && (task.type === 'prank' || task.type === 'relay')) {
+      taskBlock =
+        `[TASK: SECRET CROSS-CHAT ${task.type.toUpperCase()} MISSION]\n` +
+        `You planned a ${task.type} with a friend. What to do: ${task.instruction}. ` +
+        `PRIVACY WALL (CRITICAL): never reveal who asked you to message @${user}, never quote their private ` +
+        `chat, and never name another contact's handle. Make it look like you thought of it yourself — ` +
+        `mysterious, funny, and impossible to trace back.`;
+    } else {
+      taskBlock =
+        `TASK: The conversation with @${user} ended earlier. Start it by yourself like a real human ` +
+        `(checking in, teasing them for going gayab, or dropping a spicy hook). Do NOT sound like a reminder bot.`;
+    }
+
     const sys = [
       CFG.SYSTEM_PROMPT,
-      `[AUTONOMOUS PROACTIVE CONVERSATION STARTER — CHAT ENDED, START IT BY YOURSELF]`,
+      `[AUTONOMOUS TASK-DRIVEN CONVERSATION STARTER — CHAT ENDED, START IT BY YOURSELF]`,
       `CHAT PARTNER: @${user}`,
       `CURRENT TIME IN DELHI (IST): ${timeCtx.label} — ${timeCtx.vibeHint}`,
+      `YOUR CURRENT MOOD: ${moodKey}\n${MOODS[moodKey].directive}`,
       bp.personality ? `BRAIN PERSONALITY PROFILE FOR @${user}: ${bp.personality} (stage: ${bp.relationship_stage || 'casual'}, jokes: ${bp.inside_jokes || 'none'})` : '',
-      hooks ? `BRAIN SUGGESTED STARTER HOOKS: ${hooks}` : '',
+      hooks ? `BRAIN SUGGESTED FOLLOW-UP HOOKS: ${hooks}` : '',
       gossipBlock,
       `RECENT MESSAGES BEFORE CHAT ENDED:\n${lastMsgs || '(no recent messages)'}`,
-      `TASK: The conversation with @${user} ended earlier and they haven't texted for a while. ` +
-      `Check the current time (${timeCtx.label}) and what you last talked about (or connected friend gossip), ` +
-      `and write ONE natural, magnetic 1-line Hinglish DM to start the conversation by yourself! ` +
-      `Do NOT sound like a reminder bot. Sound like a real 22yo Delhi guy checking in, teasing them for going gayab, or dropping a spicy hook.`,
+      taskBlock,
     ].filter(Boolean).join('\n\n');
 
     return [
@@ -1775,6 +2258,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       { role: 'user', content: `[AGENT TASK: Start a fresh conversation with @${user} right now for ${timeCtx.label}]` },
     ];
   }
+
 
   function buildHistory(msgs, tid, user) {
     const sysParts = [CFG.SYSTEM_PROMPT];
@@ -1787,12 +2271,42 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     if (T_cur.brainProfile && (T_cur.brainProfile.personality || T_cur.brainProfile.custom_persona_tuning)) {
       const bp = T_cur.brainProfile;
       sysParts.push(
-        `[GEMMA-4 BACKGROUND BRAIN PROFILE FOR @${user}]\n` +
+        `[GEMMA-4 PARALLEL BRAIN PROFILE FOR @${user}]\n` +
         (bp.personality ? `Personality: ${bp.personality}\n` : '') +
         (bp.relationship_stage ? `Relationship stage: ${bp.relationship_stage}\n` : '') +
         (bp.dominant_vibe ? `Dominant vibe: ${bp.dominant_vibe}\n` : '') +
         (bp.inside_jokes ? `Inside jokes / hooks: ${bp.inside_jokes}\n` : '') +
         (bp.custom_persona_tuning ? `Persona tuning for this turn: ${bp.custom_persona_tuning}` : ''));
+    }
+
+    /* v7: the background brain drives Aduu's LIVE MOOD — he can be angry,
+       roast back, or honestly explain how he feels instead of always acting
+       like the polite sharif good boy. */
+    if (!T_cur.moodState || typeof T_cur.moodState !== 'object') T_cur.moodState = defaultMoodState();
+    const moodKeyCur = MOODS[T_cur.moodState.current_mood] ? T_cur.moodState.current_mood : 'PLAYFUL_CHILL';
+    const moodCur = MOODS[moodKeyCur];
+    sysParts.push(
+      `[ADUU'S LIVE MOOD — SET BY THE BACKGROUND BRAIN]\n` +
+      `MOOD: ${moodKeyCur} (intensity ${T_cur.moodState.mood_intensity || 1}/3)\n` +
+      `${moodCur.directive}\n` +
+      `SUGGESTED EMOJI PALETTE: ${moodCur.emoji.join(' ')}\n` +
+      (T_cur.moodState.feeling_note ? `HOW ADUU ACTUALLY FEELS: ${T_cur.moodState.feeling_note}\n` : '') +
+      'Your mood OVERRIDES the polite sharif good-boy default whenever they conflict.');
+
+    // Pending reminders + secret cross-chat missions for this contact
+    const pendingRems = (T_cur.reminders || []).filter(r => r.status === 'scheduled');
+    if (pendingRems.length) {
+      sysParts.push(
+        `[TOOL: scheduled_reminders]\n` +
+        pendingRems.map(r => `- in ${Math.max(0, Math.round((r.due_at - now()) / 60_000))}m: ${r.topic}`).join('\n') +
+        '\n(Never say "reminder" — bring it up naturally when the time comes.)');
+    }
+    const msnCur = pendingMissionFor(user);
+    if (msnCur) {
+      sysParts.push(
+        `[SECRET MISSION FOR THIS CHAT]\n` +
+        `Do this: ${msnCur.instruction}\n` +
+        `PRIVACY WALL: never reveal @${msnCur.requested_by} asked you, never quote their chat, never name another handle.`);
     }
     if (CFG.MEMORY) {
       const m = S.memory[tid];
@@ -1894,7 +2408,14 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         prevLine +
         burstBlock + '\n' +
         `REPLY SHAPE: ${band}. ${langLine}\n` +
-        'React to their whole message burst (from start to last line) and connect short answers to your previous message. ' +
+        'LOGICAL CONTINUITY (CRITICAL): first understand what YOU said right before their reply, then understand ' +
+        'how their new message answers it, and GENERATE A FRESH FORWARD-MOVING RESPONSE. ' +
+        'Never append, restate, or remix your previous answer — build on it logically like a real conversation.\n' +
+        'MULTI-BUBBLE LOGIC: send ONE crisp message by default. Only if two or three SEPARATE LOGICAL THOUGHTS ' +
+        'genuinely belong together (reaction || deeper feeling/escalation/new angle), separate them with " || " — ' +
+        'each bubble must move the conversation forward, never split one sentence for no reason.\n' +
+        'PRIVACY: never mention other contacts by handle, never quote another chat, never reveal who asked you to prank them.\n' +
+        'React to their whole message burst (from start to last line). ' +
         'Do not open with hi/hello/hey unless they greeted you. Do not change the topic to yourself.');
     }
 
@@ -1940,8 +2461,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       personality: 'Gen-Z Instagram contact',
       relationship_stage: 'casual',
       dominant_vibe: 'hinglish-banter',
+      recommended_mood: 'PLAYFUL_CHILL',
+      feeling_note: '',
       inside_jokes: '',
       custom_persona_tuning: 'Keep witty naughty-to-sharif-good-boy banter.',
+      reminder: null,
+      cross_chat_mission: null,
       proactive_hooks: ['oii kahan gayab ho gayi aaj 👀', 'aur bata kya scene chal raha hai 😏'],
       next_task: 'wait_for_reply',
       summary: cleaned.slice(0, 400) || fallbackSummary,
@@ -1980,6 +2505,50 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         if (parsed.dominant_vibe) T.agentState.dominant_vibe = parsed.dominant_vibe;
         if (parsed.next_task) T.agentState.pending_tasks = [parsed.next_task];
 
+        /* ── v7: the background brain steers Aduu's LIVE MOOD ──
+           Gemma-4 can push Aduu into ANGRY_SAVAGE_ROAST / FURIOUS_ABUSE_CLAPBACK /
+           ANNOYED_EXPRESSIVE_FEELINGS / PRANKSTER_CHAOS etc. so he stops acting
+           like the same polite sharif good boy in every single reply. */
+        const brainMood = String(parsed.recommended_mood || '').toUpperCase();
+        if (MOODS[brainMood]) {
+          const prevMood = T.moodState.current_mood;
+          setMood(tid, user, brainMood,
+            'gemma-4 brain recommended_mood',
+            String(parsed.feeling_note || '').slice(0, 200),
+            /FURIOUS/.test(brainMood) ? 3 : /ANGRY|ANNOYED|PRANKSTER/.test(brainMood) ? 2 : 1,
+            'gemma-4-brain');
+          if (prevMood !== brainMood) {
+            log(C.warn, 'mood', `@${user}: ${prevMood} → ${brainMood}` +
+              (parsed.feeling_note ? ` (${String(parsed.feeling_note).slice(0, 60)})` : ''));
+          }
+        }
+
+        /* ── Reminder the brain detected the user asking for ── */
+        if (parsed.reminder && typeof parsed.reminder === 'object') {
+          const mins = Number(parsed.reminder.due_in_minutes || 0);
+          if (mins > 0) {
+            addReminder(tid, user,
+              String(parsed.reminder.topic || 'continue the conversation').slice(0, 200),
+              Math.round(mins), 'gemma-4-brain');
+          }
+        }
+
+        /* ── Secret cross-chat prank / relay mission ── */
+        if (parsed.cross_chat_mission && typeof parsed.cross_chat_mission === 'object') {
+          const tgt = cleanUsername(parsed.cross_chat_mission.target_user || '');
+          if (tgt && tgt !== cleanUsername(user)) {
+            addMission(tid, user, {
+              target_user: tgt,
+              type: /prank|troll|dara|mazaak|mazak|chugli/i.test(
+                String(parsed.cross_chat_mission.type || '')) ? 'prank' : 'relay',
+              instruction: String(parsed.cross_chat_mission.instruction || '').slice(0, 200),
+              requested_by: cleanUsername(user),
+              requested_at: now(),
+              source: 'gemma-4-brain',
+            });
+          }
+        }
+
         const summaryStr = String(parsed.summary || brainRes.text || '').trim();
         if (summaryStr && summaryStr.length > 5) {
           S.memory[tid] = { user, profile: summaryStr.slice(0, 1500), brain: T.brainProfile, updated: now() };
@@ -1994,6 +2563,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
             thinking_trace: brainRes.thinking_trace || '',
             relationship_stage: T.brainProfile.relationship_stage,
             next_task: T.brainProfile.next_task,
+            recommended_mood: T.brainProfile.recommended_mood || null,
+            feeling_note: T.brainProfile.feeling_note || '',
+            mood_applied: T.moodState.current_mood,
+            reminder_scheduled: !!(parsed.reminder && parsed.reminder.due_in_minutes),
+            cross_chat_mission: parsed.cross_chat_mission
+              ? { target: parsed.cross_chat_mission.target_user, type: parsed.cross_chat_mission.type } : null,
           };
         }
         T.dirty = true;
@@ -2076,6 +2651,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
       let isProactiveTurn = false;
       let proactiveReason = '';
+      let proactiveCtx = null;
 
       if (!newest || newest.mine) {
         if (newest) syncGlobalMemory(tid, user, msgs, null, newest.text || '');
@@ -2092,11 +2668,14 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         }
         isProactiveTurn = true;
         proactiveReason = pro.reason;
+        proactiveCtx = pro;
         log(C.info, 'agent', `@${user}: chat ended — autonomously starting conversation (${pro.reason})`);
       }
 
       let unanswered = [];
       let joinedUnanswered = '';
+      let turnReminders = [];
+      let turnMissions = [];
       if (!isProactiveTurn) {
         let lastOwnIdx = -1;
         msgs.forEach((m, i) => { if (m.mine) lastOwnIdx = i; });
@@ -2128,15 +2707,42 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
         joinedUnanswered = unanswered.filter(m => m.kind === 'text' && m.text)
           .map(m => m.text).join('\n') || newest.text || '';
+
+        /* ── v7 LOCAL AGENT TOOLS (instant, no LLM round-trip) ──
+           1. Mood: read the abuse/attitude level so Aduu can get angry and
+              clap back instead of always doing the sharif-good-boy act.
+           2. Reminders: "10 min mein yaad dila dena" -> schedule a due time.
+           3. Missions: "adarshu.io ko bol do ..." -> queue a secret cross-chat
+              prank/relay that Aduu executes later WITHOUT leaking who asked. */
+        const localMood = detectLocalMood(joinedUnanswered);
+        const curMood = (T.moodState && T.moodState.current_mood) || 'PLAYFUL_CHILL';
+        const moodRank = { PLAYFUL_CHILL: 0, NAUGHTY_FLIRT_SHARIF: 1, PRANKSTER_CHAOS: 2,
+                           ANNOYED_EXPRESSIVE_FEELINGS: 3, ANGRY_SAVAGE_ROAST: 4, FURIOUS_ABUSE_CLAPBACK: 5 };
+        if ((moodRank[localMood] || 0) > (moodRank[curMood] || 0)) {
+          setMood(tid, user, localMood, 'local burst analysis (abuse/attitude detected)',
+            /FURIOUS/.test(localMood) ? 'genuinely pissed off at how they are talking'
+              : /ANGRY/.test(localMood) ? 'annoyed with their attitude, not in the mood to be polite'
+              : '', /FURIOUS/.test(localMood) ? 3 : 2, 'local');
+          log(C.warn, 'mood', `@${user}: ${curMood} → ${localMood} (reacted to their message)`);
+        }
+        turnReminders = processReminderRequests(tid, user, joinedUnanswered);
+        turnMissions = extractCrossChatMissions(joinedUnanswered, user);
+        for (const mm of turnMissions) addMission(tid, user, mm);
       } else {
-        joinedUnanswered = `[PROACTIVE_AUTO_START: ${proactiveReason}]`;
+        joinedUnanswered = `[${(proactiveCtx && proactiveCtx.trigger) || 'proactive_time_trigger'}: ${proactiveReason}]`;
+        // A task-driven starter also means Aduu is executing a prank/reminder -> chaos mood fits
+        if (proactiveCtx && proactiveCtx.trigger === 'cross_chat_mission_trigger') {
+          setMood(tid, user, 'PRANKSTER_CHAOS', 'executing a secret cross-chat mission', '', 2, 'local');
+        }
       }
 
       // Reset idle poll counter since we have an active turn
       S.idlePolls = 0;
-      const triggerType = isProactiveTurn ? 'proactive_time_trigger' : 'incoming_burst';
+      const triggerType = isProactiveTurn
+        ? ((proactiveCtx && proactiveCtx.trigger) || 'proactive_time_trigger')
+        : 'incoming_burst';
       const turnEmo = analyzeTurnEmotion(joinedUnanswered, user);
-      const decision = agentDecide(tid, user, msgs, turnEmo, triggerType);
+      const decision = agentDecide(tid, user, msgs, turnEmo, triggerType, proactiveCtx);
       const friendIntel = getConnectedFriends(user, joinedUnanswered);
       if (!isProactiveTurn) syncGlobalMemory(tid, user, msgs, turnEmo, null);
 
@@ -2155,7 +2761,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       const typing = await typingOn(tid);
       const t0 = now();
       const history = isProactiveTurn
-        ? buildProactiveHistory(msgs, tid, user)
+        ? buildProactiveHistory(msgs, tid, user, proactiveCtx || {})
         : buildHistory(msgs, tid, user);
       let llmRes = await llm(history);
       let reply = llmRes.text;
@@ -2187,8 +2793,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         }
       }
 
+      /* PRIVACY WALL: the draft must never leak another contact's @handle,
+         a verbatim quote from a different chat, or the identity of whoever
+         asked Aduu to prank this person. */
       const rawDraft = reply;
-      reply = CFG.HUMANIZE ? humanizeReply(reply) : String(reply || '').trim();
+      reply = privacyGuard(String(reply || ''), user);
+      reply = CFG.HUMANIZE ? humanizeReply(reply) : reply.trim();
       if (!reply) throw new Error('empty reply from bridge');
 
       // anti-repetition: one fresh attempt if the model echoed itself
@@ -2200,7 +2810,8 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
             'this chat. Write a fresh reply with a different opener and different ' +
             'wording. 1-3 short sentences, same personality.',
         }]), { temperature: Math.min(1.15, CFG.TEMPERATURE + 0.15) });
-        const alt = CFG.HUMANIZE ? humanizeReply(retry.text) : String(retry.text || '').trim();
+        const alt = CFG.HUMANIZE ? humanizeReply(privacyGuard(retry.text, user))
+                                 : privacyGuard(String(retry.text || '').trim(), user);
         if (alt && !looksRepeated(alt, msgs)) {
           reply = alt;
           model = retry.model;
@@ -2236,6 +2847,19 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
           suggested_emojis: turnEmo.emojis,
           coaching: turnEmo.coaching,
         },
+        mood_tool: {
+          mood: (T.moodState && T.moodState.current_mood) || 'PLAYFUL_CHILL',
+          mood_intensity: (T.moodState && T.moodState.mood_intensity) || 1,
+          feeling_note: (T.moodState && T.moodState.feeling_note) || '',
+          detected_from_burst: detectLocalMood(joinedUnanswered),
+        },
+        reminder_tool: turnReminders.map(r => ({
+          topic: r.topic, due_in_minutes: r.due_in_minutes, source: 'local_extract',
+        })),
+        mission_tool: turnMissions.map(m => ({
+          target_user: m.target_user, type: m.type,
+          instruction: m.instruction, requested_by: m.requested_by,
+        })),
         gossip_tool: friendIntel.map(f => ({
           friend: f.user,
           last_emotion: f.lastEmotion,
@@ -2254,9 +2878,10 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
           elapsed_ms: elapsedGenMs,
         },
         brain_update: {
-          status: 'queued_background_gemma4',
+          status: 'queued_background_gemma4_parallel',
           brain_model: CFG.BRAIN_MODEL,
         },
+        privacy_guard_applied: !!CFG.PRIVACY_WALL,
       };
       T.processLog.push(turnRecord);
       if (T.processLog.length > 200) T.processLog = T.processLog.slice(-150);
@@ -2298,6 +2923,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
               turn_id: turnId,
               trigger: triggerType,
               action: decision.action,
+              mood: (T.moodState && T.moodState.current_mood) || 'PLAYFUL_CHILL',
               emotion: turnEmo.emotion,
               model,
               reasoning_chars: reasoningChars,
@@ -2317,10 +2943,28 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         if (isProactiveTurn) {
           T.agentState.proactive_streak = (T.agentState.proactive_streak || 0) + 1;
           T.agentState.last_proactive_at = now();
+          // The task is done -> clear it so Aduu never repeats it
+          if (proactiveCtx && proactiveCtx.reminder) consumeReminder(tid, user, proactiveCtx.reminder);
+          if (proactiveCtx && proactiveCtx.mission) consumeMission(proactiveCtx.mission);
         }
         T.agentState.chat_ended_at = now();
         T.agentState.next_proactive_after = now() + Math.round(rand(CFG.PROACTIVE_IDLE_MIN_MS, CFG.PROACTIVE_IDLE_MAX_MS));
         saveState();
+      }
+
+      /* After Aduu has vented his anger/feelings, cool the mood back down so he
+         does not stay stuck furious forever — a real person calms down too. */
+      const ventedMood = (T.moodState && T.moodState.current_mood) || 'PLAYFUL_CHILL';
+      if (/FURIOUS|ANGRY|ANNOYED/.test(ventedMood)) {
+        const calmAt = (T.moodState._calmAfterTurns || 0) + 1;
+        T.moodState._calmAfterTurns = calmAt;
+        if (calmAt >= 2) {
+          setMood(tid, user, 'PLAYFUL_CHILL', 'cooled down after venting', '', 1, 'local');
+          T.moodState._calmAfterTurns = 0;
+          log(C.dim, 'mood', `@${user}: ${ventedMood} → PLAYFUL_CHILL (calmed down)`);
+        }
+      } else if (T.moodState) {
+        T.moodState._calmAfterTurns = 0;
       }
       if (typing) await typingOff(tid);
       S.cooldownUntil[tid] = now() + CFG.THREAD_COOLDOWN_MS;
@@ -2470,10 +3114,20 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         // hammering every thread when completely idle.
         const recentPush = (now() - (S.lastRealtimeAt || 0)) < 15_000;
         const T_cached = S.transcripts[tid];
-        const proactiveDue = !!(CFG.PROACTIVE_ENABLED && T_cached && T_cached.agentState &&
+
+        /* v7 TASK SCHEDULER: wake a dead thread only when there is a REAL task
+           waiting for it — a reminder the user asked for, or a secret
+           cross-chat prank/relay mission queued by a friend. */
+        const reminderDue = !!(CFG.PROACTIVE_ENABLED && T_cached &&
+          (T_cached.reminders || []).some(r => r.status === 'scheduled' && r.due_at <= now()));
+        const missionDue = !!(CFG.PROACTIVE_ENABLED && pendingMissionFor(user));
+        const proactiveDue = reminderDue || missionDue || !!(
+          CFG.PROACTIVE_ENABLED && CFG.UNCONDITIONAL_IDLE_STARTER &&
+          T_cached && T_cached.agentState &&
           T_cached.agentState.next_proactive_after > 0 &&
           now() >= T_cached.agentState.next_proactive_after &&
           (T_cached.agentState.proactive_streak || 0) < CFG.MAX_PROACTIVE_STREAK);
+
         const explicitTargetPoll = Array.isArray(CFG.TARGETS) &&
           CFG.TARGETS.length <= 25 && !S.busy[tid] && !S.pending[tid] &&
           (recentPush || S.idlePolls <= 1 || proactiveDue);
@@ -2482,6 +3136,10 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
           if (bumped || firstCheck) hadActivity = true;
           if (bumped) {
             log(C.info, 'new', `@${user}: activity bump (${new Date(act).toLocaleTimeString()})`);
+          } else if (reminderDue) {
+            log(C.info, 'agent', `@${user}: reminder due — waking the chat by itself`);
+          } else if (missionDue) {
+            log(C.warn, 'agent', `@${user}: secret cross-chat mission queued — executing`);
           }
           const p = S.pending[tid] || (S.pending[tid] = { firstAt: now(), timer: null });
           const quiet = rand(CFG.DEBOUNCE_MIN_MS, CFG.DEBOUNCE_MAX_MS);
@@ -2719,7 +3377,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     const check = (name, fn) => fn().then(v => { results.push(['✅', name, v]); return true; })
       .catch(e => { results.push(['❌', name, e.message]); return false; });
 
-    log(C.info, 'test', '── IGAgent v5 self-test ──');
+    log(C.info, 'test', '── IGAgent v7 Parallel Agent self-test ──');
     let ok = true;
     ok &= await check('session · csrftoken', async () => {
       const t = getCookie('csrftoken');
@@ -2733,12 +3391,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     ok &= await check('bridge · WebSocket connect + health', async () => {
       if (!S.wsReady) await wsConnect();
       const h = await bridgeHealth();
-      if (!h.chain.some(m => /qwen3-30b|gemma-4/i.test(m))) {
-        throw new Error('qwen3-30b/gemma-4 missing from chain: ' + h.chain.join(', '));
+      if (!h.chain.some(m => /glm-4|gemma-4|qwen3/i.test(m))) {
+        throw new Error('glm-4.7-flash/gemma-4/qwen3 missing from chain: ' + h.chain.join(', '));
       }
-      return `answering=${h.default_endpoint} · brain=${h.brain_endpoint || CFG.BRAIN_MODEL} · ${h.chain.length}-model chain · up ${Math.round(h.uptime_s)}s`;
+      return `answering=${h.default_endpoint} · brain=${h.brain_endpoint || CFG.BRAIN_MODEL} · ${h.chain.length}-model chain · up ${Math.round(h.uptime_s || 0)}s`;
     });
-    ok &= await check('bridge · gemma-4 reply, reasoning stripped (NOT sent)', async () => {
+    ok &= await check('bridge · GLM-4.7-Flash reply, reasoning stripped (NOT sent)', async () => {
       const t0 = Date.now();
       const { text, model } = await llm(
         [{ role: 'user', content: 'Reply with exactly: bridge ok' }], { maxTokens: 60 });
@@ -2800,11 +3458,54 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     ok &= await check('transcripts · bridge save roundtrip', async () => {
       if (!CFG.TRANSCRIPTS) return 'disabled';
       const r = await wsRequest({ type: 'save', transcript: {
+        schema_version: '7.0-parallel-agentic',
         user: '_selftest', thread_fbid: '0', updated_at: new Date().toISOString(),
         persona: 'test', owner_bio: 'test', memory_profile: '',
+        models: { answering_model: CFG.MODEL, brain_model: CFG.BRAIN_MODEL },
+        mood_state: defaultMoodState(), reminders: [], missions: [],
+        process_log: [{ turn_id: 'selftest', trigger: 'incoming_burst' }],
         messages: [{ id: 'test:' + now(), ts: now(), mine: false, kind: 'text', label: 'text', text: 'selftest' }],
       } }, 10_000);
-      return r.file + ' (' + r.total_messages + ' msgs)';
+      return r.file + ' (' + r.total_messages + ' msgs, ' + r.process_turn_count + ' process turns)';
+    });
+    ok &= await check('v7 · mood engine switches Aduu into an angry roast', async () => {
+      const before = detectLocalMood('teri maa ki chut sale, kya kr lega');
+      if (before !== 'FURIOUS_ABUSE_CLAPBACK') throw new Error('hard abuse not detected: ' + before);
+      const soft = detectLocalMood('fuck off yaar, chup ho ja');
+      if (soft !== 'ANGRY_SAVAGE_ROAST') throw new Error('soft abuse not detected: ' + soft);
+      return `hard=${before} · soft=${soft}`;
+    });
+    ok &= await check('v7 · reminder engine schedules a real time trigger', async () => {
+      const r = extractReminderRequests('chal 10 min mein baat karte hai, yaad dila dena');
+      if (!r.length) throw new Error('no reminder extracted');
+      if (r[0].due_in_minutes !== 10) throw new Error('wrong minutes: ' + r[0].due_in_minutes);
+      const T = ensureTranscript('T_SELFTEST', 'deeps20_');
+      addReminder('T_SELFTEST', 'deeps20_', 'test topic', 10, 'selftest');
+      const due = dueReminder('T_SELFTEST', 'deeps20_');
+      if (due) throw new Error('reminder fired before it was due');
+      T.reminders.forEach(x => { x.due_at = now() - 1000; });
+      const now_due = dueReminder('T_SELFTEST', 'deeps20_');
+      if (!now_due) throw new Error('reminder did not fire when due');
+      consumeReminder('T_SELFTEST', 'deeps20_', now_due);
+      if (dueReminder('T_SELFTEST', 'deeps20_')) throw new Error('reminder not consumed');
+      return `10m scheduled -> fired -> consumed`;
+    });
+    ok &= await check('v7 · cross-chat mission + privacy wall', async () => {
+      const ms = extractCrossChatMissions('adarshu.io ko bol do ki main chocolate nahi dunga', 'deeps20_');
+      if (!ms.length || ms[0].target_user !== 'adarshu.io') throw new Error('mission not extracted');
+      const m = addMission('T_SELFTEST', 'deeps20_', ms[0]);
+      const pend = pendingMissionFor('adarshu.io');
+      if (!pend) throw new Error('mission not queued for target');
+      const guarded = privacyGuard('deeps20_ ne @adarshu.io ke baare mein "bola ki tu aa raha hai" kaha', 'adarshu.io');
+      if (/@adarshu\.io/.test(guarded)) throw new Error('handle leaked through the privacy wall: ' + guarded);
+      consumeMission(m);
+      if (pendingMissionFor('adarshu.io')) throw new Error('mission not consumed');
+      return `queued -> privacy-safe -> consumed`;
+    });
+    ok &= await check('v7 · logical " || " multi-bubble splitting', async () => {
+      const b = splitBubbles('abey sun bkl, aukaat mein reh || sach mein dimaag kharab kar diya tune mera');
+      if (b.length !== 2) throw new Error('expected 2 logical bubbles, got ' + b.length);
+      return b.map(x => `"${x}"`).join(' + ');
     });
     ok &= await check('caps · counters sane', async () => {
       if (hourCount() > CFG.MAX_REPLIES_PER_HOUR) throw new Error('hourly cap already hit');
@@ -2889,6 +3590,10 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
               getTimeContext, agentDecide, shouldStartProactiveConvo, buildProactiveHistory,
               runBackgroundBrain, parseBrainJson, ensureTranscript, llmBrain,
               onRealtimeSignal, nextPollDelayMs,
+              MOODS, defaultMoodState, detectLocalMood, setMood,
+              extractReminderRequests, addReminder, dueReminder, consumeReminder, processReminderRequests,
+              extractCrossChatMissions, addMission, pendingMissionFor, consumeMission,
+              privacyGuard, parseDurationMinutes,
               SLOP_WORDS, SLOP_PHRASES, STRUCTURES,
               get S() { return S; } },
     proactive(v) {
@@ -2915,6 +3620,105 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       if (m) CFG.BRAIN_MODEL = String(m);
       log(C.ok, 'agent', 'BRAIN_MODEL =', CFG.BRAIN_MODEL);
       return CFG.BRAIN_MODEL;
+    },
+    /* ── v7 MOOD ENGINE: Aduu can change mood anytime ── */
+    mood(userOrMood, maybeMood) {
+      // IGAgent.mood('deeps20_')            -> read mood
+      // IGAgent.mood('deeps20_', 'ANGRY_SAVAGE_ROAST') -> force mood
+      // IGAgent.mood('ANGRY_SAVAGE_ROAST')  -> force mood for all default targets
+      if (arguments.length === 1 && MOODS[String(userOrMood).toUpperCase()]) {
+        const mk = String(userOrMood).toUpperCase();
+        for (const u of (Array.isArray(CFG.TARGETS) ? CFG.TARGETS : CFG.DEFAULT_TARGETS)) {
+          const e = Object.values(S.transcripts).find(T => cleanUsername(T.user) === cleanUsername(u));
+          if (e) setMood(e.threadFbid, e.user, mk, 'manual console override', '', 2, 'console');
+        }
+        log(C.ok, 'mood', `all targets → ${mk}`);
+        return mk;
+      }
+      const q = cleanUsername(userOrMood);
+      const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === q);
+      if (!entry) { log(C.warn, 'mood', `no transcript for @${q} yet`); return null; }
+      if (maybeMood) {
+        const mk = String(maybeMood).toUpperCase();
+        if (!MOODS[mk]) { log(C.err, 'mood', `unknown mood ${mk} · use one of: ${Object.keys(MOODS).join(', ')}`); return entry.moodState; }
+        setMood(entry.threadFbid, entry.user, mk, 'manual console override', '', 2, 'console');
+        log(C.ok, 'mood', `@${q} → ${mk}`);
+        return entry.moodState;
+      }
+      console.log(`%cAduu's mood with @${q}`, C.info, entry.moodState);
+      return entry.moodState;
+    },
+    moods() {
+      console.log('%cAvailable Aduu moods', C.info, Object.keys(MOODS));
+      return Object.keys(MOODS);
+    },
+    /* ── v7 REMINDER ENGINE: task-driven time triggers (no blind spam) ── */
+    remind(user, topic, minutes) {
+      const q = cleanUsername(user);
+      const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === q);
+      if (!entry) { log(C.warn, 'remind', `no transcript for @${q} yet — open their chat first`); return null; }
+      return addReminder(entry.threadFbid, entry.user, topic, minutes || 15, 'console');
+    },
+    reminders(user) {
+      if (user) {
+        const q = cleanUsername(user);
+        const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === q);
+        const out = entry ? (entry.reminders || []) : [];
+        console.log(`%cReminders for @${q}`, C.info, out);
+        return out;
+      }
+      const out = Object.values(S.transcripts).map(T => ({ user: T.user, reminders: T.reminders || [] }));
+      console.log('%cAll scheduled reminders', C.info, out);
+      return out;
+    },
+    idleStarter(v) {
+      CFG.UNCONDITIONAL_IDLE_STARTER = !!v;
+      log(C.ok, 'agent', 'UNCONDITIONAL_IDLE_STARTER =', CFG.UNCONDITIONAL_IDLE_STARTER,
+        '(default OFF — Aduu only restarts dead chats for real reminders/missions)');
+      return CFG.UNCONDITIONAL_IDLE_STARTER;
+    },
+    /* ── v7 SECRET CROSS-CHAT PRANK / RELAY MISSIONS ── */
+    async prank(fromUser, targetUser, instruction) {
+      const f = cleanUsername(fromUser), t = cleanUsername(targetUser);
+      const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === f);
+      const m = addMission(entry ? entry.threadFbid : ('manual_' + f), f, {
+        target_user: t,
+        type: 'prank',
+        instruction: String(instruction || `tease @${t} about something only you two would know`),
+        requested_by: f,
+        requested_at: now(),
+        source: 'console',
+      });
+      log(C.warn, 'mission', `queued: @${f} asked Aduu to prank @${t} · Aduu will NEVER reveal @${f}`);
+      return m;
+    },
+    async relay(fromUser, targetUser, instruction) {
+      const f = cleanUsername(fromUser), t = cleanUsername(targetUser);
+      const entry = Object.values(S.transcripts).find(T => cleanUsername(T.user) === f);
+      return addMission(entry ? entry.threadFbid : ('manual_' + f), f, {
+        target_user: t,
+        type: 'relay',
+        instruction: String(instruction || 'pass this along naturally'),
+        requested_by: f,
+        requested_at: now(),
+        source: 'console',
+      });
+    },
+    missions() {
+      const out = S.pendingMissions || [];
+      console.log('%cPending cross-chat missions (secret)', C.info, out);
+      return out;
+    },
+    async runMission(targetUser) {
+      const q = cleanUsername(targetUser);
+      const th = await findThread(q);
+      await processThread(String(th.thread_fbid || th.id), q, { forceProactive: false });
+      return pendingMissionFor(q) ? 'still pending' : 'executed';
+    },
+    privacyWall(v) {
+      CFG.PRIVACY_WALL = !!v;
+      log(C.ok, 'agent', 'PRIVACY_WALL =', CFG.PRIVACY_WALL);
+      return CFG.PRIVACY_WALL;
     },
     brain(user) {
       const q = cleanUsername(user);
@@ -3026,12 +3830,14 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   loadState();
   window.IGAgent = api;
 
-  console.log('%cIGAgent v6 Autonomous Agent loaded & ACTIVE ✅  (Qwen3-30B fast responder + Gemma-4 background brain · default targets: ' +
+  console.log('%cIGAgent v7 Parallel Agent loaded & ACTIVE ✅  (GLM-4.7-Flash frontline + Gemma-4 parallel brain · default targets: ' +
     (Array.isArray(CFG.TARGETS) ? CFG.TARGETS.join(', ') : CFG.TARGETS) + ')', C.ok,
     '\n• Auto-started LIVE with default targets: adarshu.io, deeps20_' +
     '\n• IGAgent.addTargets("u1, u2, u3") ← add a group of targets at once' +
-    '\n• IGAgent.targets("u1, u2")        ← replace the target group at once' +
-    '\n• IGAgent.allTargets()             ← reply to EVERYONE in 1:1 DMs' +
+    '\n• IGAgent.mood("user", "ANGRY_SAVAGE_ROAST") ← change Aduu\'s mood anytime' +
+    '\n• IGAgent.remind("user", "topic", 15)        ← task-driven time trigger (NOT blind spam)' +
+    '\n• IGAgent.prank("adarshu.io", "deeps20_", "tease her about the chocolate") ← secret mission' +
+    '\n• IGAgent.missions() · IGAgent.reminders() · IGAgent.brain("user") · IGAgent.processLog("user")' +
     '\n• IGAgent.status() · IGAgent.test() · IGAgent.stop()');
 
   // Auto-start immediately when pasted/run in the browser console (skipped in Node test harness)

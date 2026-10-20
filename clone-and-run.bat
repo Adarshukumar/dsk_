@@ -1,9 +1,9 @@
 @echo off
 setlocal EnableDelayedExpansion
-title IG-Agent v5 — Clone and Run (Gemma-4 + Aduu)
+title IG-Agent v7 — Clone and Run (GLM-4.7-Flash + Gemma-4 Brain)
 
 echo ======================================================================
-echo   IG-Agent v5 — Auto Clone, Setup and Start
+echo   IG-Agent v7 — Auto Clone, Setup and Start
 echo   Default active targets: adarshu.io, deeps20_
 echo ======================================================================
 

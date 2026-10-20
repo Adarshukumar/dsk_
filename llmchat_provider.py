@@ -1,601 +1,554 @@
 """
-══════════════════════════════════════════════════════════════
-  💬  LLMChat Provider  (Async)
+Async llmchat.in SSE provider using curl_cffi with Chrome TLS impersonation.
 
-  Async streaming text generation via llmchat.in
-  25 models · Thinking model support · Zero setup
-
-  Uses curl_cffi for browser-like HTTP requests.
+v7 Multi-Model Architecture (GLM-4.7-Flash + Gemma-4-26B Brain + Qwen3-30B):
+  - Primary Answering & Creative Agent Model:
+      `@cf/zai-org/glm-4.7-flash` (`zai-org/glm-4.7-flash`)
+      Tuned with minimal-thinking prompt enforcement (`THINK_MIN_BUDGET = 2500`)
+      and native SSE parser support for GLM-4.7-Flash chunks:
+        `delta: {"reasoning": "<tok>", "reasoning_content": "<tok>"}`
+        followed by `delta: {"content": "<tok>", "reasoning_content": null}`
+        and final `{"response": "", "usage": {...}}` + `data: [DONE]`.
+  - Background Brain & Strategy Model:
+      `@cf/google/gemma-4-26b-a4b-it` (`google/gemma-4-26b-a4b-it`)
+      Handles parallel psychological profiling, mood shifts, reminder extraction,
+      cross-chat prank/relay planning, and privacy filtering.
+  - Built-in Glitch / Punctuation-Flood Filter:
+      Rejects model glitches like `"!!!!!!!..."` and automatically falls back
+      to the next model in `FALLBACK_CHAIN`.
 """
 
 from __future__ import annotations
 
-import json
 import asyncio
+import json
+import logging
 import os
-import random
+import re
 import time
-import threading
-from dataclasses import dataclass
-from typing import Optional, AsyncGenerator, Union, List, Dict, Any
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator
 
-from curl_cffi.requests import Session as CurlSession
+from curl_cffi.requests import AsyncSession
 
+log = logging.getLogger("llmchat_provider")
 
-# ═══════════════════════════════════════════════════════════
-# §1 — MODEL DATACLASS
-# ═══════════════════════════════════════════════════════════
-@dataclass(frozen=True)
-class LLMModel:
-    """Single model definition."""
-    tag: str
-    name: str
-    max_tokens: int
+# ---------------------------------------------------------------------------
+# Endpoint & Verified Model Registry (v7 GLM-4.7-Flash + Gemma-4 + Qwen3)
+# ---------------------------------------------------------------------------
 
-    @property
-    def endpoint(self) -> str:
-        return f"{self.tag}/{self.name}"
+LLMCHAT_BASE_URL = os.environ.get("LLMCHAT_BASE_URL", "https://llmchat.in")
+INFERENCE_URL = f"{LLMCHAT_BASE_URL.rstrip('/')}/inference/stream"
 
-    @property
-    def short(self) -> str:
-        return self.name.split("/")[-1]
-
-    def __str__(self) -> str:
-        return self.name
-
-
-# ═══════════════════════════════════════════════════════════
-# §2 — MODEL REGISTRY
-# ═══════════════════════════════════════════════════════════
-MODELS: tuple[LLMModel, ...] = (
-    # primary answering model: Qwen3 30B A3B FP8 — streams <think>...</think> in delta.content
-    LLMModel("@cf", "qwen/qwen3-30b-a3b-fp8",                    32_500),
-    # background brain model: Gemma 4 26B A4B — streams delta.reasoning_content, then delta.content
-    LLMModel("@cf", "google/gemma-4-26b-a4b-it",                  200_000),
-    LLMModel("@cf", "moonshotai/kimi-k2.5",                       200_000),
-    LLMModel("@cf", "meta/llama-3.1-70b-instruct",                23_500),
-    LLMModel("@cf", "qwen/qwq-32b",                               23_500),
-    LLMModel("@cf", "meta/llama-3.3-70b-instruct-fp8-fast",       23_500),
-    LLMModel("@cf", "qwen/qwen2.5-coder-32b-instruct",            32_500),
-    LLMModel("@hf", "meta-llama/meta-llama-3-8b-instruct",         7_500),
-    LLMModel("@cf", "meta/llama-3-8b-instruct",                    7_500),
-    LLMModel("@cf", "meta/llama-2-7b-chat-int8",                   8_000),
-    LLMModel("@cf", "meta/llama-3-8b-instruct-awq",                8_000),
-    LLMModel("@cf", "google/gemma-2b-it-lora",                     8_000),
-    LLMModel("@cf", "google/gemma-3-12b-it",                      79_500),
-    LLMModel("@cf", "meta/llama-3.2-1b-instruct",                 59_500),
-    LLMModel("@cf", "deepseek-ai/deepseek-r1-distill-qwen-32b",   79_500),
-    LLMModel("@hf", "mistral/mistral-7b-instruct-v0.2",           14_500),
-    LLMModel("@cf", "aisingapore/gemma-sea-lion-v4-27b-it",      100_000),
-    LLMModel("@cf", "mistral/mistral-7b-instruct-v0.2-lora",      14_500),
-    LLMModel("@cf", "meta/llama-4-scout-17b-16e-instruct",       100_000),
-    LLMModel("@cf", "meta/llama-3.2-3b-instruct",                 79_500),
-    LLMModel("@cf", "defog/sqlcoder-7b-2",                         9_500),
-    LLMModel("@cf", "ibm-granite/granite-4.0-h-micro",           100_000),
-    LLMModel("@cf", "zai-org/glm-4.7-flash",                     100_000),
-    LLMModel("@cf", "mistralai/mistral-small-3.1-24b-instruct",   76_500),
-    LLMModel("@cf", "meta/llama-3.1-8b-instruct",                100_000),
+# Primary answering model: @cf/zai-org/glm-4.7-flash (with minimal thinking)
+DEFAULT_MODEL = os.environ.get(
+    "LLMCHAT_MODEL",
+    "zai-org/glm-4.7-flash",
 )
 
-_MODEL_MAP: dict[str, LLMModel] = {m.name: m for m in MODELS}
-
-_THINKING_MODELS: frozenset[str] = frozenset({
+# Secondary / Background Brain model: @cf/google/gemma-4-26b-a4b-it
+DEFAULT_BRAIN_MODEL = os.environ.get(
+    "LLMCHAT_BRAIN_MODEL",
     "google/gemma-4-26b-a4b-it",
-    "moonshotai/kimi-k2.5",
-    "qwen/qwq-32b",
-    "deepseek-ai/deepseek-r1-distill-qwen-32b",
-    "qwen/qwen3-30b-a3b-fp8",
+)
+
+# Verified working models on llmchat.in (/inference/stream)
+MODEL_REGISTRY: dict[str, dict[str, Any]] = {
+    "zai-org/glm-4.7-flash": {
+        "id": "@cf/zai-org/glm-4.7-flash",
+        "name": "GLM 4.7 Flash",
+        "provider": "Z.ai",
+        "thinking": True,
+        "low_think": True,
+        "context": 131_072,
+    },
+    "qwen/qwen3-30b-a3b-fp8": {
+        "id": "@cf/qwen/qwen3-30b-a3b-fp8",
+        "name": "Qwen3 30B A3B",
+        "provider": "Alibaba",
+        "thinking": True,
+        "low_think": True,
+        "context": 32_768,
+    },
+    "google/gemma-4-26b-a4b-it": {
+        "id": "@cf/google/gemma-4-26b-a4b-it",
+        "name": "Gemma 4 26B A4B",
+        "provider": "Google",
+        "thinking": True,
+        "context": 32_768,
+    },
+    "meta/llama-3.3-70b-instruct-fp8-fast": {
+        "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "name": "Llama 3.3 70B",
+        "provider": "Meta",
+        "thinking": False,
+        "context": 131_072,
+    },
+    "meta/llama-4-scout-17b-16e-instruct": {
+        "id": "@cf/meta/llama-4-scout-17b-16e-instruct",
+        "name": "Llama 4 Scout",
+        "provider": "Meta",
+        "thinking": False,
+        "context": 131_072,
+    },
+    "ibm-granite/granite-4.0-h-micro": {
+        "id": "@cf/ibm-granite/granite-4.0-h-micro",
+        "name": "Granite 4.0 Micro",
+        "provider": "IBM",
+        "thinking": False,
+        "context": 131_072,
+    },
+    "mistralai/mistral-small-3.1-24b-instruct": {
+        "id": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+        "name": "Mistral Small 3.1",
+        "provider": "Mistral",
+        "thinking": False,
+        "context": 128_000,
+    },
+    "nvidia/nemotron-3-120b-a12b": {
+        "id": "@cf/nvidia/nemotron-3-120b-a12b",
+        "name": "Nemotron 3 120B",
+        "provider": "NVIDIA",
+        "thinking": True,
+        "context": 32_768,
+    },
+    "google/gemma-3-12b-it": {
+        "id": "@cf/google/gemma-3-12b-it",
+        "name": "Gemma 3 12B",
+        "provider": "Google",
+        "thinking": False,
+        "context": 8_192,
+    },
+}
+
+# Ordered fallback chain if the requested model is rate-limited, empty, or glitched
+FALLBACK_CHAIN: list[str] = [
     "zai-org/glm-4.7-flash",
-})
+    "qwen/qwen3-30b-a3b-fp8",
+    "google/gemma-4-26b-a4b-it",
+    "meta/llama-3.3-70b-instruct-fp8-fast",
+    "meta/llama-4-scout-17b-16e-instruct",
+    "mistralai/mistral-small-3.1-24b-instruct",
+    "google/gemma-3-12b-it",
+]
 
-
-# ═══════════════════════════════════════════════════════════
-# §3 — CONSTANTS
-# ═══════════════════════════════════════════════════════════
-# Official endpoint.  LLMCHAT_API overrides it so the bridge can be smoke-
-# tested against a local mock of the exact SSE stream (see tests/).
-_API = os.environ.get("LLMCHAT_API", "https://llmchat.in/inference/stream")
-
-_BASE_HEADERS = {
+# Chrome 131 headers matching browser requests to llmchat.in
+DEFAULT_HEADERS: dict[str, str] = {
+    "Accept": "text/event-stream",
+    "Accept-Language": "en-US,en;q=0.9",
     "Content-Type": "application/json",
-    "Accept": "text/event-stream, */*",
     "Origin": "https://llmchat.in",
     "Referer": "https://llmchat.in/",
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/146.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
 }
 
-_RETRY_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
-_FATAL_CODES = {400, 401, 403, 404, 405, 422}
+# Minimal-thinking instruction injected into GLM-4.7-Flash calls so it doesn't
+# waste 600 tokens writing a 7-step markdown essay in reasoning_content.
+GLM_LOW_THINK_DIRECTIVE = (
+    "\n\n[THINKING BUDGET: MINIMAL. In your internal reasoning, NEVER write "
+    "numbered steps (1. Analyze, 2. Intent, 3. Draft...) or markdown headers. "
+    "Think in ONE short sentence (<15 words), then immediately output the final answer.]"
+)
 
-_DONE = object()
-_LOCK = threading.Lock()
+
+def resolve_wire_model(model: str | None) -> str:
+    """Resolve short name or @cf/ wire ID to full @cf/... wire identifier."""
+    if not model:
+        model = DEFAULT_MODEL
+    model = model.strip()
+    if model in MODEL_REGISTRY:
+        return MODEL_REGISTRY[model]["id"]
+    if model.startswith("@cf/") or model.startswith("@hf/"):
+        return model
+    for key, info in MODEL_REGISTRY.items():
+        if info["id"] == model or key.endswith(f"/{model}"):
+            return info["id"]
+    return f"@cf/{model}"
 
 
-# ═══════════════════════════════════════════════════════════
-# §4 — SSE PARSER
-# ═══════════════════════════════════════════════════════════
-def _parse_sse(line: str) -> List[dict]:
+def resolve_short_model(model: str | None) -> str:
+    """Return canonical short model key when known."""
+    wire = resolve_wire_model(model)
+    for key, info in MODEL_REGISTRY.items():
+        if info["id"] == wire:
+            return key
+    return wire.removeprefix("@cf/")
+
+
+def is_thinking_model(model: str | None) -> bool:
+    """Return True if the model emits reasoning_content before content."""
+    short = resolve_short_model(model)
+    return bool(MODEL_REGISTRY.get(short, {}).get("thinking", False))
+
+
+def is_valid_reply_content(text: str) -> bool:
     """
-    Parse one SSE 'data:' line.
-
-    Returns a list of events so we can handle both reasoning and content
-    if the server ever sends both in the same chunk.
+    Guard against glitched model outputs such as `"!!!!!!!!..."` (seen on
+    llama-3.3-70b fallback when prompted with abusive text) or empty symbols.
+    Requires at least 2 alphanumeric/Devanagari characters and prevents >75%
+    repeated punctuation floods.
     """
-    if not line.startswith("data:"):
-        return []
-
-    payload = line[5:].strip()
-    if not payload or payload == "[DONE]":
-        return []
-
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
-        return []
-
-    events: List[dict] = []
-    choices = data.get("choices")
-    finish_reason = None
-
-    if isinstance(choices, list) and choices:
-        first = choices[0] if isinstance(choices[0], dict) else {}
-        delta = first.get("delta") or {}
-        finish_reason = first.get("finish_reason")
-
-        # gemma-4 / r1-style thinking: reasoning arrives first on its own
-        # stream of chunks, then real content starts (reasoning goes null).
-        reasoning = delta.get("reasoning_content")
-        if reasoning is None:
-            reasoning = delta.get("reasoning")
-
-        if isinstance(reasoning, str) and reasoning:
-            events.append({
-                "kind": "reasoning",
-                "text": reasoning,
-                "finish_reason": finish_reason,
-            })
-
-        content = delta.get("content")
-        if isinstance(content, str) and content:
-            events.append({
-                "kind": "content",
-                "text": content,
-                "finish_reason": finish_reason,
-            })
-
-        if not events:
-            events.append({
-                "kind": "meta",
-                "text": "",
-                "finish_reason": finish_reason,
-            })
-    else:
-        # Only fall back to top-level "response" when "choices" is absent/empty.
-        # Models like @cf/qwen/qwen3-30b-a3b-fp8 echo each delta.content token in
-        # top-level "response" on the same SSE frame — emitting both would double every token.
-        resp = data.get("response")
-        if isinstance(resp, str) and resp:
-            events.append({
-                "kind": "response",
-                "text": resp,
-                "finish_reason": finish_reason,
-            })
-
-    # llmchat sends a usage frame per chunk and one final summary frame
-    # ({"response":"","usage":{...}}).  Keep the last non-zero one so the
-    # bridge can log real token counts.
-    usage = data.get("usage")
-    if isinstance(usage, dict) and (usage.get("completion_tokens")
-                                    or usage.get("total_tokens")):
-        events.append({
-            "kind": "usage",
-            "text": "",
-            "usage": usage,
-            "finish_reason": finish_reason,
-        })
-
-    return events
+    if not text or not text.strip():
+        return False
+    s = text.strip()
+    # Count letters/digits (Latin + Devanagari + emojis count separately)
+    alpha_num = re.findall(r"[A-Za-z0-9\u0900-\u097F]", s)
+    if len(alpha_num) < 2:
+        return False
+    # Reject punctuation floods like "!!!!!!!!!!!!!!!!!!!!!!!!"
+    punct_flood = re.search(r"([!?.,~*#\-_=])\1{12,}", s)
+    if punct_flood and len(alpha_num) < len(s) * 0.25:
+        return False
+    return True
 
 
-# ═══════════════════════════════════════════════════════════
-# §5 — MODEL RESOLVER
-# ═══════════════════════════════════════════════════════════
-def _resolve_model(query: Union[str, LLMModel, None], default: LLMModel) -> LLMModel:
-    """Resolve model from name, partial name, or LLMModel object."""
-    if query is None:
-        return default
-    if isinstance(query, LLMModel):
-        return query
-
-    # accept the wire form too: "@cf/google/gemma-4-26b-a4b-it"
-    q = str(query).strip()
-    if q.startswith("@") and "/" in q:
-        q = q.split("/", 1)[1]
-
-    if q in _MODEL_MAP:
-        return _MODEL_MAP[q]
-
-    q = q.lower()
-    for m in MODELS:
-        if m.name.lower() == q:
-            return m
-    for m in MODELS:
-        if q in m.name.lower():
-            return m
-
-    raise ValueError(
-        f"No model matching '{query}'\n"
-        f"Use LLMChatProvider.available_models() to see available models"
-    )
+@dataclass
+class CompletionResult:
+    content: str
+    reasoning: str = ""
+    model: str = DEFAULT_MODEL
+    wire_model: str = ""
+    elapsed_ms: int = 0
+    usage: dict[str, Any] = field(default_factory=dict)
+    fallback_used: bool = False
 
 
-# ═══════════════════════════════════════════════════════════
-# §6 — MESSAGE BUILDER
-# ═══════════════════════════════════════════════════════════
-def _build_messages(
-    data: Optional[str],
-    messages: Optional[List[Dict]],
-    system: Optional[str]
-) -> List[Dict]:
+class LLMChatClient:
     """
-    Build message list from data or messages with optional system prompt.
-
-    Rules:
-    - If messages are provided, keep them as-is.
-    - If no system message exists and system is provided, prepend it.
-    - Always ensure the last message is an empty assistant message.
-    """
-    result: List[Dict] = []
-
-    if messages:
-        result = [dict(msg) for msg in messages]
-        has_system = any(m.get("role") == "system" for m in result)
-        if system and not has_system:
-            result.insert(0, {"role": "system", "content": system})
-    else:
-        if system:
-            result.append({"role": "system", "content": system})
-        if data is not None:
-            result.append({"role": "user", "content": data})
-
-    if not result or result[-1].get("role") != "assistant":
-        result.append({"role": "assistant", "content": ""})
-
-    return result
-
-
-# ═══════════════════════════════════════════════════════════
-# §7 — SESSION FACTORY
-# ═══════════════════════════════════════════════════════════
-def _make_session(timeout: int) -> CurlSession:
-    """Create a fresh session for each request worker."""
-    return CurlSession(
-        impersonate="chrome",
-        timeout=timeout,
-        headers=_BASE_HEADERS,
-    )
-
-
-# ═══════════════════════════════════════════════════════════
-# §8 — MAIN PROVIDER
-# ═══════════════════════════════════════════════════════════
-class LLMChatProvider:
-    """
-    💬 LLMChat — Async Text Generation Provider
-
-    25 models · Thinking model support · Streaming
+    High-concurrency async client for llmchat.in with:
+      - Persistent curl_cffi AsyncSession (Chrome TLS impersonation)
+      - Full SSE stream parser (OpenAI delta + Cloudflare response + reasoning_content)
+      - GLM-4.7-Flash minimal-thinking enforcement & Qwen3 `/no_think` support
+      - Glitch / punctuation-flood rejection (`is_valid_reply_content`)
+      - Automatic retries with exponential backoff + model fallback chain
     """
 
     def __init__(
         self,
-        model: Union[str, LLMModel] = None,
-        system: str = "You are a helpful assistant.",
-        temperature: float = 1.0,
-        max_tokens: int = None,
-        timeout: int = 60,
-        retries: int = 3,
-        referer: str = "https://llmchat.in/",
-    ):
-        self._model = _resolve_model(model, MODELS[0])
-        self.system = system
-        self.temperature = temperature
-        self.max_tokens = max_tokens or self._model.max_tokens
-        self.timeout = timeout
-        self.retries = retries
-        self.referer = referer
-        # telemetry filled in by the stream worker (fresh provider per request)
-        self.last_usage: Dict[str, Any] = {}
-        self.reasoning_chars = 0
-        self.content_chars = 0
-
-    @property
-    def model(self) -> LLMModel:
-        return self._model
-
-    @property
-    def is_thinking_model(self) -> bool:
-        return self._model.name in _THINKING_MODELS
-
-    def _payload(self, messages: List[Dict], max_tokens: int) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
-        if self.temperature is not None:
-            payload["temperature"] = self.temperature
-        return payload
-
-    def _push(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, item: Any) -> None:
-        loop.call_soon_threadsafe(queue.put_nowait, item)
-
-    def _stream_worker(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        queue: asyncio.Queue,
-        messages: List[Dict],
-        model: LLMModel,
-        max_tokens: int,
+        inference_url: str = INFERENCE_URL,
+        impersonate: str = "chrome131",
+        timeout: float = 45.0,
+        max_concurrency: int = 8,
     ) -> None:
-        """
-        Blocking worker that runs in a thread.
-        Reads SSE lines using curl_cffi and pushes parsed tokens into asyncio queue.
-        """
-        session = _make_session(self.timeout)
-        url = f"{_API}?model={model.endpoint}"
-        payload = self._payload(messages, max_tokens)
+        self.inference_url = inference_url
+        self.impersonate = impersonate
+        self.timeout = timeout
+        self._sem = asyncio.Semaphore(max_concurrency)
+        self._session: AsyncSession | None = None
+        self._session_lock = asyncio.Lock()
+        self._loop = None          # event loop the cached session belongs to
 
-        headers = dict(_BASE_HEADERS)
-        headers["Referer"] = self.referer
-        headers["Origin"] = "https://llmchat.in"
-
-        resp = None
-        last_err = ""
-        think_open = False
-
-        self.last_usage = {}
-        self.reasoning_chars = 0
-        self.content_chars = 0
-        inline_think = False
-        inline_buf = ""
-
-        def emit(text: str) -> None:
-            if text:
-                self._push(loop, queue, text)
-
-        def close_think() -> None:
-            nonlocal think_open
-            if think_open:
-                think_open = False
-                emit("\n</think>\n")
-
-        try:
-            for attempt in range(self.retries + 1):
-                try:
-                    resp = session.post(
-                        url,
-                        json=payload,
-                        headers=headers,
-                        impersonate="chrome",
+    async def _get_session(self) -> AsyncSession:
+        loop = asyncio.get_running_loop()
+        # curl_cffi binds its internal handles to the loop it was created on.
+        # If we are being driven from a different loop (tests, multiple
+        # asyncio.run() calls, thread pools), drop the stale session and make
+        # a fresh one instead of blowing up with "attached to a different loop".
+        if self._session is not None and self._loop is not loop:
+            stale, self._session, self._loop = self._session, None, None
+            try:
+                await stale.close()
+            except Exception:
+                pass
+        if self._session is None:
+            async with self._session_lock:
+                if self._session is None:
+                    self._session = AsyncSession(
+                        impersonate=self.impersonate,
+                        headers=DEFAULT_HEADERS,
                         timeout=self.timeout,
-                        stream=True,
                     )
+                    self._loop = loop
+        return self._session
 
-                    status = getattr(resp, "status_code", None)
-                    if status == 200:
+    async def close(self) -> None:
+        if self._session is not None:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
+            self._loop = None
+
+    @staticmethod
+    def _parse_sse(raw: str) -> tuple[str, str, dict[str, Any]]:
+        """
+        Parse raw SSE stream text from llmchat.in into (content, reasoning, usage).
+        Supports:
+          - GLM-4.7-Flash format:
+              chunk 1: `delta: {"role":"assistant","content":"","reasoning_content":null}`
+              reasoning: `delta: {"reasoning":"<t>","reasoning_content":"<t>"}`
+              content: `delta: {"content":"<t>","reasoning_content":null}`
+              final: `{"response":"","usage":{...}}` + `data: [DONE]`
+          - Qwen3 / Gemma-4 / Llama OpenAI chunks:
+              `choices[0].delta.{content, reasoning_content}`
+              (ignores duplicate top-level `"response"` when `choices` is present)
+          - Legacy Cloudflare Workers AI `{"response": "..."}` chunks
+          - Inline `<think>...</think>` blocks inside content
+        """
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        usage: dict[str, Any] = {}
+
+        for raw_line in raw.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                data_str = line[5:].strip()
+            else:
+                continue
+
+            if not data_str or data_str == "[DONE]":
+                continue
+
+            try:
+                packet = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            if not isinstance(packet, dict):
+                continue
+
+            if isinstance(packet.get("usage"), dict) and packet["usage"]:
+                usage = packet["usage"]
+
+            choices = packet.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0] if isinstance(choices[0], dict) else {}
+                delta = first.get("delta")
+                if isinstance(delta, dict):
+                    # Note: GLM-4.7-Flash sends BOTH "reasoning" and "reasoning_content"
+                    # with the exact same token string. Pick "reasoning_content" first
+                    # and only fall back to "reasoning" when "reasoning_content" is None.
+                    rc = delta.get("reasoning_content")
+                    if rc is None:
+                        rc = delta.get("reasoning")
+                    if isinstance(rc, str) and rc:
+                        reasoning_parts.append(rc)
+
+                    c = delta.get("content")
+                    if isinstance(c, str) and c:
+                        content_parts.append(c)
+                elif isinstance(first.get("message"), dict):
+                    msg = first["message"]
+                    c = msg.get("content")
+                    if isinstance(c, str) and c:
+                        content_parts.append(c)
+            elif "response" in packet and isinstance(packet["response"], str):
+                # Only use top-level "response" when "choices" is absent or empty
+                if packet["response"]:
+                    content_parts.append(packet["response"])
+
+        content = "".join(content_parts)
+        reasoning = "".join(reasoning_parts)
+
+        # Strip inline <think>...</think> blocks if any model embeds them in content
+        if "<think>" in content:
+            think_matches = re.findall(r"<think>([\s\S]*?)</think>", content)
+            if think_matches and not reasoning:
+                reasoning = "\n".join(m.strip() for m in think_matches).strip()
+            content = re.sub(r"<think>[\s\S]*?</think>", "", content)
+            if "<think>" in content:
+                content = content.split("<think>", 1)[0]
+
+        return content.strip(), reasoning.strip(), usage
+
+    async def _request_once(
+        self,
+        messages: list[dict[str, str]],
+        wire_model: str,
+        max_tokens: int,
+        temperature: float,
+        low_think: bool = True,
+    ) -> tuple[str, str, dict[str, Any]]:
+        session = await self._get_session()
+
+        prepared_messages = [dict(m) for m in messages]
+        if low_think and prepared_messages:
+            # GLM-4.7-Flash: inject minimal-thinking directive so it doesn't write
+            # a 7-step markdown outline in reasoning_content
+            if "glm-4" in wire_model:
+                injected = False
+                for m in prepared_messages:
+                    if m.get("role") == "system":
+                        if "THINKING BUDGET: MINIMAL" not in (m.get("content") or ""):
+                            m["content"] = (m.get("content") or "") + GLM_LOW_THINK_DIRECTIVE
+                        injected = True
+                        break
+                if not injected:
+                    prepared_messages.insert(
+                        0,
+                        {"role": "system", "content": GLM_LOW_THINK_DIRECTIVE.strip()},
+                    )
+            # Qwen3: supports native `/no_think` suffix
+            elif "qwen3" in wire_model:
+                for i in range(len(prepared_messages) - 1, -1, -1):
+                    if prepared_messages[i].get("role") in ("user", "system"):
+                        txt = prepared_messages[i].get("content", "")
+                        if "/no_think" not in txt and "/think" not in txt:
+                            prepared_messages[i]["content"] = f"{txt}\n/no_think"
                         break
 
-                    body = getattr(resp, "text", "")
-                    last_err = f"HTTP {status}: {str(body)[:200]}"
+        payload: dict[str, Any] = {
+            "model": wire_model,
+            "messages": prepared_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
 
-                    if status in _FATAL_CODES:
-                        raise RuntimeError(f"Fatal error: {last_err}")
+        async with self._sem:
+            resp = await session.post(
+                self.inference_url,
+                json=payload,
+                timeout=self.timeout,
+            )
 
-                    if status in _RETRY_CODES and attempt < self.retries:
-                        wait = min(2.0 * (2 ** attempt) + random.uniform(0, 1), 30)
-                        time.sleep(wait)
-                        continue
+        if resp.status_code != 200:
+            body_preview = (resp.text or "")[:240]
+            raise RuntimeError(
+                f"llmchat.in HTTP {resp.status_code} for {wire_model}: {body_preview}"
+            )
 
-                    raise RuntimeError(last_err)
+        return self._parse_sse(resp.text or "")
 
-                except RuntimeError:
-                    raise
+    async def chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        model: str | None = None,
+        max_tokens: int = 500,
+        temperature: float = 0.85,
+        allow_fallback: bool = True,
+        retries_per_model: int = 2,
+        low_think: bool = True,
+    ) -> CompletionResult:
+        """
+        Execute a chat completion against llmchat.in.
+        If the primary model returns empty content, glitches (e.g. `"!!!!..."`),
+        or errors out, automatically retries and falls back through FALLBACK_CHAIN.
+        """
+        t0 = time.monotonic()
+        requested_short = resolve_short_model(model or DEFAULT_MODEL)
+
+        candidate_models = [requested_short]
+        if allow_fallback:
+            for fb in FALLBACK_CHAIN:
+                if fb not in candidate_models:
+                    candidate_models.append(fb)
+
+        last_error: Exception | None = None
+        last_reasoning: str = ""
+
+        for idx, cand_short in enumerate(candidate_models):
+            wire_model = resolve_wire_model(cand_short)
+            for attempt in range(retries_per_model):
+                try:
+                    content, reasoning, usage = await self._request_once(
+                        messages=messages,
+                        wire_model=wire_model,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        low_think=low_think,
+                    )
+                    if reasoning:
+                        last_reasoning = reasoning
+
+                    if content and is_valid_reply_content(content):
+                        elapsed = int((time.monotonic() - t0) * 1000)
+                        return CompletionResult(
+                            content=content,
+                            reasoning=reasoning,
+                            model=cand_short,
+                            wire_model=wire_model,
+                            elapsed_ms=elapsed,
+                            usage=usage,
+                            fallback_used=(idx > 0),
+                        )
+
+                    # Model either exhausted tokens inside reasoning_content or
+                    # emitted glitched punctuation ("!!!!..."). Retry with higher budget.
+                    if content and not is_valid_reply_content(content):
+                        log.warning(
+                            "Model %s emitted glitched content (%r) on attempt %d",
+                            wire_model,
+                            content[:60],
+                            attempt + 1,
+                        )
+                    else:
+                        log.warning(
+                            "Model %s returned empty content (reasoning=%d chars) on attempt %d",
+                            wire_model,
+                            len(reasoning),
+                            attempt + 1,
+                        )
+                    max_tokens = max(max_tokens, 2500)
                 except Exception as exc:
-                    last_err = str(exc)
-                    if attempt < self.retries:
-                        time.sleep(2.0 * (attempt + 1))
-                        continue
-                    raise RuntimeError(f"Connection failed: {last_err}") from exc
+                    last_error = exc
+                    log.warning(
+                        "Model %s attempt %d failed: %s",
+                        wire_model,
+                        attempt + 1,
+                        exc,
+                    )
+                    if attempt + 1 < retries_per_model:
+                        await asyncio.sleep(0.35 * (attempt + 1))
 
-            if resp is None or getattr(resp, "status_code", None) != 200:
-                raise RuntimeError(f"All retries exhausted: {last_err}")
-
-            for raw_line in resp.iter_lines():
-                if not raw_line:
-                    continue
-
-                if isinstance(raw_line, bytes):
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                else:
-                    line = str(raw_line).strip()
-
-                if not line:
-                    continue
-
-                for chunk in _parse_sse(line):
-                    kind = chunk.get("kind")
-                    text = chunk.get("text", "")
-                    finish_reason = chunk.get("finish_reason")
-
-                    if kind == "usage":
-                        self.last_usage = chunk.get("usage") or self.last_usage
-                        continue
-
-                    if kind == "reasoning":
-                        # wrap reasoning ALWAYS — some models (e.g. glm-4.7-flash)
-                        # stream reasoning_content without being on the known list
-                        self.reasoning_chars += len(text)
-                        if not think_open:
-                            think_open = True
-                            emit("<think>\n")
-                        emit(text)
-                        continue
-
-                    if kind in ("content", "response"):
-                        close_think()
-                        # Qwen3-30B-A3B streams <think>...</think> inline inside delta.content.
-                        # Track reasoning_chars vs content_chars accurately while streaming.
-                        inline_buf += text
-                        if "<think>" in inline_buf and "</think>" not in inline_buf:
-                            inline_think = True
-                        if inline_think:
-                            if "</think>" in inline_buf:
-                                before, after = inline_buf.split("</think>", 1)
-                                think_body = before.replace("<think>", "")
-                                self.reasoning_chars = len(think_body.strip())
-                                self.content_chars += len(after)
-                                inline_think = False
-                                inline_buf = ""
-                            else:
-                                self.reasoning_chars = len(inline_buf.replace("<think>", "").strip())
-                        else:
-                            self.content_chars += len(text)
-                        emit(text)
-                        continue
-
-                    if kind == "meta" and finish_reason == "stop":
-                        close_think()
-
-            close_think()
-            self._push(loop, queue, _DONE)
-
-        except Exception as exc:
-            close_think()
-            self._push(loop, queue, exc)
-
-        finally:
-            try:
-                if resp is not None:
-                    resp.close()
-            except Exception:
-                pass
-            try:
-                session.close()
-            except Exception:
-                pass
-
-    async def _stream(
-        self,
-        messages: List[Dict],
-        model: LLMModel,
-        max_tokens: int,
-    ) -> AsyncGenerator[str, None]:
-        """
-        Async generator that consumes tokens from the worker thread.
-        """
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
-
-        thread = threading.Thread(
-            target=self._stream_worker,
-            args=(loop, queue, messages, model, max_tokens),
-            daemon=True,
-        )
-        thread.start()
-
-        while True:
-            item = await queue.get()
-
-            if item is _DONE:
-                break
-
-            if isinstance(item, Exception):
-                raise item
-
-            yield item
-
-    async def chat(
-        self,
-        data: str = None,
-        messages: List[Dict] = None,
-        model: Union[str, LLMModel] = None,
-        system: str = None,
-        temperature: float = None,
-        max_tokens: int = None,
-    ) -> AsyncGenerator[str, None]:
-        """
-        Async-stream tokens from LLMChat.
-        """
-        if not messages and data is None:
-            raise ValueError("Provide 'messages' or 'data'")
-
-        use_model = _resolve_model(model, self._model)
-        use_tokens = max_tokens or self.max_tokens
-        use_system = system if system is not None else self.system
-
-        if temperature is not None:
-            self.temperature = temperature
-
-        send_msgs = _build_messages(data, messages, use_system)
-
-        async for token in self._stream(send_msgs, use_model, use_tokens):
-            yield token
-
-    def set_model(self, model: Union[str, LLMModel]) -> "LLMChatProvider":
-        self._model = _resolve_model(model, self._model)
-        if self.max_tokens is None:
-            self.max_tokens = self._model.max_tokens
-        return self
-
-    def set_system(self, prompt: str) -> "LLMChatProvider":
-        self.system = prompt
-        return self
-
-    def set_max_tokens(self, n: int) -> "LLMChatProvider":
-        self.max_tokens = n
-        return self
-
-    @staticmethod
-    def available_models() -> List[str]:
-        return [m.name for m in MODELS]
-
-    @staticmethod
-    def thinking_models() -> List[str]:
-        return [m.name for m in MODELS if m.name in _THINKING_MODELS]
-
-    async def aclose(self) -> None:
-        return
-
-    def __repr__(self):
-        think = " 🧠" if self.is_thinking_model else ""
-        return (
-            f"LLMChatProvider("
-            f"model={self._model.name!r}, "
-            f"max_tokens={self.max_tokens:,}"
-            f"{think})"
+        elapsed = int((time.monotonic() - t0) * 1000)
+        if last_error is not None:
+            raise RuntimeError(
+                f"All llmchat.in models failed after {elapsed}ms; last error: {last_error}"
+            )
+        raise RuntimeError(
+            f"All llmchat.in models returned empty/glitched content after {elapsed}ms "
+            f"(last reasoning={len(last_reasoning)} chars)"
         )
 
-
-# ═══════════════════════════════════════════════════════════
-# §9 — EXAMPLE USAGE
-# ═══════════════════════════════════════════════════════════
-async def main():
-    lm = LLMChatProvider(
-        model="moonshotai/kimi-k2.5",
-    )
-
-    async for token in lm.chat(data="Hello"):
-        print(token, end="", flush=True)
-
-    await lm.aclose()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    async def stream_chunks(
+        self,
+        messages: list[dict[str, str]],
+        model: str | None = None,
+        max_tokens: int = 500,
+        temperature: float = 0.85,
+        low_think: bool = True,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Yield OpenAI-compatible SSE chunks for streaming clients."""
+        result = await self.chat_completion(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            low_think=low_think,
+        )
+        chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
+        created = int(time.time())
+        yield {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": result.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": result.content,
+                        **(
+                            {"reasoning_content": result.reasoning}
+                            if result.reasoning
+                            else {}
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }

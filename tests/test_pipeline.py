@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 """
-End-to-end offline tests for the gemma-4 pipeline.
+End-to-end offline tests for the v7 parallel-agent bridge.
 
     python tests/test_pipeline.py
 
-Runs with the system/test environment's Python; needs curl_cffi (same
-dependency as the bridge itself).  No network access required.
+Runs with the system/test environment's Python; needs curl_cffi (the same
+dependency the bridge itself uses). No network access required — the whole
+llmchat.in side is served by tests/mock_llmchat.py.
+
+Covers:
+  1. provider · GLM-4.7-Flash SSE parse (reasoning + content, no duplication)
+  2. provider · minimal-think directive injection
+  3. provider · glitch ("!!!!!!") + empty-content rejection → model fallback
+  4. server  · model registry / resolution / thinking budgets
+  5. bridge  · HTTP /health, /v1/models, /v1/chat/completions, /inference/stream
+  6. bridge  · WebSocket protocol: health, bot, reply (GLM), brain (Gemma-4),
+              save (v7.0-parallel-agentic schema), save_global, get_global
+  7. storage · transcripts + global memory round-trip
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -24,9 +38,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-import llmchat_provider                      # noqa: E402
-import server                                # noqa: E402
-from mock_llmchat import MockLLM, MODEL_WIRE, CONTENT   # noqa: E402
+import llmchat_provider                                    # noqa: E402
+import server                                              # noqa: E402
+from mock_llmchat import (                                 # noqa: E402
+    MockLLM, MODEL_WIRE, BRAIN_MODEL_WIRE, FALLBACK_MODEL_WIRE, CONTENT, REASONING)
 
 PASS, FAIL = [], []
 
@@ -44,32 +59,17 @@ def check(name):
     return deco
 
 
-def collect_stream(messages, model=None):
-    async def run():
-        prov = llmchat_provider.LLMChatProvider(
-            model=model,
-            system=None, temperature=0.9, max_tokens=600,
-            timeout=30, retries=0,
-        )
-        out = []
-        async for tok in prov.chat(messages=messages):
-            out.append(tok)
-        return "".join(out), prov
-    import asyncio
-    return asyncio.run(run())
+def make_client(mock, **kw):
+    return llmchat_provider.LLMChatClient(inference_url=mock.url, **kw)
 
 
-def http_json(url, body=None, timeout=30):
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json"} if data else {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.status, json.loads(r.read())
+def run(coro):
+    return asyncio.run(coro)
 
+
+# ───────────────────────────── tiny WS client ─────────────────────────────
 
 def ws_session(port):
-    """Tiny raw RFC6455 client: connect, return (send_json, recv_json, close)."""
     s = socket.create_connection(("127.0.0.1", port), timeout=10)
     key = base64.b64encode(os.urandom(16)).decode()
     s.sendall((
@@ -92,186 +92,267 @@ def ws_session(port):
             header = bytes([0x81, 0x80 | 126]) + struct.pack(">H", len(payload))
         else:
             header = bytes([0x81, 0x80 | 127]) + struct.pack(">Q", len(payload))
-        s.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        s.sendall(header + mask + masked)
 
-    def recv_exact(n):
-        buf = b""
+    buf = bytearray()
+
+    def _read(n):
         while len(buf) < n:
-            chunk = s.recv(n - len(buf))
+            chunk = s.recv(4096)
             if not chunk:
-                raise AssertionError("socket closed")
-            buf += chunk
-        return buf
+                raise ConnectionError("closed")
+            buf.extend(chunk)
+        out = bytes(buf[:n])
+        del buf[:n]
+        return out
 
     def recv_json():
-        h = recv_exact(2)
-        length = h[1] & 0x7F
-        if length == 126:
-            length = struct.unpack(">H", recv_exact(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", recv_exact(8))[0]
-        return json.loads(recv_exact(length).decode())
+        while True:
+            h = _read(2)
+            opcode = h[0] & 0x0F
+            length = h[1] & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", _read(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", _read(8))[0]
+            payload = _read(length) if length else b""
+            if opcode == 0x1:
+                return json.loads(payload.decode("utf-8"))
+            if opcode == 0x8:
+                raise ConnectionError("closed by server")
 
     return send_json, recv_json, s.close
 
 
-def wait_http(url, timeout=25):
-    t0 = time.time()
-    while time.time() - t0 < timeout:
+def http_json(url, body=None, timeout=30):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"} if data else {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, json.loads(r.read())
+
+
+def wait_http(url, tries=80):
+    last = None
+    for _ in range(tries):
         try:
-            status, body = http_json(url, timeout=3)
-            if status == 200:
-                return body
-        except Exception:
-            time.sleep(0.3)
-    raise AssertionError("server did not come up: " + url)
+            return http_json(url)
+        except Exception as e:
+            last = e
+            time.sleep(0.25)
+    raise AssertionError(f"server never came up at {url}: {last}")
 
 
-def test_provider(mock):
-    llmchat_provider._API = mock.url
-    msgs = [{"role": "user", "content": "bro hi"}]
-    raw, prov = collect_stream(msgs)
+# ────────────────────────────────── tests ──────────────────────────────────
 
-    assert "<think>" in raw, "provider did not capture <think>"
-    assert "user said" in raw, f"reasoning text missing in {raw!r}"
-    assert CONTENT.strip() in raw, f"answer text missing in {raw!r}"
-    # Ensure top-level "response" field in Qwen3 SSE chunks did NOT double tokens
-    assert "Yo! Yo!" not in raw, f"tokens were doubled: {raw!r}"
-    assert prov.reasoning_chars > 50, f"reasoning_chars={prov.reasoning_chars}"
-    assert prov.last_usage.get("completion_tokens") == 250, prov.last_usage
-    assert mock.requests, "mock received no request"
-    sent = mock.requests[-1]
-    assert sent["model"] == MODEL_WIRE, f"wire model was {sent['model']!r}"
-    assert sent["body"].get("stream") is True
-    assert sent["body"].get("max_tokens") == 600
-    assert sent["body"]["messages"][-1]["role"] == "assistant"
-    return f"{prov.reasoning_chars} reasoning chars · model {MODEL_WIRE} used (no token duplication)"
+def test_provider_glm(mock):
+    client = make_client(mock)
+    res = run(client.chat_completion(
+        messages=[{"role": "user", "content": "bro hi"}],
+        model="zai-org/glm-4.7-flash", max_tokens=500))
 
+    assert res.content == CONTENT, f"content={res.content!r}"
+    assert res.reasoning.strip() == REASONING, f"reasoning={res.reasoning!r}"
+    # GLM sends reasoning+reasoning_content with the SAME token: never doubled
+    assert "One One" not in res.reasoning, f"reasoning doubled: {res.reasoning!r}"
+    assert res.model == "zai-org/glm-4.7-flash", res.model
+    assert res.wire_model == MODEL_WIRE, res.wire_model
+    assert res.usage.get("completion_tokens") == 658, res.usage
 
-def test_strip():
-    assert server.strip_think("a<think>x</think>b") == "ab"
-    assert server.strip_think("a<thinking>x</thinking>b") == "ab"
-    assert server.strip_think("a<think>unclosed") == "a"
-    assert server.strip_think("plain") == "plain"
-    clean, trace = server.extract_think("<think>\nQuick thought.\n</think>\n\nHey bro!")
-    assert clean == "Hey bro!" and trace == "Quick thought."
-    return "closed, <thinking>, truncated, extract_think"
+    body = mock.last_body()
+    assert body.get("model") == MODEL_WIRE, body.get("model")
+    assert body.get("stream") is None, "payload must not ask for SSE framing"
+    return f"{len(res.reasoning)} reasoning chars · {len(res.content)} content chars · {MODEL_WIRE}"
 
 
-def test_config():
-    assert server.DEFAULT_MODEL == "qwen/qwen3-30b-a3b-fp8"
-    assert server.BRAIN_MODEL == "google/gemma-4-26b-a4b-it"
-    assert server.FALLBACK_CHAIN[0] == server.DEFAULT_MODEL
-    assert server.FALLBACK_CHAIN[1] == server.BRAIN_MODEL
-    assert server.model_endpoint(server.DEFAULT_MODEL) == MODEL_WIRE
-    assert server.resolve_model("@cf/qwen/qwen3-30b-a3b-fp8") == server.DEFAULT_MODEL
-    assert server.resolve_model("@cf/google/gemma-4-26b-a4b-it") == server.BRAIN_MODEL
-    assert server.resolve_model(None) == server.DEFAULT_MODEL
-    return "Qwen3-30B primary + Gemma-4 brain + fallbacks"
+def test_provider_minimal_think(mock):
+    client = make_client(mock)
+    run(client.chat_completion(
+        messages=[{"role": "system", "content": "You are Aduu."},
+                  {"role": "user", "content": "bro hi"}],
+        model="zai-org/glm-4.7-flash", max_tokens=500, low_think=True))
+
+    body = mock.last_body()
+    sysmsg = " ".join(str(m.get("content", "")) for m in body["messages"]
+                      if m.get("role") == "system")
+    assert "THINKING BUDGET: MINIMAL" in sysmsg, f"minimal-think directive missing: {sysmsg!r}"
+
+    # Qwen3 uses the native /no_think suffix instead
+    run(client.chat_completion(
+        messages=[{"role": "user", "content": "bro hi"}],
+        model="qwen/qwen3-30b-a3b-fp8", max_tokens=500, low_think=True))
+    qbody = mock.last_body()
+    assert "/no_think" in str(qbody["messages"][-1]["content"]), "qwen3 /no_think missing"
+    return "GLM minimal-think directive + Qwen3 /no_think injected"
 
 
-def test_fallback(mock):
-    llmchat_provider._API = mock.url
-    msgs = [{"role": "user", "content": "bro hi"}]
-    res = server.generate_with_fallback(msgs, "@cf/qwen/qwen3-30b-a3b-fp8", 600, 0.9)
-    assert res["text"] == CONTENT.strip(), res["text"]
-    assert res["model"] == server.DEFAULT_MODEL
-    assert res["fallback_index"] == 0
-    assert "<think" not in res["text"]
-    assert res["reasoning_chars"] > 50
-    assert "user said" in res["thinking_trace"]
-    assert res["usage"].get("completion_tokens") == 250
+def test_provider_glitch_and_fallback(mock):
+    # 1. glitched "!!!!!" output from the requested model must fall through
+    with MockLLM(glitch_models=("glm-4",)) as glitchy:
+        client = make_client(glitchy)
+        res = run(client.chat_completion(
+            messages=[{"role": "user", "content": "teri maa ki chut"}],
+            model="zai-org/glm-4.7-flash", max_tokens=500))
+        assert res.content == CONTENT, f"fallback content={res.content!r}"
+        assert res.fallback_used is True, "fallback not flagged"
+        assert res.model != "zai-org/glm-4.7-flash", res.model
 
-    with MockLLM(fail_models=("qwen",)) as broken:
-        llmchat_provider._API = broken.url
-        res2 = server.generate_with_fallback(msgs, "@cf/qwen/qwen3-30b-a3b-fp8", 600, 0.9)
-        assert res2["model"] == "google/gemma-4-26b-a4b-it", res2["model"]
-        assert res2["fallback_index"] == 1, res2["fallback_index"]
-        assert res2["text"] == CONTENT.strip()
-    return "Qwen3-30B primary (/no_think) · auto-fallback to Gemma-4 when Qwen fails"
+    # 2. empty content (all tokens burned in reasoning) must also fall through
+    with MockLLM(empty_models=("glm-4",)) as emptier:
+        client = make_client(emptier)
+        res = run(client.chat_completion(
+            messages=[{"role": "user", "content": "bro hi"}],
+            model="zai-org/glm-4.7-flash", max_tokens=500))
+        assert res.content == CONTENT, res.content
+        assert res.fallback_used is True
+
+    # 3. HTTP 500 on the frontline model must fall back cleanly
+    with MockLLM(fail_models=("glm-4",)) as broken:
+        client = make_client(broken)
+        res = run(client.chat_completion(
+            messages=[{"role": "user", "content": "bro hi"}],
+            model="zai-org/glm-4.7-flash", max_tokens=500))
+        assert res.content == CONTENT, res.content
+        assert res.model == "qwen/qwen3-30b-a3b-fp8", res.model
+    return "glitch '!!!!' · empty-content · HTTP 500 → all auto-fallback"
 
 
-def test_bridge_http_ws(mock):
-    env = dict(os.environ, LLMCHAT_API=mock.url)
+def test_registry():
+    assert llmchat_provider.resolve_wire_model("zai-org/glm-4.7-flash") == MODEL_WIRE
+    assert llmchat_provider.resolve_wire_model(MODEL_WIRE) == MODEL_WIRE
+    assert llmchat_provider.resolve_short_model(MODEL_WIRE) == "zai-org/glm-4.7-flash"
+    assert llmchat_provider.resolve_wire_model("google/gemma-4-26b-a4b-it") == BRAIN_MODEL_WIRE
+    assert llmchat_provider.resolve_wire_model(None) == MODEL_WIRE
+    assert llmchat_provider.is_thinking_model("zai-org/glm-4.7-flash") is True
+    assert llmchat_provider.is_thinking_model("meta/llama-3.3-70b-instruct-fp8-fast") is False
+    assert llmchat_provider.FALLBACK_CHAIN[0] == "zai-org/glm-4.7-flash"
+    assert "google/gemma-4-26b-a4b-it" in llmchat_provider.FALLBACK_CHAIN
+
+    # glitch guard
+    assert llmchat_provider.is_valid_reply_content("haan bhai, thik hai") is True
+    assert llmchat_provider.is_valid_reply_content("!" * 400) is False
+    assert llmchat_provider.is_valid_reply_content("") is False
+    assert llmchat_provider.is_valid_reply_content("😄") is False
+    return "GLM-4.7-Flash primary · Gemma-4 brain · Qwen3 fallback · glitch guard"
+
+
+def test_server_bridge(mock):
+    # Isolated transcripts dir so the real ./transcripts data is never touched
+    tmpdir = Path(tempfile.mkdtemp(prefix="ig_pipeline_"))
+    env = dict(os.environ,
+               LLMCHAT_BASE_URL=mock.base_url,
+               IG_BRIDGE_PORT="8791",
+               IG_TRANSCRIPTS_DIR=str(tmpdir))
     proc = subprocess.Popen(
-        [sys.executable, str(ROOT / "server.py"), "--port", "8791"],
+        [sys.executable, str(ROOT / "server.py")],
         cwd=str(ROOT), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
-        health = wait_http("http://127.0.0.1:8791/health")
+        _, health = wait_http("http://127.0.0.1:8791/health")
+        assert health["default_model"] == "zai-org/glm-4.7-flash", health
+        assert health["brain_model"] == "google/gemma-4-26b-a4b-it", health
         assert health["default_endpoint"] == MODEL_WIRE, health
-        assert health["chain"][0] == server.DEFAULT_MODEL
+        assert health["chain"][0] == "zai-org/glm-4.7-flash", health["chain"]
+        assert "uptime_s" in health
 
-        status, reply = http_json("http://127.0.0.1:8791/reply", {
-            "messages": [{"role": "user", "content": "bro hi"}],
-            "max_tokens": 600,
-        })
-        assert status == 200
-        assert reply["text"] == CONTENT.strip(), reply["text"]
-        assert reply["model"] == "qwen/qwen3-30b-a3b-fp8", reply
-        assert reply["reasoning_chars"] > 50
-        assert "elapsed_ms" in reply and "fallback_index" in reply
+        _, models = http_json("http://127.0.0.1:8791/v1/models")
+        ids = [m["id"] for m in models["data"]]
+        assert "zai-org/glm-4.7-flash" in ids and "google/gemma-4-26b-a4b-it" in ids
 
-        status, brain_resp = http_json("http://127.0.0.1:8791/brain", {
-            "messages": [{"role": "user", "content": "analyze profile"}],
-            "max_tokens": 300,
-        })
-        assert status == 200
-        assert brain_resp["model"] == "google/gemma-4-26b-a4b-it", brain_resp
-
+        # non-streaming OpenAI-compatible completion (thinking budget floor)
         status, oai = http_json("http://127.0.0.1:8791/v1/chat/completions", {
-            "messages": [{"role": "user", "content": "bro hi"}]})
-        assert oai["choices"][0]["message"]["content"] == CONTENT.strip()
+            "messages": [{"role": "user", "content": "bro hi"}],
+            "model": "zai-org/glm-4.7-flash", "max_tokens": 500, "stream": False,
+        })
+        assert status == 200
+        assert oai["choices"][0]["message"]["content"] == CONTENT, oai
+        assert oai["choices"][0]["message"]["reasoning_content"].strip() == REASONING
+        assert oai["model"] == "zai-org/glm-4.7-flash", oai["model"]
+        sent = mock.last_body()
+        assert sent["max_tokens"] >= server.THINK_MIN_BUDGET, sent["max_tokens"]
 
+        # SSE streaming passthrough
+        req = urllib.request.Request(
+            "http://127.0.0.1:8791/inference/stream",
+            data=json.dumps({"messages": [{"role": "user", "content": "bro hi"}],
+                             "model": "zai-org/glm-4.7-flash"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            sse = r.read().decode("utf-8")
+        assert "data: " in sse and "data: [DONE]" in sse
+        assert REASONING in sse and CONTENT in sse
+
+        # WebSocket bridge protocol (what the in-page agent actually uses)
         send, recv, close = ws_session(8791)
         try:
             send({"id": "h1", "type": "health"})
             h = recv()
-            assert h["id"] == "h1" and h["default_endpoint"] == MODEL_WIRE, h
+            assert h["ok"] and h["default_endpoint"] == MODEL_WIRE, h
+            assert h["brain_endpoint"] == BRAIN_MODEL_WIRE, h
 
             send({"id": "b1", "type": "bot"})
             b = recv()
-            assert b["id"] == "b1" and b["ok"] is True and "window.IGAgent" in b["code"]
+            assert b["ok"] and "window.IGAgent" in b["code"], list(b)
 
+            # FRONTLINE reply → GLM-4.7-Flash
             send({"id": "r1", "type": "reply", "messages": [
                 {"role": "user", "content": "bro hi"}]})
             r = recv()
-            assert r["ok"] and r["text"] == CONTENT.strip(), r
+            assert r["ok"] and r["text"] == CONTENT, r
+            assert r["model"] == "zai-org/glm-4.7-flash", r
+            assert r["endpoint"] == MODEL_WIRE, r
+            assert r["reasoning_chars"] == len(REASONING), r
 
+            # PARALLEL BRAIN pass → Gemma-4
             send({"id": "br1", "type": "brain", "messages": [
-                {"role": "user", "content": "analyze profile"}]})
+                {"role": "user", "content": "analyze this contact"}]})
             br = recv()
             assert br["ok"] and br["model"] == "google/gemma-4-26b-a4b-it", br
+            assert br["role_type"] == "brain", br
 
+            # v7 transcript save (mood_state + reminders + missions + process_log)
             send({"id": "s1", "type": "save", "transcript": {
-                "user": "_pipeline_test",
-                "agent_state": {"relationship_stage": "flirty-banter", "proactive_streak": 0},
-                "brain_profile": {"personality": "witty Gen-Z"},
-                "process_log": [{"turn_id": "t1", "at": 1, "trigger": "incoming_burst"}],
+                "schema_version": "7.0-parallel-agentic",
+                "user": "_pipeline_test", "thread_fbid": "0",
+                "models": {"answering_model": "zai-org/glm-4.7-flash",
+                           "brain_model": "google/gemma-4-26b-a4b-it"},
+                "mood_state": {"current_mood": "FURIOUS_ABUSE_CLAPBACK",
+                               "mood_intensity": 3,
+                               "feeling_note": "genuinely pissed off"},
+                "reminders": [{"topic": "baat karte hai", "due_in_minutes": 10,
+                               "status": "scheduled"}],
+                "missions": [{"target_user": "deeps20_", "type": "prank"}],
+                "process_log": [{"turn_id": "t1", "trigger": "incoming_burst"}],
                 "messages": [{"id": "test:1", "ts": 1, "mine": False,
-                              "kind": "text", "label": "text", "text": "hi"}]}})
+                              "kind": "text", "label": "text", "text": "hi"}],
+            }})
             saved = recv()
-            assert saved["ok"] and saved["total_messages"] == 1 and saved["process_turn_count"] == 1, saved
+            assert saved["ok"] and saved["total_messages"] == 1, saved
+            assert saved["process_turn_count"] == 1, saved
+
+            disk = json.loads((tmpdir / "_pipeline_test.json").read_text())
+            assert disk["mood_state"]["current_mood"] == "FURIOUS_ABUSE_CLAPBACK"
+            assert disk["reminders"][0]["topic"] == "baat karte hai"
+            assert disk["missions"][0]["target_user"] == "deeps20_"
 
             send({"id": "g1", "type": "save_global", "global": {
-                "connections": [{"a": "adarshu.io", "b": "deeps20_", "relation": "close friends"}],
-                "people": {"deeps20_": {"handle": "deeps20_", "lastTexts": ["Hyy babyy🌚🌚"]}},
-                "gossip": ["@deeps20_: Hyy babyy🌚🌚"],
+                "contacts": {"deeps20_": {"handle": "deeps20_", "vibe": "aggressive"}},
+                "gossip": [{"user": "deeps20_", "text": "asked for chocolates"}],
+                "reminders": [], "missions": [],
             }})
             gsaved = recv()
-            assert gsaved["ok"] and gsaved["people"] == 1, gsaved
+            assert gsaved["ok"] and gsaved["people"] >= 1, gsaved
 
             send({"id": "g2", "type": "get_global"})
             gloaded = recv()
-            assert gloaded["ok"] and "deeps20_" in gloaded["global"].get("people", {}), gloaded
+            assert gloaded["ok"] and "deeps20_" in gloaded["global"]["contacts"], gloaded
         finally:
             close()
 
-        for p in (ROOT / "transcripts").glob("_pipeline_test.json"):
-            p.unlink()
-        for p in (ROOT / "transcripts").glob("_global_memory.json"):
-            p.unlink()
-        return "health · /reply · OpenAI alias · WS reply · WS save"
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return "health · models · OpenAI · SSE · WS reply+brain+save+global"
     finally:
         proc.terminate()
         try:
@@ -281,21 +362,24 @@ def test_bridge_http_ws(mock):
 
 
 def main():
-    print("\nIG-Agent pipeline tests (offline, mock llmchat.in)\n")
+    print("\nIG-Agent v7 pipeline tests (offline, mock llmchat.in)\n")
     with MockLLM() as mock:
-        check("provider · gemma-4 SSE reasoning + content")(lambda: test_provider(mock))
-        check("server · strip_think variants")(test_strip)
-        check("server · gemma-4 config + resolution")(test_config)
-        check("server · fallback chain")(lambda: test_fallback(mock))
-        check("bridge · HTTP + WebSocket end-to-end")(lambda: test_bridge_http_ws(mock))
+        check("provider · GLM-4.7-Flash SSE (reasoning + content, no duplication)")(
+            lambda: test_provider_glm(mock))
+        check("provider · minimal-think directive (GLM) + /no_think (Qwen3)")(
+            lambda: test_provider_minimal_think(mock))
+        check("server · model registry + glitch guard")(test_registry)
+        check("bridge · HTTP + WebSocket end-to-end")(lambda: test_server_bridge(mock))
+    with MockLLM() as mock2:
+        check("provider · glitch/empty/500 auto-fallback")(
+            lambda: test_provider_glitch_and_fallback(mock2))
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed\n")
     if FAIL:
         for name, err in FAIL:
             print(f"FAILED: {name}: {err}")
-        return 1
-    return 0
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

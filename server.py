@@ -1,438 +1,79 @@
-#!/usr/bin/env python3
 """
-══════════════════════════════════════════════════════════════════════
-  🌉  IG-Agent LLM Bridge  ·  server.py  (v3)
+Local bridge server (`http://localhost:8765`) for the Instagram DM Agent (v7).
 
-  Turns llmchat_provider.py (llmchat.in — 25 free models, no API key)
-  into a tiny local HTTP+WS API the Instagram console bot can call,
-  and keeps a complete JSON transcript per contact on disk.
-
-  Run:      python server.py            (default http://127.0.0.1:8787)
-
-  Endpoints:
-    GET  /health                → {ok, default_model, chain, uptime_s}
-    GET  /models                → {models: [...], default}
-    POST /reply                 → {messages, model?, max_tokens?, temperature?}
-                                  ← {text, model, elapsed_ms, fallback_index}
-    POST /v1/chat/completions   → OpenAI-style alias of /reply
-    POST /save                  → {transcript:{user, messages, persona, …}}
-                                  ← {file, total_messages}  (merged on disk)
-    GET  /transcripts           → list of saved contact JSONs
-    GET  /transcripts/<user>    → one contact's full transcript JSON
-
-  WebSocket protocol (ws://localhost:8787/ws) — JSON text frames:
-    {"id","type":"reply","messages":[…]}   → {"id","ok":true,"text","model"}
-    {"id","type":"health"}                 → {"id","ok":true,…}
-    {"id","type":"save","transcript":{…}}  → {"id","ok":true,"file",…}
-
-  Self-healing:
-    · model fallback chain — if a model errors/times out, next one is tried
-    · unknown model names silently fall back to the default (never a 400)
-    · <think>…</think> blocks from thinking models are stripped from output
-    · reply workers run in parallel threads so one slow chat never blocks
-      another; socket writes are serialized so frames can't interleave
-  Transcripts:
-    · ./transcripts/<user>.json — complete merged message history per
-      contact + the agent persona + memory profile; the client only sends
-      its recent window, the server merges by message id so nothing is
-      ever lost (the client's cap only limits its local cache).
-══════════════════════════════════════════════════════════════════════
+Features:
+  - Forwards `/v1/chat/completions` and `/inference/stream` to `llmchat.in`
+    using `LLMChatClient` (async `curl_cffi` with Chrome TLS impersonation).
+  - Dual-Model Parallel Architecture (v7):
+      * Primary Answering & Creative Agent Model: `@cf/zai-org/glm-4.7-flash`
+        (`zai-org/glm-4.7-flash`) with minimal-thinking prompt enforcement.
+      * Background Brain & Strategy Model: `@cf/google/gemma-4-26b-a4b-it`
+        (`google/gemma-4-26b-a4b-it`).
+      * Fast Fallback Model: `@cf/qwen/qwen3-30b-a3b-fp8`.
+  - Saves & loads per-user conversation transcripts, dynamic mood states,
+    scheduled reminders, cross-chat prank/relay missions, and privacy-filtered
+    global memory in `transcripts/` via `/transcripts` and `/global-memory`.
+  - Exposes `/health` and `/v1/models` for browser-console diagnostics.
 """
+
 from __future__ import annotations
 
-import argparse
 import asyncio
 import base64
+import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import re
 import struct
 import sys
-import threading
 import time
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from http import HTTPStatus
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-try:
-    from llmchat_provider import LLMChatProvider, MODELS
-except ImportError:
-    sys.exit("llmchat_provider.py not found — keep it next to server.py")
-
-try:  # emoji-safe Windows console
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
-
-# ═══════════════════════════ CONFIG ═══════════════════════════
-
-# Primary frontline answering model: Qwen3-30B-A3B-FP8 (fast, snappy DM replies)
-DEFAULT_MODEL = "qwen/qwen3-30b-a3b-fp8"
-# Background agentic brain model: Gemma-4-26B-A4B-IT (deep personality, memory, proactive tasks)
-BRAIN_MODEL = "google/gemma-4-26b-a4b-it"
-
-# Tried in order until one answers. Qwen3-30B first (answering primary),
-# then Gemma-4-26B, then fast llama/glm fallbacks.
-FALLBACK_CHAIN = [
-    "qwen/qwen3-30b-a3b-fp8",
-    "google/gemma-4-26b-a4b-it",
-    "meta/llama-3.3-70b-instruct-fp8-fast",
-    "meta/llama-4-scout-17b-16e-instruct",
-    "zai-org/glm-4.7-flash",
-    "meta/llama-3.1-70b-instruct",
-    "meta/llama-3.1-8b-instruct",
-    "moonshotai/kimi-k2.5",
-]
-
-NAME_MAP = {m.name: m for m in MODELS}
-_THINK_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.S)
-
-_THINKING = {
-    "qwen/qwen3-30b-a3b-fp8",
-    "google/gemma-4-26b-a4b-it",
-    "moonshotai/kimi-k2.5",
-    "qwen/qwq-32b",
-    "deepseek-ai/deepseek-r1-distill-qwen-32b",
-    "zai-org/glm-4.7-flash",
-}
-THINK_MIN_BUDGET = 1200   # lean token floor for fast low-think responses
-
-TIMEOUT = 120         # per-model HTTP timeout (s), set by --timeout
-START = time.time()
-
-# transcripts live next to server.py
-TRANSCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcripts")
-TRANSCRIPT_MAX_MSGS = 5000          # per file
-_SAVE_LOCK = threading.Lock()       # one writer at a time — merges must not race
-
-# ═══════════════════════════ HELPERS ═══════════════════════════
-
-
-def extract_think(text: str) -> tuple[str, str]:
-    """Return (clean_answer, thinking_trace) from raw model output."""
-    traces = [m.strip() for m in _THINK_RE.findall(text or "") if m and m.strip()]
-    cleaned = _THINK_RE.sub("", text or "")
-    cut = cleaned.find("<think")
-    if cut != -1:
-        unclosed = cleaned[cut:]
-        unclosed = re.sub(r"^<think(?:ing)?>", "", unclosed).strip()
-        if unclosed:
-            traces.append(unclosed)
-        cleaned = cleaned[:cut]
-    return cleaned.strip(), "\n".join(traces).strip()
-
-
-def strip_think(text: str) -> str:
-    """Remove reasoning blocks; also salvage a truncated (unclosed) one."""
-    cleaned, _ = extract_think(text)
-    return cleaned
-
-
-_LOW_THINK_DIRECTIVE = (
-    "\n\n[FAST-THINK DIRECTIVE /no_think]: Think SO LESS. "
-    "Keep <think> empty or under 10 words max, close </think> immediately, "
-    "and output ONLY the final response."
+from llmchat_provider import (
+     DEFAULT_BRAIN_MODEL,
+    DEFAULT_MODEL,
+    FALLBACK_CHAIN,
+    LLMCHAT_BASE_URL,
+    MODEL_REGISTRY,
+    LLMChatClient,
+    is_thinking_model,
+    resolve_short_model,
+    resolve_wire_model,
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("ig_bridge_server")
 
-def _apply_low_think(messages: list[dict], model_name: str, fast_think: bool = True) -> list[dict]:
-    """Fine-tune prompt for Qwen3 / Gemma-4 so internal thinking stays minimal."""
-    if not fast_think or not messages:
-        return messages
-    out = [dict(m) for m in messages]
-    if model_name in ("qwen/qwen3-30b-a3b-fp8", "google/gemma-4-26b-a4b-it"):
-        if out[0].get("role") == "system":
-            if "/no_think" not in str(out[0].get("content", "")):
-                out[0]["content"] = str(out[0].get("content", "")) + _LOW_THINK_DIRECTIVE
-        else:
-            out.insert(0, {"role": "system", "content": _LOW_THINK_DIRECTIVE.strip()})
-        # For Qwen3, appending /no_think to the last user turn triggers native 0-token think mode
-        if model_name == "qwen/qwen3-30b-a3b-fp8":
-            for idx in range(len(out) - 1, -1, -1):
-                if out[idx].get("role") == "user":
-                    u_txt = str(out[idx].get("content", ""))
-                    if "/no_think" not in u_txt:
-                        out[idx]["content"] = u_txt + " /no_think"
-                    break
-    return out
-
-
-def resolve_model(query) -> str | None:
-    """Exact or substring match; None = unknown → caller uses fallback chain.
-
-    Accepts both the registry name ("google/gemma-4-26b-a4b-it") and the wire
-    form ("@cf/google/gemma-4-26b-a4b-it"), case-insensitively.
-    """
-    if not query:
-        return DEFAULT_MODEL
-    q = str(query).strip()
-    if q.startswith("@") and "/" in q:
-        q = q.split("/", 1)[1]
-    if q in NAME_MAP:
-        return q
-    ql = q.lower()
-    for name in NAME_MAP:
-        if name.lower() == ql:
-            return name
-    for name in NAME_MAP:
-        if ql in name.lower():
-            return name
-    return None
-
-
-def model_endpoint(name: str) -> str:
-    """Registry name → the exact wire model id ("@cf/…") used upstream."""
-    m = NAME_MAP.get(name)
-    return m.endpoint if m else name
-
-
-def _generate(messages: list, model: str, max_tokens: int, temperature: float):
-    """Blocking: stream one model to completion.
-
-    Returns (raw_text, reasoning_chars, usage).  raw_text still carries the
-    <think>…</think> wrapper the provider adds around reasoning_content;
-    strip_think() removes it.
-    """
-    prov = LLMChatProvider(
-        model=model,
-        system=None,               # system prompt already inside messages
-        temperature=temperature,
-        max_tokens=max_tokens,
-        timeout=TIMEOUT,
-        retries=1,                 # fail fast — the fallback chain retries
+HOST = os.environ.get("IG_BRIDGE_HOST", "0.0.0.0")
+PORT = int(os.environ.get("IG_BRIDGE_PORT", "8787"))
+TRANSCRIPTS_DIR = Path(
+    os.environ.get(
+        "IG_TRANSCRIPTS_DIR",
+        str(Path(__file__).resolve().parent / "transcripts"),
     )
+)
+TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+GLOBAL_MEMORY_FILE = TRANSCRIPTS_DIR / "_global_memory.json"
 
-    async def run() -> str:
-        out: list[str] = []
-        async for tok in prov.chat(messages=messages):
-            out.append(tok)
-        return "".join(out)
+# Token floor for thinking models (GLM-4.7-Flash, Gemma-4, Qwen3) so internal
+# reasoning_content never starves the visible reply content.
+THINK_MIN_BUDGET = int(os.environ.get("IG_THINK_MIN_BUDGET", "2500"))
 
-    raw = asyncio.run(run())
-    return raw, prov.reasoning_chars, dict(prov.last_usage)
+START = time.time()
+BOT_SCRIPT_PATH = Path(__file__).resolve().parent / "ig-agent-chat.js"
 
-
-def generate_with_fallback(messages, model_query=None, max_tokens=512, temperature=0.9, fast_think=True):
-    """Shared by POST /reply, POST /brain, and the WebSocket channel."""
-    max_tokens = int(max_tokens or 512)
-    temperature = float(temperature if temperature is not None else 0.9)
-    first = resolve_model(model_query)
-    chain: list[str] = []
-    for name in ([first] if first else []) + FALLBACK_CHAIN:
-        if name not in chain:
-            chain.append(name)
-    errors = []
-    for i, name in enumerate(chain):
-        t0 = time.time()
-        budget = max(max_tokens, THINK_MIN_BUDGET) if name in _THINKING else max_tokens
-        tuned_msgs = _apply_low_think(messages, name, fast_think=fast_think)
-        try:
-            raw, reasoning_chars, usage = _generate(tuned_msgs, name, budget, temperature)
-            text, thinking_trace = extract_think(raw)
-            if not reasoning_chars and thinking_trace:
-                reasoning_chars = len(thinking_trace)
-            if not text:
-                raise RuntimeError("empty output")
-            dt = time.time() - t0
-            tokens = int(usage.get("completion_tokens") or 0)
-            print(f"[reply] {name}  {dt:.1f}s  {len(text)} chars"
-                  + (f"  · think {reasoning_chars} ch" if reasoning_chars else "")
-                  + (f"  · {tokens} tok" if tokens else "")
-                  + (f"  (fallback #{i})" if i else ""), flush=True)
-            return {
-                "text": text,
-                "model": name,
-                "endpoint": model_endpoint(name),
-                "elapsed_ms": round(dt * 1000),
-                "fallback_index": i,
-                "reasoning_chars": reasoning_chars,
-                "thinking_trace": thinking_trace[:500] if thinking_trace else "",
-                "usage": usage,
-            }
-        except Exception as e:
-            errors.append(f"{name}: {str(e)[:160]}")
-            print(f"[fall]  {errors[-1]}", flush=True)
-    raise RuntimeError("all models failed: " + " | ".join(errors[:2]))
-
-
-# ═══════════════════ TRANSCRIPTS (per-contact JSON files) ═══════════════════
-
-
-def _safe_user(user: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9._-]", "_", str(user or "").lstrip("@").strip())
-    return name or "unknown"
-
-
-def _transcript_path(user: str) -> str:
-    return os.path.join(TRANSCRIPT_DIR, _safe_user(user) + ".json")
-
-
-def save_transcript(tr: dict) -> dict:
-    """Merge a client transcript window + complete v6 agentic process log,
-    brain profile, and agent state into the on-disk JSON file. Atomic write."""
-    user = str(tr.get("user") or "").strip() or "unknown"
-    path = _transcript_path(user)
-    with _SAVE_LOCK:
-        old_msgs: dict[str, dict] = {}
-        old_proc: dict[str, dict] = {}
-        keep: dict = {}
-        if os.path.exists(path):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    old = json.load(f)
-                for m in old.get("messages", []):
-                    if isinstance(m, dict) and m.get("id"):
-                        old_msgs[str(m["id"])] = m
-                for p_entry in old.get("process_log", []):
-                    if isinstance(p_entry, dict) and p_entry.get("turn_id"):
-                        old_proc[str(p_entry["turn_id"])] = p_entry
-                keep = {k: old.get(k) for k in (
-                    "persona", "owner_bio", "memory_profile",
-                    "brain_profile", "agent_state", "models"
-                )}
-            except Exception:
-                old_msgs, old_proc, keep = {}, {}, {}
-
-        incoming = tr.get("messages") or []
-        for m in incoming:
-            if isinstance(m, dict) and m.get("id"):
-                mid = str(m["id"])
-                prev_m = old_msgs.get(mid) or {}
-                merged_m = {**prev_m, **m}
-                if m.get("ts") and not merged_m.get("iso_time"):
-                    try:
-                        merged_m["iso_time"] = datetime.fromtimestamp(
-                            float(m["ts"]) / 1000.0, tz=timezone.utc
-                        ).isoformat(timespec="seconds")
-                    except Exception:
-                        pass
-                old_msgs[mid] = merged_m
-
-        for p_entry in (tr.get("process_log") or []):
-            if isinstance(p_entry, dict) and p_entry.get("turn_id"):
-                old_proc[str(p_entry["turn_id"])] = p_entry
-
-        msgs = sorted(old_msgs.values(), key=lambda m: m.get("ts") or 0)
-        proc_list = sorted(old_proc.values(), key=lambda x: x.get("at") or 0)[-500:]
-        brain_prof = tr.get("brain_profile") or keep.get("brain_profile") or {}
-        agent_st = tr.get("agent_state") or keep.get("agent_state") or {}
-        models_meta = tr.get("models") or keep.get("models") or {
-            "answering_model": model_endpoint(DEFAULT_MODEL),
-            "brain_model": model_endpoint(BRAIN_MODEL),
-        }
-
-        doc = {
-            "schema_version": "6.0-agentic",
-            "user": user,
-            "thread_fbid": tr.get("thread_fbid"),
-            "updated_at": tr.get("updated_at")
-                          or datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "message_count": len(msgs),
-            "process_turn_count": len(proc_list),
-            "models": models_meta,
-            "agent_state": agent_st,
-            "brain_profile": brain_prof,
-            "memory_profile": tr.get("memory_profile") or keep.get("memory_profile") or "",
-            "persona": tr.get("persona") or keep.get("persona") or "",
-            "owner_bio": tr.get("owner_bio") or keep.get("owner_bio") or "",
-            "process_log": proc_list,
-            "messages": msgs[-TRANSCRIPT_MAX_MSGS:],
-        }
-        os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(doc, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    total = len(doc["messages"])
-    print(f"[save] @{_safe_user(user)}  {total} msgs ({len(proc_list)} agentic turns)  →  {os.path.basename(path)}", flush=True)
-    return {"file": path, "total_messages": total, "process_turn_count": len(proc_list)}
-
-
-def list_transcripts() -> list[dict]:
-    out = []
-    if os.path.isdir(TRANSCRIPT_DIR):
-        for fn in sorted(os.listdir(TRANSCRIPT_DIR)):
-            if not fn.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(TRANSCRIPT_DIR, fn), encoding="utf-8") as f:
-                    d = json.load(f)
-                out.append({
-                    "user": d.get("user", fn[:-5]),
-                    "file": fn,
-                    "message_count": d.get("message_count", len(d.get("messages", []))),
-                    "updated_at": d.get("updated_at", ""),
-                })
-            except Exception:
-                out.append({"user": fn[:-5], "file": fn, "message_count": None, "updated_at": "unreadable"})
-    return out
-
-
-def load_transcript(user: str) -> dict | None:
-    path = _transcript_path(user)
-    if not os.path.exists(path):
-        return None
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-GLOBAL_MEM_PATH = os.path.join(TRANSCRIPT_DIR, "_global_memory.json")
-
-
-def save_global_memory(gm: dict) -> dict:
-    """Persist the cross-chat global memory + social graph + gossip on disk."""
-    with _SAVE_LOCK:
-        old: dict = {}
-        if os.path.exists(GLOBAL_MEM_PATH):
-            try:
-                with open(GLOBAL_MEM_PATH, encoding="utf-8") as f:
-                    old = json.load(f)
-            except Exception:
-                old = {}
-        people = dict(old.get("people") or {})
-        for k, v in (gm.get("people") or {}).items():
-            if isinstance(v, dict):
-                people[str(k)] = v
-        conns = gm.get("connections") or old.get("connections") or []
-        gossip = (old.get("gossip") or []) + (gm.get("gossip") or [])
-        seen_g = set()
-        dedup_gossip = []
-        for g in gossip:
-            gs = str(g).strip()
-            if gs and gs not in seen_g:
-                seen_g.add(gs)
-                dedup_gossip.append(gs)
-        doc = {
-            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "connections": conns,
-            "people": people,
-            "gossip": dedup_gossip[-200:],
-        }
-        os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
-        tmp = GLOBAL_MEM_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(doc, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, GLOBAL_MEM_PATH)
-    return {"file": GLOBAL_MEM_PATH, "people_count": len(doc["people"]), "gossip_count": len(doc["gossip"])}
-
-
-def load_global_memory() -> dict:
-    if os.path.exists(GLOBAL_MEM_PATH):
-        try:
-            with open(GLOBAL_MEM_PATH, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"connections": [], "people": {}, "gossip": []}
-
-
-# ═══════════════════════════ WEBSOCKET (CSP bypass) ═══════════════════════════
-# Instagram's CSP blocks fetch() to http://127.0.0.1 but ALLOWS ws://localhost:*.
-# So the page-side bot talks to the bridge over a tiny hand-rolled WebSocket.
-# Protocol (JSON text frames): {"id","type":"reply"|"health"|"save",...}
-# → {"id","ok":true,...} / {"id","ok":false,"error"}
-
+# ═══════════════════ WEBSOCKET (CSP bypass for the page script) ═══════════════════
+# Instagram's CSP blocks fetch() to http://127.0.0.1 but ALLOWS ws://localhost:*,
+# so the in-page agent talks to this bridge over a tiny RFC6455 WebSocket.
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
@@ -440,52 +81,314 @@ def _ws_accept(key: str) -> str:
     return base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
 
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept",
+    "Access-Control-Max-Age": "86400",
+}
+
+
+def _safe_filename(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_.\-@]", "_", (name or "unknown").strip())
+    return cleaned[:100] or "unknown"
+
+
+def _iso_utc(ts_ms: int | float | None = None) -> str:
+    try:
+        sec = (float(ts_ms) / 1000.0) if ts_ms else time.time()
+        return dt.datetime.fromtimestamp(sec, tz=dt.timezone.utc).isoformat()
+    except Exception:
+        return dt.datetime.now(tz=dt.timezone.utc).isoformat()
+
+
+def _load_transcript(username: str) -> dict[str, Any]:
+    safe = _safe_filename(username)
+    fpath = TRANSCRIPTS_DIR / f"{safe}.json"
+    if not fpath.exists():
+        return {
+            "username": username,
+            "thread_id": None,
+            "updated_at": None,
+            "message_count": 0,
+            "brain_profile": None,
+            "agent_state": None,
+            "mood_state": None,
+            "reminders": [],
+            "missions": [],
+            "process_log": [],
+            "messages": [],
+        }
+    try:
+        data = json.loads(fpath.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Invalid transcript root")
+        data.setdefault("username", username)
+        data.setdefault("messages", [])
+        data.setdefault("brain_profile", None)
+        data.setdefault("agent_state", None)
+        data.setdefault("mood_state", None)
+        data.setdefault("reminders", [])
+        data.setdefault("missions", [])
+        data.setdefault("process_log", [])
+        data["message_count"] = len(data["messages"])
+        return data
+    except Exception as exc:
+        log.warning("Failed to read transcript %s: %s", fpath, exc)
+        return {
+            "username": username,
+            "thread_id": None,
+            "updated_at": None,
+            "message_count": 0,
+            "brain_profile": None,
+            "agent_state": None,
+            "mood_state": None,
+            "reminders": [],
+            "missions": [],
+            "process_log": [],
+            "messages": [],
+        }
+
+
+def _save_transcript(
+    username: str,
+    thread_id: str | None,
+    messages: list[dict[str, Any]],
+    brain_profile: dict[str, Any] | None = None,
+    agent_state: dict[str, Any] | None = None,
+    mood_state: dict[str, Any] | None = None,
+    reminders: list[dict[str, Any]] | None = None,
+    missions: list[dict[str, Any]] | None = None,
+    process_entry: dict[str, Any] | None = None,
+    process_log: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    existing = _load_transcript(username)
+    by_key: dict[str, dict[str, Any]] = {}
+
+    for msg in existing.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        key = str(
+            msg.get("id")
+            or f"{msg.get('ts', 0)}_{msg.get('mine', False)}_{msg.get('text', '')[:32]}"
+        )
+        by_key[key] = msg
+
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        ts_val = msg.get("ts") or int(time.time() * 1000)
+        enriched = dict(msg)
+        enriched.setdefault("iso_time", _iso_utc(ts_val))
+        key = str(
+            enriched.get("id")
+            or f"{ts_val}_{enriched.get('mine', False)}_{enriched.get('text', '')[:32]}"
+        )
+        if key in by_key and isinstance(by_key[key], dict):
+            merged_msg = dict(by_key[key])
+            merged_msg.update(enriched)
+            by_key[key] = merged_msg
+        else:
+            by_key[key] = enriched
+
+    merged = sorted(by_key.values(), key=lambda m: int(m.get("ts") or 0))[-400:]
+
+    merged_process_log: list[dict[str, Any]] = list(existing.get("process_log") or [])
+    if isinstance(process_log, list) and process_log:
+        seen_ids = {
+            str(p.get("turn_id") or p.get("at"))
+            for p in merged_process_log
+            if isinstance(p, dict)
+        }
+        for p in process_log:
+            if isinstance(p, dict):
+                pid = str(p.get("turn_id") or p.get("at") or "")
+                if not pid or pid not in seen_ids:
+                    merged_process_log.append(p)
+                    if pid:
+                        seen_ids.add(pid)
+    if isinstance(process_entry, dict) and process_entry:
+        merged_process_log.append(process_entry)
+    merged_process_log = merged_process_log[-120:]
+
+    payload = {
+        "username": username,
+        "thread_id": thread_id or existing.get("thread_id"),
+        "updated_at": int(time.time() * 1000),
+        "updated_iso": _iso_utc(),
+        "message_count": len(merged),
+        "brain_profile": (
+            brain_profile
+            if brain_profile is not None
+            else existing.get("brain_profile")
+        ),
+        "agent_state": (
+            agent_state
+            if agent_state is not None
+            else existing.get("agent_state")
+        ),
+        "mood_state": (
+            mood_state
+            if mood_state is not None
+            else existing.get("mood_state")
+        ),
+        "reminders": (
+            reminders
+            if reminders is not None
+            else existing.get("reminders", [])
+        ),
+        "missions": (
+            missions
+            if missions is not None
+            else existing.get("missions", [])
+        ),
+        "process_log": merged_process_log,
+        "messages": merged,
+    }
+    safe = _safe_filename(username)
+    fpath = TRANSCRIPTS_DIR / f"{safe}.json"
+    fpath.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return payload
+
+
+def _gossip_key(item: Any) -> str:
+    """Gossip entries may be plain strings (page-side) or dicts (REST side)."""
+    if isinstance(item, dict):
+        return f"{item.get('user', '')}:{str(item.get('text', ''))[:80]}"
+    return str(item)[:100]
+
+
+def _normalize_contacts(data: dict[str, Any]) -> dict[str, Any]:
+    """Accept either `contacts` (REST) or `people` (page-side global memory)."""
+    contacts = data.get("contacts")
+    people = data.get("people")
+    if not isinstance(contacts, dict):
+        contacts = {}
+    if isinstance(people, dict):
+        for k, v in people.items():
+            contacts.setdefault(k, v)
+    data["contacts"] = contacts
+    return data
+
+
+def _load_global_memory() -> dict[str, Any]:
+    if not GLOBAL_MEMORY_FILE.exists():
+        return {
+            "updated_at": int(time.time() * 1000),
+            "contacts": {},
+            "people": {},
+            "gossip": [],
+            "reminders": [],
+            "missions": [],
+        }
+    try:
+        data = json.loads(GLOBAL_MEMORY_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Invalid global memory root")
+        data.setdefault("gossip", [])
+        data.setdefault("reminders", [])
+        data.setdefault("missions", [])
+        _normalize_contacts(data)
+        return data
+    except Exception as exc:
+        log.warning("Failed to load global memory: %s", exc)
+        return {
+            "updated_at": int(time.time() * 1000),
+            "contacts": {},
+            "people": {},
+            "gossip": [],
+            "reminders": [],
+            "missions": [],
+        }
+
+
+def _save_global_memory(update: dict[str, Any]) -> dict[str, Any]:
+    current = _load_global_memory()
+    incoming_contacts = update.get("contacts")
+    if not isinstance(incoming_contacts, dict):
+        incoming_contacts = update.get("people")
+    if isinstance(incoming_contacts, dict):
+        for uname, info in incoming_contacts.items():
+            if isinstance(info, dict):
+                existing_contact = current["contacts"].get(uname)
+                if isinstance(existing_contact, dict):
+                    existing_contact.update(info)
+                    current["contacts"][uname] = existing_contact
+                else:
+                    current["contacts"][uname] = info
+    # keep the page-side `people` mirror in sync with `contacts`
+    if isinstance(current.get("people"), dict):
+        current["people"].update(current["contacts"])
+
+    if isinstance(update.get("gossip"), list):
+        combined = list(current.get("gossip") or []) + list(update["gossip"])
+        seen: set[str] = set()
+        deduped: list[Any] = []
+        for item in combined[-200:]:
+            key = _gossip_key(item)
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(item)
+        current["gossip"] = deduped[-100:]
+
+    if isinstance(update.get("reminders"), list):
+        current["reminders"] = update["reminders"][-100:]
+    if isinstance(update.get("missions"), list):
+        current["missions"] = update["missions"][-100:]
+    current["updated_at"] = int(time.time() * 1000)
+    GLOBAL_MEMORY_FILE.write_text(
+        json.dumps(current, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return current
+
+
 class _WSConn:
-    """Minimal RFC6455 server-side connection (text frames, ping/pong/close)."""
+    """Minimal async RFC6455 server connection (text frames, ping/pong/close)."""
 
-    def __init__(self, rfile, wfile):
-        self.rfile, self.wfile = rfile, wfile
-        # Reply workers may complete out of order; serialize physical writes so
-        # their WebSocket frames can never interleave on the same socket.
-        self._write_lock = threading.Lock()
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader, self.writer = reader, writer
+        self._write_lock = asyncio.Lock()
 
-    def _read_exact(self, n: int) -> bytes:
-        buf = b""
-        while len(buf) < n:
-            chunk = self.rfile.read(n - len(buf))
-            if not chunk:
-                raise ConnectionError("client gone")
-            buf += chunk
-        return buf
+    # ── reading ────────────────────────────────────────────────────────────
+    async def _read_exact(self, n: int) -> bytes:
+        return await self.reader.readexactly(n)
 
-    def recv_text(self, timeout_s: float = 600):
-        """Return next text payload (handles ping/pong/close). None = closed."""
+    async def recv_text(self, timeout_s: float = 900):
+        """Return the next text payload, or None when the client closes."""
         while True:
-            h = self._read_exact(2)
-            fin, opcode = (h[0] >> 7) & 1, h[0] & 0x0F
-            masked, length = (h[1] >> 7) & 1, h[1] & 0x7F
+            try:
+                head = await asyncio.wait_for(self._read_exact(2), timeout_s)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+                return None
+            opcode = head[0] & 0x0F
+            masked, length = (head[1] >> 7) & 1, head[1] & 0x7F
             if length == 126:
-                length = struct.unpack(">H", self._read_exact(2))[0]
+                length = struct.unpack(">H", await self._read_exact(2))[0]
             elif length == 127:
-                length = struct.unpack(">Q", self._read_exact(8))[0]
-            mask = self._read_exact(4) if masked else None
-            payload = self._read_exact(length) if length else b""
+                length = struct.unpack(">Q", await self._read_exact(8))[0]
+            mask = await self._read_exact(4) if masked else None
+            payload = await self._read_exact(length) if length else b""
             if mask:
                 payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-            if opcode == 0x1:                       # text
+            if opcode == 0x1:                       # text frame
                 return payload.decode("utf-8", "replace")
-            if opcode == 0x9:                       # ping → pong
-                self.send_frame(payload, 0xA)
+            if opcode == 0x9:                       # ping -> pong
+                await self.send_frame(payload, 0xA)
                 continue
             if opcode == 0x8:                       # close
                 try:
-                    self.send_frame(payload, 0x8)
+                    await self.send_frame(payload, 0x8)
                 except Exception:
                     pass
                 return None
-            continue                                # pong/other — ignore
+            continue                                # pong / continuation
 
-    def send_frame(self, data: bytes, opcode: int = 0x1):
+    # ── writing ────────────────────────────────────────────────────────────
+    async def send_frame(self, data: bytes, opcode: int = 0x1) -> None:
         header = bytes([0x80 | opcode])
         n = len(data)
         if n < 126:
@@ -494,256 +397,580 @@ class _WSConn:
             header += bytes([126]) + struct.pack(">H", n)
         else:
             header += bytes([127]) + struct.pack(">Q", n)
-        with self._write_lock:
-            self.wfile.write(header + data)
-            self.wfile.flush()
-
-    def send_text(self, s: str):
-        self.send_frame(s.encode("utf-8"))
-
-
-def _serve_ws_reply(conn: _WSConn, req: dict) -> None:
-    """Generate one reply or background brain pass in its own worker thread."""
-    rid = req.get("id")
-    req_type = req.get("type") or "reply"
-    try:
-        messages = req.get("messages")
-        if not isinstance(messages, list) or not messages:
-            raise ValueError("'messages' must be a non-empty list")
-        default_m = BRAIN_MODEL if req_type == "brain" else DEFAULT_MODEL
-        model_q = req.get("model") or default_m
-        result = generate_with_fallback(
-            messages, model_q, req.get("max_tokens"), req.get("temperature"),
-            fast_think=req.get("fast_think", True))
-        resp = {"id": rid, "ok": True, "role_type": req_type, **result}
-    except Exception as e:
-        resp = {"id": rid, "ok": False, "error": str(e)[:300]}
-    try:
-        conn.send_text(json.dumps(resp))
-    except (BrokenPipeError, ConnectionError, OSError, ValueError):
-        pass
-
-
-def handle_ws(handler) -> None:
-    """Upgrade + serve one WebSocket client; reply jobs run independently."""
-    key = handler.headers.get("Sec-WebSocket-Key", "")
-    handler.close_connection = True     # socket is ours now, not the HTTP loop's
-    handler.send_response(101, "Switching Protocols")
-    handler.send_header("Upgrade", "websocket")
-    handler.send_header("Connection", "Upgrade")
-    handler.send_header("Sec-WebSocket-Accept", _ws_accept(key))
-    handler.end_headers()
-    conn = _WSConn(handler.rfile, handler.wfile)
-    print("[ws] client connected", flush=True)
-    try:
-        while True:
-            raw = conn.recv_text()
-            if raw is None:
-                break
+        async with self._write_lock:
             try:
-                req = json.loads(raw)
-            except Exception:
-                conn.send_text(json.dumps({"ok": False, "error": "bad json"}))
-                continue
-            if req.get("type") == "health":
-                resp = {"id": req.get("id"), "ok": True,
+                self.writer.write(header + data)
+                await self.writer.drain()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    async def send_text(self, s: str) -> None:
+        await self.send_frame(s.encode("utf-8"))
+
+    async def send_json(self, obj: dict) -> None:
+        await self.send_text(json.dumps(obj, ensure_ascii=False))
+
+
+class BridgeServer:
+    """Async HTTP server handling OpenAI-compatible completions, SSE, and transcripts."""
+
+    def __init__(
+        self,
+        host: str = HOST,
+        port: int = PORT,
+        llm_client: LLMChatClient | None = None,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.client = llm_client or LLMChatClient()
+        self._server: asyncio.AbstractServer | None = None
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(
+            self._handle_client, self.host, self.port
+        )
+        log.info(
+            "IG Bridge Server v7 listening on http://%s:%d (answering=%s, brain=%s -> %s)",
+            self.host,
+            self.port,
+            DEFAULT_MODEL,
+            DEFAULT_BRAIN_MODEL,
+            LLMCHAT_BASE_URL,
+        )
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+        await self.client.close()
+
+    async def _send_response(
+        self,
+        writer: asyncio.StreamWriter,
+        status: int,
+        body: bytes,
+        content_type: str = "application/json; charset=utf-8",
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        phrase = HTTPStatus(status).phrase
+        headers = {
+            "Content-Type": content_type,
+            "Content-Length": str(len(body)),
+            "Connection": "close",
+            **CORS_HEADERS,
+            **(extra_headers or {}),
+        }
+        header_lines = [f"HTTP/1.1 {status} {phrase}\r\n"]
+        for k, v in headers.items():
+            header_lines.append(f"{k}: {v}\r\n")
+        header_lines.append("\r\n")
+        writer.write("".join(header_lines).encode("utf-8") + body)
+        await writer.drain()
+
+    async def _send_json(
+        self,
+        writer: asyncio.StreamWriter,
+        status: int,
+        payload: Any,
+    ) -> None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        await self._send_response(writer, status, raw)
+
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            request_line = await asyncio.wait_for(reader.readline(), timeout=15.0)
+            if not request_line:
+                return
+            parts = request_line.decode("utf-8", errors="replace").strip().split(" ")
+            if len(parts) < 2:
+                return
+            method, raw_target = parts[0].upper(), parts[1]
+
+            headers: dict[str, str] = {}
+            while True:
+                hline = await asyncio.wait_for(reader.readline(), timeout=15.0)
+                if not hline or hline in (b"\r\n", b"\n"):
+                    break
+                decoded = hline.decode("utf-8", errors="replace").strip()
+                if ":" in decoded:
+                    k, v = decoded.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+
+            content_length = int(headers.get("content-length", "0") or "0")
+            body_bytes = b""
+            if content_length > 0:
+                body_bytes = await asyncio.wait_for(
+                    reader.readexactly(content_length), timeout=30.0
+                )
+
+            if method == "OPTIONS":
+                await self._send_response(writer, 204, b"")
+                return
+
+            # ── WebSocket upgrade (used by the in-page agent, CSP-proof) ──
+            # Browsers send `Connection: Upgrade` (not "websocket"), so accept
+            # either that or a Sec-WebSocket-Key handshake.
+            if (headers.get("upgrade", "").lower() == "websocket"
+                    and ("upgrade" in headers.get("connection", "").lower()
+                         or headers.get("sec-websocket-key"))):
+                await self._handle_ws(reader, writer, headers)
+                return
+
+            parsed = urlparse(raw_target)
+            path = parsed.path.rstrip("/") or "/"
+            query = parse_qs(parsed.query)
+
+            if path in ("/", "/health", "/status"):
+                await self._send_json(
+                    writer,
+                    200,
+                    {
+                        "status": "ok",
+                        "version": "7.0",
+                        "provider": "llmchat.in",
                         "default_model": DEFAULT_MODEL,
-                        "default_endpoint": model_endpoint(DEFAULT_MODEL),
-                        "brain_model": BRAIN_MODEL,
-                        "brain_endpoint": model_endpoint(BRAIN_MODEL),
+                        "default_endpoint": resolve_wire_model(DEFAULT_MODEL),
+                        "default_wire_model": resolve_wire_model(DEFAULT_MODEL),
+                        "brain_model": DEFAULT_BRAIN_MODEL,
+                        "brain_endpoint": resolve_wire_model(DEFAULT_BRAIN_MODEL),
+                        "brain_wire_model": resolve_wire_model(DEFAULT_BRAIN_MODEL),
+                        "fallback_chain": FALLBACK_CHAIN,
                         "chain": FALLBACK_CHAIN,
-                        "uptime_s": round(time.time() - START)}
-                conn.send_text(json.dumps(resp))
-                continue
-            if req.get("type") == "bot":
-                bot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ig-agent-chat.js")
-                try:
-                    with open(bot_path, encoding="utf-8") as bf:
-                        code = bf.read()
-                    resp = {"id": req.get("id"), "ok": True, "code": code}
-                except Exception as e:
-                    resp = {"id": req.get("id"), "ok": False, "error": str(e)[:200]}
-                conn.send_text(json.dumps(resp))
-                continue
-            if req.get("type") == "save":
-                rid = req.get("id")
-                try:
-                    tr = req.get("transcript")
-                    if not isinstance(tr, dict) or not tr.get("user"):
-                        raise ValueError("'transcript' with 'user' is required")
-                    r = save_transcript(tr)
-                    resp = {"id": rid, "ok": True, **r}
-                except Exception as e:
-                    resp = {"id": rid, "ok": False, "error": str(e)[:300]}
-                try:
-                    conn.send_text(json.dumps(resp))
-                except (BrokenPipeError, ConnectionError, OSError, ValueError):
-                    pass
-                continue
-            if req.get("type") == "save_global":
-                rid = req.get("id")
-                try:
-                    gm = req.get("global_memory") or req.get("global")
-                    if not isinstance(gm, dict):
-                        raise ValueError("'global_memory' dict is required")
-                    r = save_global_memory(gm)
-                    resp = {"id": rid, "ok": True, "people": r["people_count"], **r}
-                except Exception as e:
-                    resp = {"id": rid, "ok": False, "error": str(e)[:300]}
-                try:
-                    conn.send_text(json.dumps(resp))
-                except (BrokenPipeError, ConnectionError, OSError, ValueError):
-                    pass
-                continue
-            if req.get("type") == "get_global":
-                rid = req.get("id")
-                gm_doc = load_global_memory()
-                conn.send_text(json.dumps({"id": rid, "ok": True, "global_memory": gm_doc, "global": gm_doc}))
-                continue
-            # Do not block this connection while an LLM streams. The browser's
-            # request ids let responses safely arrive in whichever order finishes first.
-            threading.Thread(target=_serve_ws_reply, args=(conn, req), daemon=True).start()
-    except (ConnectionError, OSError, ValueError) as e:
-        print(f"[ws] client left ({e})", flush=True)
+                        "models": list(MODEL_REGISTRY.keys()),
+                        "transcripts_dir": str(TRANSCRIPTS_DIR),
+                        "uptime_s": round(time.time() - START),
+                        "unconditional_idle_starter": False,
+                        "privacy_wall": True,
+                    },
+                )
+                return
 
+            if path == "/v1/models" and method == "GET":
+                await self._send_json(
+                    writer,
+                    200,
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": short_id,
+                                "wire_id": info["id"],
+                                "object": "model",
+                                "owned_by": info["provider"],
+                                "thinking": info["thinking"],
+                                "context_window": info["context"],
+                            }
+                            for short_id, info in MODEL_REGISTRY.items()
+                        ],
+                    },
+                )
+                return
 
-# ═══════════════════════════ HTTP ═══════════════════════════
+            if path == "/global-memory":
+                if method == "GET":
+                    await self._send_json(writer, 200, _load_global_memory())
+                    return
+                if method in ("POST", "PUT"):
+                    payload = json.loads(body_bytes.decode("utf-8") or "{}")
+                    saved = _save_global_memory(payload)
+                    await self._send_json(writer, 200, saved)
+                    return
 
+            if path.startswith("/transcripts"):
+                sub = path[len("/transcripts") :].strip("/")
+                if method == "GET" and not sub:
+                    files = sorted(TRANSCRIPTS_DIR.glob("*.json"))
+                    items = []
+                    for f in files:
+                        if f.name == "_global_memory.json":
+                            continue
+                        try:
+                            d = json.loads(f.read_text(encoding="utf-8"))
+                            items.append(
+                                {
+                                    "username": d.get("username", f.stem),
+                                    "thread_id": d.get("thread_id"),
+                                    "message_count": len(d.get("messages", [])),
+                                    "updated_at": d.get("updated_at"),
+                                    "brain_profile": d.get("brain_profile"),
+                                    "agent_state": d.get("agent_state"),
+                                    "mood_state": d.get("mood_state"),
+                                }
+                            )
+                        except Exception:
+                            pass
+                    await self._send_json(writer, 200, {"transcripts": items})
+                    return
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "IGAgentBridge/3.0"
+                username = sub or (query.get("username", [""])[0])
+                if not username:
+                    await self._send_json(
+                        writer, 400, {"error": "username required"}
+                    )
+                    return
 
-    # -- CORS incl. Private Network Access (https page → http://127.0.0.1)
-    def _cors(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Max-Age", "600")
-        self.send_header("Access-Control-Allow-Private-Network", "true")
+                if method == "GET":
+                    await self._send_json(writer, 200, _load_transcript(username))
+                    return
 
-    def _json(self, code: int, obj: dict) -> None:
-        body = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self._cors()
-        self.end_headers()
-        self.wfile.write(body)
+                if method in ("POST", "PUT"):
+                    payload = json.loads(body_bytes.decode("utf-8") or "{}")
+                    saved = _save_transcript(
+                        username=username,
+                        thread_id=payload.get("thread_id"),
+                        messages=payload.get("messages", []),
+                        brain_profile=payload.get("brain_profile"),
+                        agent_state=payload.get("agent_state"),
+                        mood_state=payload.get("mood_state"),
+                        reminders=payload.get("reminders"),
+                        missions=payload.get("missions"),
+                        process_entry=payload.get("process_entry"),
+                        process_log=payload.get("process_log"),
+                    )
+                    await self._send_json(writer, 200, saved)
+                    return
 
-    def log_message(self, fmt, *args):  # silence default stderr noise
-        pass
+            if path in ("/v1/chat/completions", "/inference/stream") and method == "POST":
+                await self._handle_completions(writer, path, body_bytes)
+                return
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self._cors()
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def do_GET(self):
-        path = urlparse(self.path).path
-        if (self.headers.get("Upgrade", "").lower() == "websocket"
-                and path in ("/ws", "/")):
-            handle_ws(self)
-            return
-        if path == "/health":
-            self._json(200, {
-                "ok": True,
-                "default_model": DEFAULT_MODEL,
-                "default_endpoint": model_endpoint(DEFAULT_MODEL),
-                "brain_model": BRAIN_MODEL,
-                "brain_endpoint": model_endpoint(BRAIN_MODEL),
-                "chain": FALLBACK_CHAIN,
-                "uptime_s": round(time.time() - START),
-            })
-        elif path == "/models":
-            self._json(200, {"models": [m.name for m in MODELS], "default": DEFAULT_MODEL})
-        elif path == "/global_memory":
-            self._json(200, load_global_memory())
-        elif path == "/transcripts":
-            self._json(200, {"transcripts": list_transcripts()})
-        elif path.startswith("/transcripts/"):
-            user = unquote(path[len("/transcripts/"):])
-            doc = load_transcript(user)
-            if doc is None:
-                self._json(404, {"error": "no transcript for " + user})
-            else:
-                self._json(200, doc)
-        else:
-            self._json(200, {
-                "ok": True,
-                "service": "ig-agent-llm-bridge",
-                "endpoints": ["GET /health", "GET /models", "POST /reply",
-                              "POST /v1/chat/completions", "POST /save",
-                              "GET /transcripts", "GET /transcripts/<user>"],
-            })
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-        if path not in ("/reply", "/brain", "/v1/chat/completions", "/save"):
-            return self._json(404, {"error": "unknown endpoint " + path})
-
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(n) or b"{}")
-        except Exception as e:
-            return self._json(400, {"error": f"bad JSON body: {e}"})
-
-        if path == "/save":
-            tr = body.get("transcript")
-            if not isinstance(tr, dict) or not tr.get("user"):
-                return self._json(400, {"error": "'transcript' with 'user' is required"})
+            await self._send_json(
+                writer, 404, {"error": f"Unknown endpoint {method} {path}"}
+            )
+        except Exception as exc:
+            log.warning("Request handler error: %s", exc)
             try:
-                return self._json(200, save_transcript(tr))
-            except Exception as e:
-                return self._json(500, {"error": str(e)[:300]})
+                await self._send_json(writer, 500, {"error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
-        messages = body.get("messages")
-        if not isinstance(messages, list) or not messages:
-            return self._json(400, {"error": "'messages' must be a non-empty list"})
-
+    # ═══════════════════════════ WEBSOCKET ═══════════════════════════
+    async def _handle_ws(self, reader, writer, headers) -> None:
+        key = headers.get("sec-websocket-key", "")
+        accept = _ws_accept(key)
+        writer.write(
+            (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode()
+        )
+        await writer.drain()
+        conn = _WSConn(reader, writer)
+        log.info("[ws] page client connected")
         try:
-            default_m = BRAIN_MODEL if path == "/brain" else DEFAULT_MODEL
-            result = generate_with_fallback(
-                messages, body.get("model") or default_m, body.get("max_tokens"),
-                body.get("temperature", 0.9), fast_think=body.get("fast_think", True))
+            while True:
+                raw = await conn.recv_text()
+                if raw is None:
+                    break
+                try:
+                    req = json.loads(raw)
+                except Exception:
+                    await conn.send_json({"ok": False, "error": "bad json"})
+                    continue
+                if not isinstance(req, dict):
+                    continue
+                rtype = req.get("type") or "reply"
+                if rtype in ("reply", "brain", "llm"):
+                    # Never block the socket while the model streams: each
+                    # request carries its own id so answers may land in any order.
+                    asyncio.create_task(self._ws_llm_worker(conn, req, rtype))
+                else:
+                    await self._ws_dispatch(conn, req, rtype)
+        except (ConnectionError, asyncio.IncompleteReadError, OSError, ValueError) as e:
+            log.info("[ws] client left (%s)", e)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _ws_dispatch(self, conn: _WSConn, req: dict, rtype: str) -> None:
+        rid = req.get("id")
+        try:
+            if rtype == "health":
+                await conn.send_json({
+                    "id": rid, "ok": True,
+                    "default_model": DEFAULT_MODEL,
+                    "default_endpoint": resolve_wire_model(DEFAULT_MODEL),
+                    "brain_model": DEFAULT_BRAIN_MODEL,
+                    "brain_endpoint": resolve_wire_model(DEFAULT_BRAIN_MODEL),
+                    "chain": FALLBACK_CHAIN,
+                    "models": list(MODEL_REGISTRY.keys()),
+                    "uptime_s": round(time.time() - START),
+                })
+                return
+
+            if rtype == "bot":
+                try:
+                    code = BOT_SCRIPT_PATH.read_text(encoding="utf-8")
+                    await conn.send_json({"id": rid, "ok": True, "code": code})
+                except Exception as e:
+                    await conn.send_json({"id": rid, "ok": False, "error": str(e)[:200]})
+                return
+
+            if rtype == "save":
+                tr = req.get("transcript")
+                if not isinstance(tr, dict) or not tr.get("user"):
+                    raise ValueError("'transcript' with 'user' is required")
+                saved = _save_transcript(
+                    username=tr.get("user"),
+                    thread_id=tr.get("thread_fbid"),
+                    messages=tr.get("messages", []),
+                    brain_profile=tr.get("brain_profile"),
+                    agent_state=tr.get("agent_state"),
+                    mood_state=tr.get("mood_state"),
+                    reminders=tr.get("reminders"),
+                    missions=tr.get("missions"),
+                    process_entry=tr.get("process_entry"),
+                    process_log=tr.get("process_log"),
+                )
+                await conn.send_json({
+                    "id": rid, "ok": True,
+                    "file": f"{_safe_filename(tr.get('user'))}.json",
+                    "total_messages": saved.get("message_count", 0),
+                    "process_turn_count": len(saved.get("process_log") or []),
+                })
+                return
+
+            if rtype == "save_global":
+                gm = req.get("global_memory") or req.get("global")
+                if not isinstance(gm, dict):
+                    raise ValueError("'global_memory' dict is required")
+                saved = _save_global_memory(gm)
+                await conn.send_json({
+                    "id": rid, "ok": True,
+                    "people": len(saved.get("contacts", {})),
+                    "global_memory": saved, "global": saved,
+                })
+                return
+
+            if rtype == "get_global":
+                doc = _load_global_memory()
+                await conn.send_json({
+                    "id": rid, "ok": True, "global_memory": doc, "global": doc})
+                return
+
+            await conn.send_json({"id": rid, "ok": False, "error": f"unknown type {rtype}"})
         except Exception as e:
-            return self._json(502, {"error": str(e)[:300]})
+            await conn.send_json({"id": rid, "ok": False, "error": str(e)[:300]})
 
-        if path == "/v1/chat/completions":
-            return self._json(200, {
-                "choices": [{"message": {"role": "assistant", "content": result["text"]}}],
-                "model": result["model"],
-                "usage": result.get("usage") or {},
+    async def _ws_llm_worker(self, conn: _WSConn, req: dict, rtype: str) -> None:
+        """Frontline `reply` (GLM-4.7-Flash) and background `brain` (Gemma-4) calls."""
+        rid = req.get("id")
+        try:
+            messages = req.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("'messages' must be a non-empty list")
+
+            default_m = DEFAULT_BRAIN_MODEL if rtype == "brain" else DEFAULT_MODEL
+            model_q = req.get("model") or default_m
+            req_max = int(req.get("max_tokens") or (320 if rtype == "brain" else 500))
+            if is_thinking_model(model_q):
+                max_tokens = max(req_max, THINK_MIN_BUDGET)
+            else:
+                max_tokens = max(req_max, 256)
+
+            log.info(
+                "WS %s model=%s (wire=%s) msgs=%d max_tokens=%d",
+                rtype, resolve_short_model(model_q), resolve_wire_model(model_q),
+                len(messages), max_tokens,
+            )
+
+            result = await self.client.chat_completion(
+                messages=messages,
+                model=model_q,
+                max_tokens=max_tokens,
+                temperature=float(req.get("temperature", 0.85 if rtype != "brain" else 0.35)),
+                low_think=bool(req.get("fast_think", True)),
+            )
+
+            await conn.send_json({
+                "id": rid,
+                "ok": True,
+                "role_type": rtype,
+                "text": result.content,
+                "model": result.model,
+                "endpoint": result.wire_model,
+                "thinking_trace": result.reasoning,
+                "reasoning_chars": len(result.reasoning),
+                "elapsed_ms": result.elapsed_ms,
+                "usage": result.usage,
+                "fallback_index": (FALLBACK_CHAIN.index(result.model)
+                                   if result.model in FALLBACK_CHAIN else 0),
+                "fallback_used": result.fallback_used,
             })
-        return self._json(200, result)
+        except Exception as e:
+            log.warning("WS %s failed: %s", rtype, e)
+            try:
+                await conn.send_json({"id": rid, "ok": False, "error": str(e)[:300]})
+            except Exception:
+                pass
+
+    async def _handle_completions(
+        self,
+        writer: asyncio.StreamWriter,
+        path: str,
+        body_bytes: bytes,
+    ) -> None:
+        payload = json.loads(body_bytes.decode("utf-8") or "{}")
+        messages = payload.get("messages") or []
+        requested_model = payload.get("model") or DEFAULT_MODEL
+        temperature = float(payload.get("temperature", 0.85))
+        req_max_tokens = int(payload.get("max_tokens", 500))
+        low_think = bool(payload.get("low_think", True))
+        stream = bool(payload.get("stream", path == "/inference/stream"))
+
+        # Ensure thinking models (GLM-4.7-Flash, Gemma-4, Qwen3) have sufficient
+        # token headroom so reasoning_content never truncates visible content.
+        if is_thinking_model(requested_model):
+            max_tokens = max(req_max_tokens, THINK_MIN_BUDGET)
+        else:
+            max_tokens = max(req_max_tokens, 256)
+
+        log.info(
+            "LLM req path=%s model=%s (wire=%s) msgs=%d max_tokens=%d low_think=%s stream=%s",
+            path,
+            resolve_short_model(requested_model),
+            resolve_wire_model(requested_model),
+            len(messages),
+            max_tokens,
+            low_think,
+            stream,
+        )
+
+        result = await self.client.chat_completion(
+            messages=messages,
+            model=requested_model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            low_think=low_think,
+        )
+
+        log.info(
+            "LLM ok model=%s elapsed=%dms chars=%d (think=%d chars) fallback=%s",
+            result.model,
+            result.elapsed_ms,
+            len(result.content),
+            len(result.reasoning),
+            result.fallback_used,
+        )
+
+        if stream:
+            header_lines = [
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/event-stream; charset=utf-8\r\n",
+                "Cache-Control: no-cache\r\n",
+                "Connection: close\r\n",
+            ]
+            for k, v in CORS_HEADERS.items():
+                header_lines.append(f"{k}: {v}\r\n")
+            header_lines.append("\r\n")
+            writer.write("".join(header_lines).encode("utf-8"))
+
+            chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
+            if result.reasoning:
+                think_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": result.wire_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "reasoning": result.reasoning,
+                                "reasoning_content": result.reasoning,
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                writer.write(
+                    f"data: {json.dumps(think_chunk, ensure_ascii=False)}\n\n".encode(
+                        "utf-8"
+                    )
+                )
+            chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": result.wire_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": result.content,
+                            "reasoning_content": None,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "response": result.content,
+            }
+            writer.write(
+                f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+            )
+            writer.write(b"data: [DONE]\n\n")
+            await writer.drain()
+            return
+
+        response_obj = {
+            "id": f"chatcmpl-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": result.model,
+            "wire_model": result.wire_model,
+            "elapsed_ms": result.elapsed_ms,
+            "fallback_used": result.fallback_used,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": result.content,
+                        "reasoning_content": result.reasoning,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": result.usage
+            or {
+                "prompt_tokens": 0,
+                "completion_tokens": len(result.content.split()),
+                "total_tokens": len(result.content.split()),
+            },
+        }
+        await self._send_json(writer, 200, response_obj)
 
 
-# ═══════════════════════════ MAIN ═══════════════════════════
-
-
-def main():
-    global TIMEOUT
-    ap = argparse.ArgumentParser(description="IG-Agent LLM bridge (llmchat.in)")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--timeout", type=int, default=120, help="per-model LLM timeout in seconds")
-    args = ap.parse_args()
-    TIMEOUT = args.timeout
-
-    os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
-    ThreadingHTTPServer.allow_reuse_address = True
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    httpd.daemon_threads = True
-    print(f"IG-Agent LLM bridge  ->  http://{args.host}:{args.port}")
-    print(f"default model : {DEFAULT_MODEL}")
-    print(f"fallback chain: {len(FALLBACK_CHAIN)} models, auto-rotate on failure")
-    print(f"transcripts   : {TRANSCRIPT_DIR}")
-    print("waiting for calls from ig-agent-chat.js ...  (Ctrl+C to stop)")
+async def _main() -> None:
+    server = BridgeServer(host=HOST, port=PORT)
+    await server.start()
+    stop_event = asyncio.Event()
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\nbridge stopped")
+        await stop_event.wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await server.stop()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        sys.exit(0)

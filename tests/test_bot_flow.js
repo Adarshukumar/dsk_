@@ -329,22 +329,76 @@ const check = (name, fn) => {
     assert.strictEqual(T.brainProfile.relationship_stage, 'flirty-banter', 'Gemma-4 brainProfile updated');
   });
 
-  // AUTONOMOUS PROACTIVE CONVERSATION STARTER WHEN CHAT ENDED:
-  // Even though T_DEEPS now ends with our own message (mine: true), when the
-  // idle window expires, Aduu checks the time and starts the convo by himself!
-  BRIDGE_REPLY = 'oii kahan gayab ho gayi aaj shaam se 👀';
+  /* ═════════════ v7 TASK-DRIVEN PROACTIVE CONVERSATION STARTER ═════════════
+     Aduu no longer blindly restarts a dead chat every 30-45 minutes. He only
+     starts a conversation by himself when there is a REAL task:
+       · a REMINDER the user asked for ("10 min mein baat karte hai")
+       · a SECRET cross-chat prank/relay mission queued by a friend
+     ══════════════════════════════════════════════════════════════════════ */
   const T_deeps = S.transcripts.T_DEEPS;
+  T_deeps.reminders = [];
   T_deeps.agentState.next_proactive_after = Date.now() - 1000;
   S.cooldownUntil.T_DEEPS = 0;
-  const proBefore = IG.sent.length;
+
+  // 1. Idle time alone must NOT start a conversation (no more blind spam)
+  const idleBefore = IG.sent.length;
   await api._debug.processThread('T_DEEPS', 'deeps20_');
-  check('proactive · starts conversation by itself when chat ended & idle window elapsed', () => {
-    assert.strictEqual(IG.sent.length, proBefore + 1, 'proactive starter sent');
+  check('proactive · idle time ALONE never spams a dead chat (task required)', () => {
+    assert.strictEqual(IG.sent.length, idleBefore, 'Aduu must stay quiet with no reminder/mission');
+  });
+
+  // 2. A DUE REMINDER starts the conversation by itself
+  BRIDGE_REPLY = 'oii kahan gayab ho gayi aaj shaam se 👀';
+  api._debug.addReminder('T_DEEPS', 'deeps20_', 'baat karte hai', 10, 'test');
+  T_deeps.reminders.forEach(r => { r.due_at = Date.now() - 1000; });
+  S.cooldownUntil.T_DEEPS = 0;
+  const remBefore = IG.sent.length;
+  await api._debug.processThread('T_DEEPS', 'deeps20_');
+  check('proactive · starts the convo by itself when a REMINDER comes due', () => {
+    assert.strictEqual(IG.sent.length, remBefore + 1, 'reminder starter sent');
     assert.strictEqual(IG.sent[IG.sent.length - 1], 'oii kahan gayab ho gayi aaj shaam se 👀');
-    assert.strictEqual(T_deeps.agentState.proactive_streak, 1);
     const lastTurn = T_deeps.processLog[T_deeps.processLog.length - 1];
-    assert.strictEqual(lastTurn.trigger, 'proactive_time_trigger');
-    assert.strictEqual(lastTurn.agent_decision.action, 'PROACTIVE_AUTO_START');
+    assert.strictEqual(lastTurn.trigger, 'reminder_due_trigger', 'turn trigger');
+    assert.strictEqual(lastTurn.agent_decision.action, 'TASK_DRIVEN_START');
+    assert(lastTurn.reminder_tool && lastTurn.reminder_tool.length >= 0);
+    // the reminder must be consumed so it never fires twice
+    assert(!api._debug.dueReminder('T_DEEPS', 'deeps20_'), 'reminder not consumed');
+  });
+
+  // 3. A SECRET CROSS-CHAT PRANK MISSION starts the conversation too
+  BRIDGE_REPLY = 'oye sun, ek baat pata chali hai tere baare mein 👀';
+  S.cooldownUntil.T_DEEPS = 0;
+  T_deeps.agentState.next_proactive_after = Date.now() - 1000;
+  api._debug.addMission('T_ADARSH', 'adarshu.io', {
+    target_user: 'deeps20_', type: 'prank',
+    instruction: 'tease her that adarsh told on her', requested_by: 'adarshu.io',
+    requested_at: Date.now(),
+  });
+  const msnBefore = IG.sent.length;
+  await api._debug.processThread('T_DEEPS', 'deeps20_');
+  check('proactive · executes a SECRET cross-chat prank mission by itself', () => {
+    assert.strictEqual(IG.sent.length, msnBefore + 1, 'mission starter sent');
+    const lastTurn = T_deeps.processLog[T_deeps.processLog.length - 1];
+    assert.strictEqual(lastTurn.trigger, 'cross_chat_mission_trigger', 'turn trigger');
+    assert.strictEqual(T_deeps.moodState.current_mood, 'PRANKSTER_CHAOS', 'prankster mood set');
+    assert(!api._debug.pendingMissionFor('deeps20_'), 'mission not consumed');
+  });
+
+  // 4. Aduu's mood flips to FURIOUS when someone abuses him
+  const T_saroj = api._debug.ensureTranscript('T_SAROJ', 'saroj_priyanshu7');
+  api._debug.setMood('T_SAROJ', 'saroj_priyanshu7', 'FURIOUS_ABUSE_CLAPBACK',
+    'abuse detected', 'genuinely pissed off', 3, 'test');
+  const dec = api._debug.agentDecide('T_SAROJ', 'saroj_priyanshu7', [{
+    id: 'x1', ts: Date.now(), mine: false, kind: 'text', label: 'text',
+    text: 'teri maa ki chut sale, kya kr lega',
+  }], api._debug.analyzeTurnEmotion('teri maa ki chut sale, kya kr lega', 'saroj_priyanshu7'),
+    'incoming_burst');
+  check('v7 · agent decision picks the angry clapback + feelings action when abused', () => {
+    assert.strictEqual(dec.action, 'ABUSE_CLAPBACK_WITH_FEELINGS', dec.action);
+    assert.strictEqual(dec.mood, 'FURIOUS_ABUSE_CLAPBACK');
+    assert(/clap back hard/i.test(dec.directive), dec.directive);
+    assert(/feel/i.test(dec.directive), 'must explain real feelings: ' + dec.directive);
+    assert.strictEqual(T_saroj.moodState.feeling_note, 'genuinely pissed off');
   });
 
   api.stop();

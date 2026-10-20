@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  IG-Agent v5 — Clone & Run (Linux / macOS / Git Bash / WSL)
+#  IG-Agent v7 — Clone & Run (GLM-4.7-Flash + Gemma-4 Brain) (Linux / macOS / Git Bash / WSL)
 #  Default active targets: adarshu.io, deeps20_
 # ==============================================================================
 set -e
@@ -9,7 +9,7 @@ REPO_URL="https://github.com/Adarshukumar/dsk_.git"
 BRANCH="arena/d05a574d-dsk"
 
 echo "======================================================================"
-echo "  IG-Agent v5 — Auto Clone, Setup and Start"
+echo "  IG-Agent v7 — Auto Clone, Setup and Start"
 echo "  Default active targets: adarshu.io, deeps20_"
 echo "======================================================================"
 

@@ -1,0 +1,2 @@
+# The only runtime dependency of the bridge (browser-like TLS impersonation).
+curl_cffi>=0.7.0

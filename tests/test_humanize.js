@@ -39,19 +39,22 @@ const check = (name, fn) => {
 
 console.log('\nIG-Agent humanizer / config tests\n');
 
-check('config · Qwen3-30B is answering model + Gemma-4 is background brain model', () => {
-  assert.strictEqual(api.config.MODEL, '@cf/qwen/qwen3-30b-a3b-fp8');
+check('config · GLM-4.7-Flash is the frontline model + Gemma-4 is the parallel brain', () => {
+  assert.strictEqual(api.config.MODEL, '@cf/zai-org/glm-4.7-flash');
   assert.strictEqual(api.config.BRAIN_MODEL, '@cf/google/gemma-4-26b-a4b-it');
-  assert.strictEqual(api.config.FAST_THINK, true);
+  assert.strictEqual(api.config.FAST_THINK, true);          // minimal thinking
   assert.strictEqual(api.config.PROACTIVE_ENABLED, true);
+  assert.strictEqual(api.config.UNCONDITIONAL_IDLE_STARTER, false, 'must NOT blind-spam a dead chat');
+  assert.strictEqual(api.config.PRIVACY_WALL, true);
   assert.strictEqual(api.config.HUMANIZE, true);
   assert.strictEqual(api.config.MAX_REPLY_CHARS, 300);
+  assert.strictEqual(api.config.PERSONA_VERSION, 7);
 });
 
 check('state · stale persona + llama model ignored; default targets active', () => {
   assert(!/OLD STALE PERSONA/.test(api.config.SYSTEM_PROMPT),
     'old cached persona overrode the new default');
-  assert.strictEqual(api.config.MODEL, '@cf/qwen/qwen3-30b-a3b-fp8');
+  assert.strictEqual(api.config.MODEL, '@cf/zai-org/glm-4.7-flash');
   assert.strictEqual(api.config.BRAIN_MODEL, '@cf/google/gemma-4-26b-a4b-it');
   assert.deepStrictEqual(api.config.DEFAULT_TARGETS, ['adarshu.io', 'deeps20_']);
   assert.deepStrictEqual(api.config.TARGETS, ['adarshu.io', 'deeps20_']);
@@ -280,13 +283,94 @@ check('agentic engine · time context + autonomous decision + proactive starter'
     { id: '1', ts: 1000, mine: false, kind: 'text', label: 'text', text: 'achha chalo baad mein baat karte' },
     { id: '2', ts: 2000, mine: true, kind: 'text', label: 'text', text: 'chal thik hai, gayab mat ho jana 😌' },
   ];
+  // TASK-DRIVEN: an idle timer alone must NOT start a conversation (no blind 30m spam)
   const T = api._debug.ensureTranscript('T_PRO', 'deeps20_');
+  T.reminders = [];
   T.agentState.chat_ended_at = Date.now() - 60 * 60_000;
   T.agentState.next_proactive_after = Date.now() - 1000;
+  const idleOnly = api._debug.shouldStartProactiveConvo('T_PRO', 'deeps20_', endedMsgs, false);
+  assert.strictEqual(idleOnly.ok, false,
+    'Aduu must NOT restart a dead chat just because time passed — needs a reminder or mission');
+
+  // A DUE REMINDER must start it
+  api._debug.addReminder('T_PRO', 'deeps20_', 'baat karte hai', 10, 'test');
+  T.reminders.forEach(r => { r.due_at = Date.now() - 1000; });
   const pro = api._debug.shouldStartProactiveConvo('T_PRO', 'deeps20_', endedMsgs, false);
-  assert.strictEqual(pro.ok, true, 'proactive starter triggers when idle timer elapses');
-  const proHist = api._debug.buildProactiveHistory(endedMsgs, 'T_PRO', 'deeps20_');
-  assert(proHist[0].content.includes('[AUTONOMOUS PROACTIVE CONVERSATION STARTER'), 'proactive system header present');
+  assert.strictEqual(pro.ok, true, 'a due reminder must trigger the starter');
+  assert.strictEqual(pro.trigger, 'reminder_due_trigger');
+  const proHist = api._debug.buildProactiveHistory(endedMsgs, 'T_PRO', 'deeps20_', pro);
+  assert(proHist[0].content.includes('[TASK: REMINDER DUE NOW]'), 'reminder task block missing');
+  api._debug.consumeReminder('T_PRO', 'deeps20_', pro.reminder);
+
+  // A SECRET CROSS-CHAT MISSION must start it
+  api._debug.addMission('T_OTHER', 'deeps20_', {
+    target_user: 'deeps20_', type: 'prank',
+    instruction: 'tease them', requested_by: 'adarshu.io', requested_at: Date.now(),
+  });
+  const msnPro = api._debug.shouldStartProactiveConvo('T_PRO', 'deeps20_', endedMsgs, false);
+  assert.strictEqual(msnPro.ok, true, 'a pending mission must trigger the starter');
+  assert.strictEqual(msnPro.trigger, 'cross_chat_mission_trigger');
+  const msnHist = api._debug.buildProactiveHistory(endedMsgs, 'T_PRO', 'deeps20_', msnPro);
+  assert(msnHist[0].content.includes('PRIVACY WALL'), 'mission privacy wall missing');
+  assert(msnHist[0].content.includes('[TASK: SECRET CROSS-CHAT PRANK MISSION]'), 'prank task block missing');
+  api._debug.consumeMission(msnPro.mission);
+});
+
+check('v7 · mood engine · Aduu gets angry when abused (no more always-sharif)', () => {
+  const d = api._debug;
+  assert.strictEqual(d.detectLocalMood('teri maa ki chut sale, kya kr lega'), 'FURIOUS_ABUSE_CLAPBACK');
+  assert.strictEqual(d.detectLocalMood('fuck off, chup ho ja'), 'ANGRY_SAVAGE_ROAST');
+  assert.strictEqual(d.detectLocalMood('hi baby 🌚 miss you'), 'NAUGHTY_FLIRT_SHARIF');
+  assert.strictEqual(d.detectLocalMood('kya haal hai bhai'), 'PLAYFUL_CHILL');
+  assert(d.MOODS.FURIOUS_ABUSE_CLAPBACK.directive.includes('DROP'), 'furious mood must drop the sharif act');
+  assert(d.MOODS.ANNOYED_EXPRESSIVE_FEELINGS.directive.includes('feeling'), 'annoyed mood must express feelings');
+  const T = d.ensureTranscript('T_MOOD', 'saroj_priyanshu7');
+  d.setMood('T_MOOD', 'saroj_priyanshu7', 'FURIOUS_ABUSE_CLAPBACK', 'test', 'genuinely pissed off', 3, 'test');
+  assert.strictEqual(T.moodState.current_mood, 'FURIOUS_ABUSE_CLAPBACK');
+  assert.strictEqual(T.moodState.mood_intensity, 3);
+  assert.strictEqual(T.moodState.feeling_note, 'genuinely pissed off');
+});
+
+check('v7 · reminder engine · "10 min mein baat karte hai" schedules a real trigger', () => {
+  const d = api._debug;
+  const r1 = d.extractReminderRequests('chal 10 min mein baat karte hai, yaad dila dena');
+  assert.strictEqual(r1.length, 1, 'reminder not extracted');
+  assert.strictEqual(r1[0].due_in_minutes, 10);
+  const r2 = d.extractReminderRequests('baad mein baat karte hai');
+  assert(r2.length >= 1, 'open-ended "baad mein" must still schedule the default window');
+  const r3 = d.extractReminderRequests('kya haal hai bhai');
+  assert.strictEqual(r3.length, 0, 'a normal message must NOT schedule a reminder');
+});
+
+check('v7 · cross-chat prank/relay mission + privacy wall', () => {
+  const d = api._debug;
+  const ms = d.extractCrossChatMissions('adarshu.io ko bol do ki main chocolate nahi dunga', 'deeps20_');
+  assert.strictEqual(ms.length, 1, 'mission not extracted');
+  assert.strictEqual(ms[0].target_user, 'adarshu.io');
+  assert.strictEqual(ms[0].requested_by, 'deeps20_');
+  const m = d.addMission('T_DEEPS', 'deeps20_', ms[0]);
+  assert(d.pendingMissionFor('adarshu.io'), 'mission not queued for the target');
+  // talking to a third person: every other handle + private quote must be scrubbed
+  const guarded = d.privacyGuard(
+    '@deeps20_ ne @adarshu.io ke baare mein "bola ki tu aa raha hai" kaha', 'saroj_priyanshu7');
+  assert(!/@adarshu\.io/.test(guarded), 'handle leaked: ' + guarded);
+  assert(!/@deeps20_/.test(guarded), 'handle leaked: ' + guarded);
+  assert(!/bola ki tu aa raha hai/.test(guarded), 'private quote leaked: ' + guarded);
+  // but the person we are ACTUALLY talking to may be named normally
+  const ok = d.privacyGuard('haan @saroj_priyanshu7 sun', 'saroj_priyanshu7');
+  assert(/@saroj_priyanshu7/.test(ok), 'own chat partner should not be scrubbed: ' + ok);
+  d.consumeMission(m);
+  assert(!d.pendingMissionFor('adarshu.io'), 'mission not consumed');
+});
+
+check('v7 · logical 2-3 bubble continuity (no blind appending)', () => {
+  const b = api._debug.splitBubbles(
+    'abey sun, aukaat mein reh ke baat kar || sach mein dimaag kharab kar diya tune mera');
+  assert.strictEqual(b.length, 2, 'expected 2 logical bubbles, got ' + b.length);
+  assert(/aukaat/.test(b[0]) && /dimaag kharab/.test(b[1]), JSON.stringify(b));
+  // a single short reply stays ONE bubble
+  const one = api._debug.splitBubbles('haan bhai, thik hai');
+  assert.strictEqual(one.length, 1);
 });
 
 check('prompt() · custom persona persists', () => {
@@ -296,4 +380,4 @@ check('prompt() · custom persona persists', () => {
   assert.strictEqual(saved.systemPrompt, 'my custom persona');
 });
 
-console.log('\n25 passed, 0 failed\n');
+console.log('\n30 passed, 0 failed\n');

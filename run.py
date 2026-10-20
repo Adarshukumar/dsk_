@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-One-file cross-platform launcher for IG-Agent v5.
+One-file cross-platform launcher for IG-Agent v7 (GLM-4.7-Flash frontline + Gemma-4 parallel brain).
 
 Usage:
     python run.py
