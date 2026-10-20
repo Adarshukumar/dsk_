@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-One-file cross-platform launcher for IG-Agent v8 (Gemma-4 brain decides, GLM-4.7-Flash writes).
+One-file cross-platform launcher for IG-Agent v9 (Gemma-4 brain: DMs, stories, comments, notes).
 
 Usage:
     python run.py

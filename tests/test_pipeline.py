@@ -331,7 +331,7 @@ def test_server_bridge(mock):
 
             # v7 transcript save (mood_state + reminders + missions + process_log)
             send({"id": "s1", "type": "save", "transcript": {
-                "schema_version": "8.0-brain-decides",
+                "schema_version": "9.0-social-brain",
                 "user": "_pipeline_test", "thread_fbid": "0",
                 "models": {"answering_model": "zai-org/glm-4.7-flash",
                            "brain_model": "google/gemma-4-26b-a4b-it"},
@@ -357,6 +357,25 @@ def test_server_bridge(mock):
             assert disk["missions"][0]["target_user"] == "deeps20_"
             assert disk["last_decision"]["action"] == "REPLY", disk.get("last_decision")
 
+            # v9: the social brain's diary over the WebSocket
+            send({"id": "sb1", "type": "save_social", "social": {
+                "schema_version": "9.0-social-brain-log",
+                "config": {"enabled": True, "dry_run": True, "notes_mode": "agentic"},
+                "action_log": [{"kind": "note", "target": "", "text": "chai aur code"}],
+                "note_log": [{"text": "chai aur code", "reason": "calm evening"}],
+                "cycles": [{"at": 1, "status": "completed", "plan": {"mode": "observe"}}],
+            }})
+            sbs = recv()
+            assert sbs["ok"] and sbs["cycles"] == 1 and sbs["actions"] == 1, sbs
+
+            send({"id": "sb2", "type": "get_social"})
+            sbg = recv()
+            assert sbg["ok"], sbg
+            sb_doc = sbg["social_brain"]
+            assert sb_doc["config"]["notes_mode"] == "agentic", sb_doc
+            assert sb_doc["action_log"][0]["kind"] == "note", sb_doc
+            assert (tmpdir / "_social_brain.json").exists(), "social brain file not written"
+
             # v8: REST decision endpoint (any client, not just the page script)
             status, d = http_json("http://127.0.0.1:8791/v1/decide", {
                 "messages": [{"role": "user",
@@ -367,6 +386,26 @@ def test_server_bridge(mock):
             assert d["decision"]["action"] == "REPLY", d["decision"]
             assert d["model"] == "google/gemma-4-26b-a4b-it", d["model"]
             assert "DECISION BRAIN" in mock.last_body()["messages"][0]["content"]
+
+            # v9: the social brain's diary over plain HTTP
+            status, sb = http_json("http://127.0.0.1:8791/social-brain")
+            assert status == 200, sb
+            assert sb["config"]["notes_mode"] == "agentic", sb
+            assert len(sb["cycles"]) == 1, sb
+
+            status, sb2 = http_json("http://127.0.0.1:8791/social-brain", {
+                "config": {"enabled": False, "dry_run": False, "notes_mode": "off"},
+                "action_log": [{"kind": "story_reply", "target": "deeps20_"}],
+            })
+            assert status == 200, sb2
+            assert sb2["config"]["notes_mode"] == "off", sb2
+            assert any(a.get("kind") == "story_reply" for a in sb2["action_log"]), sb2
+
+            # the diary must never be mistaken for a chat transcript
+            _, tlist = http_json("http://127.0.0.1:8791/transcripts")
+            names = [t["username"] for t in tlist["transcripts"]]
+            assert "_social_brain" not in names, names
+            assert "_global_memory" not in names, names
 
             send({"id": "g1", "type": "save_global", "global": {
                 "contacts": {"deeps20_": {"handle": "deeps20_", "vibe": "aggressive"}},
@@ -383,7 +422,8 @@ def test_server_bridge(mock):
             close()
 
         shutil.rmtree(tmpdir, ignore_errors=True)
-        return "health · models · OpenAI · SSE · WS reply+brain+decide+save+global"
+        return ("health · models · OpenAI · SSE · WS reply+brain+decide+"
+                "social+save+global")
     finally:
         proc.terminate()
         try:
@@ -393,7 +433,7 @@ def test_server_bridge(mock):
 
 
 def main():
-    print("\nIG-Agent v8 pipeline tests (offline, mock llmchat.in)\n")
+    print("\nIG-Agent v9 pipeline tests (offline, mock llmchat.in)\n")
     with MockLLM() as mock:
         check("provider · GLM-4.7-Flash SSE (reasoning + content, no duplication)")(
             lambda: test_provider_glm(mock))

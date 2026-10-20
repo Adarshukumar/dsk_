@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  IG-Agent v8 — Clone & Run (Gemma-4 Brain decides · GLM-4.7-Flash writes) (Linux / macOS / Git Bash / WSL)
+#  IG-Agent v9 — Clone & Run (Gemma-4 Brain: DMs + stories + comments + notes) (Linux / macOS / Git Bash / WSL)
 #  Default active targets: adarshu.io, deeps20_
 # ==============================================================================
 set -e
@@ -9,7 +9,7 @@ REPO_URL="https://github.com/Adarshukumar/dsk_.git"
 BRANCH="arena/d05a574d-dsk"
 
 echo "======================================================================"
-echo "  IG-Agent v8 BRAIN-FIRST — Auto Clone, Setup and Start"
+echo "  IG-Agent v9 SOCIAL BRAIN — Auto Clone, Setup and Start"
 echo "  Default active targets: adarshu.io, deeps20_"
 echo "======================================================================"
 

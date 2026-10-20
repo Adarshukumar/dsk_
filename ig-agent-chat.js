@@ -110,7 +110,7 @@
     BACKFILL_ON_START: 40,        // pull N msgs of history per target at start
 
     // Bumped whenever the default persona / model architecture changes.
-    PERSONA_VERSION: 8,
+    PERSONA_VERSION: 9,
 
     SYSTEM_PROMPT:
 `You are Aduu — a real 22-year-old Delhi Gen-Z guy who handles Adarsh's Instagram DMs. You are not Adarsh; you're his close friend and the guy who runs his DMs. You are Aduu in every message, and that is the only answer to "who are you".
@@ -240,6 +240,42 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     MAX_PROACTIVE_STREAK: 2,
     PRIVACY_WALL: true,                   // never leak private chat logs or prank instigators across chats
 
+    /* ── SOCIAL BRAIN (v9) ────────────────────────────────────────────────
+       The SAME Gemma-4 brain also runs the whole account's social life:
+       reading the story tray, reacting to stories, commenting on posts,
+       replying to comments on Aduu's own posts, sliding into DMs — and
+       writing the Instagram NOTE.
+       It is deliberately RARE: the brain observes on a slow cycle and the
+       runtime only lets a handful of actions through per day, so Aduu does
+       NOT spam. Nothing runs until IGAgent.Social.enable(). */
+    SOCIAL: {
+      ENABLED: false,                  // master switch — nothing runs until you flip it
+      BRAIN_AUTOPILOT: true,           // the brain decides what to do (false = only manual calls)
+      DRY_RUN: true,                   // social actions logged, NOT sent until false
+
+      WATCH: [],                       // usernames the social brain may engage with
+      COMMENT_TARGETS: [],             // whose NEW posts may get a comment
+      COMMENT_REPLIES: false,          // reply to comments on Aduu's own posts
+      STORY_TARGETS: [],               // whose stories may get a reaction
+      NOTES_MODE: 'agentic',           // 'agentic' | 'off' — brain writes the NOTE by itself
+
+      // ── rarity: "not always, so less times" ──
+      CYCLE_MIN_MS: 45 * 60_000,       // observe/plan cadence (45–120 min)
+      CYCLE_MAX_MS: 120 * 60_000,
+      MAX_ACTIONS_PER_CYCLE: 1,        // at most one public action per cycle
+      QUIET_HOURS: [2, 9],             // never act between 2am and 9am IST
+      MIN_GAP_BETWEEN_PUBLIC_ACTIONS_MS: 3 * 60 * 60_000,
+      COOLDOWN_MS: {                   // per (kind, target) minimum gap
+        note: 4 * 60 * 60_000,
+        comment: 8 * 60 * 60_000,
+        comment_reply: 2 * 60 * 60_000,
+        story_reply: 14 * 60 * 60_000,
+        dm: 6 * 60 * 60_000,
+      },
+      DAILY_CAP: { note: 4, comment: 3, comment_reply: 6, story_reply: 2, dm: 2 },
+      MAX_NOTE_CHARS: 60,              // Instagram hard limit
+    },
+
     /* ── v8 DECISION CONTRACT ─────────────────────────────────────────────
        The brain gets the REAL chat messages and returns one JSON object.
        GLM-4.7-Flash then only writes what this decided. Every decision must
@@ -353,6 +389,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       header:  '28784987187762419',
       seen:    '27399783383056109',   // useIGDMarkThreadAsReadMutation
       seenVal: '35211594988486314',   // useIGDMarkThreadAsReadValidationMutation
+      // ── social layer (captured live on 2026-10-17) ──
+      comment:    '27261905640092552', // PolarisPostCommentInputRevampedMutation
+      reelShare:  '26212720875066239', // IGDirectReelShareMutation (story/reel reply → DM)
+      noteCreate: '28592645767037889', // usePolarisCreateInboxTrayItemSubmitMutation
+      noteDelete: '28419182984337833', // usePolarisDeleteInboxTrayItemSubmitMutation
+      tray:       '29231580869776032', // IGDInboxTrayQuery (read the notes tray)
     },
     APP_ID: '936619743392459',
     ASBD: '359341',
@@ -1428,7 +1470,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         const r = await wsRequest({
           type: 'save',
           transcript: {
-            schema_version: '8.0-brain-decides',
+            schema_version: '9.0-social-brain',
             user: T.user, thread_fbid: T.threadFbid,
             updated_at: new Date().toISOString(),
             models: {
@@ -3272,7 +3314,10 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
          a verbatim quote from a different chat, or the identity of whoever
          asked Aduu to prank this person. */
       const rawDraft = reply;
-      reply = privacyGuard(String(reply || ''), user);
+      /* v9 ISOLATION: privacyGuard strips other-chat quotes, isolationGuard
+         then kills any other contact's handle and any verbatim line that
+         belongs to a DIFFERENT chat — so chats can never collide. */
+      reply = isolationGuard(privacyGuard(String(reply || ''), user), user);
       reply = CFG.HUMANIZE ? humanizeReply(reply) : reply.trim();
       if (!reply) throw new Error('empty reply from bridge');
 
@@ -3674,6 +3719,844 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     return CFG.TARGETS.includes(cleanUsername(user));
   }
 
+  /* ══════════════════════════════════════════════════════════════════════════
+     v9 · SOCIAL BRAIN — the SAME Gemma-4 mind runs the whole account
+     ──────────────────────────────────────────────────────────────────────────
+     Captured Instagram operations (live, 2026-10-17):
+       comment    PolarisPostCommentInputRevampedMutation   {data:{comment_text,media_id[,reply_to_comment_id]}}
+       story→DM   IGDirectReelShareMutation                 {ig_media_igid,otid,data:{text},clip_share_params}
+       note add   usePolarisCreateInboxTrayItemSubmitMutation {input:{…note_create_params.text,audience}}
+       note del   usePolarisDeleteInboxTrayItemSubmitMutation {inbox_tray_item_id}
+       tray read  IGDInboxTrayQuery                          {}
+       stories    GET /api/v1/feed/reels_tray/               (private REST)
+       comments   GET /api/v1/media/<id>/comments/           (private REST)
+       own feed   GET /api/v1/feed/user/<pk>/                (private REST)
+
+     HOW IT WORKS (the design the brain follows every cycle)
+       1. OBSERVE — read the notes tray, the story tray, watched people's
+          latest posts, unanswered comments on Aduu's own posts, and a
+          privacy-safe pulse of every DM.
+       2. PLAN    — the brain returns ONE strict JSON plan. It usually
+          chooses "observe" and does nothing at all — that is on purpose.
+       3. GATE    — the runtime enforces rarity: per-(kind,target) cooldowns,
+          daily caps, quiet hours, one public action per cycle, and a minimum
+          gap between public actions. The brain wants, the runtime allows.
+       4. ISOLATE — every outgoing line is audience-checked: no other
+          contact's handle, no verbatim line from another chat, no private
+          content crossing chats. Collisions are dropped, not sent.
+       5. ACT     — comment / reply / story reaction / DM / note.
+       6. REFLECT — the whole cycle is logged to _social_brain.json so you can
+          always see what the brain saw, decided, and why.
+  ══════════════════════════════════════════════════════════════════════════ */
+
+  const SO = S.social = {
+    running: false, timer: null, planning: false,
+    seenPosts: new Set(),            // media pks already considered
+    handledComments: new Set(),      // comment pks already considered
+    actionLog: [],                   // {kind,target,at,text,status}
+    noteLog: [],                     // last note brain decisions
+    cycles: [],                      // last N social-brain reflections
+    myPk: null,
+  };
+
+  /* ── raw Instagram primitives ─────────────────────────────────────────── */
+
+  async function socRest(path) {
+    const csrf = getCookie('csrftoken') || '';
+    const res = await fetch(path, {
+      headers: { 'X-CSRFToken': csrf, 'X-IG-App-ID': CFG.APP_ID },
+      credentials: 'same-origin',
+    });
+    if (res.status === 429 || res.status === 403) {
+      throw Object.assign(new Error('IG_RATE_LIMIT status=' + res.status), { fatal: true });
+    }
+    const j = await res.json().catch(() => null);
+    if (!res.ok) throw new Error('REST HTTP ' + res.status + ' ' + path);
+    return j || {};
+  }
+
+  async function myPk() {
+    if (SO.myPk) return SO.myPk;
+    SO.myPk = String(getCookie('ds_user_id') || '');   // ds_user_id IS the REST pk
+    return SO.myPk;
+  }
+
+  async function userFeedPk(username) {
+    const j = await socRest('/api/v1/users/web_profile_info/?username=' +
+      encodeURIComponent(username));
+    return String((j.data && j.data.user && j.data.user.id) || '');
+  }
+
+  async function userFeed(username, count = 6) {
+    const pk = await userFeedPk(username);
+    if (!pk) return [];
+    const j = await socRest(`/api/v1/feed/user/${pk}/?count=${count}`);
+    return (j.items || []).map(it => ({
+      pk: String(it.pk),
+      id: String(it.id || it.pk),
+      type: it.media_type === 2 ? 'video' : (it.carousel_media ? 'carousel' : 'photo'),
+      caption: (it.caption && it.caption.text) || '',
+      taken_at: (it.taken_at || 0) * 1000,
+      comments: it.comment_count || 0,
+      likes: it.like_count || 0,
+    }));
+  }
+
+  /* LIVE STORY TRAY — who posted a story in the last 24h (and its media id,
+     which is what a story reaction DM needs). */
+  async function storyTray() {
+    try {
+      const j = await socRest('/api/v1/feed/reels_tray/');
+      const out = [];
+      for (const reel of (j.tray || [])) {
+        const u = (reel.user && reel.user.username) || (reel.owner && reel.owner.username) || '';
+        for (const m of (reel.media || [])) {
+          out.push({
+            username: cleanUsername(u),
+            pk: String(m.pk || ''),
+            id: String(m.id || m.pk || ''),
+            taken_at: (m.taken_at || 0) * 1000,
+            seen: !!m.seen,
+            type: m.media_type === 2 ? 'video' : 'photo',
+          });
+        }
+        if (!(reel.media || []).length && u) {
+          out.push({
+            username: cleanUsername(u), pk: String(reel.pk || ''),
+            id: String(reel.id || reel.pk || ''),
+            taken_at: (reel.latest_reel_media || 0) * 1000, seen: false, type: 'story',
+          });
+        }
+      }
+      return out;
+    } catch (e) {
+      socLog('story', 'story tray unavailable (' + e.message + ') — falling back to posts');
+      return [];
+    }
+  }
+
+  async function postComment(mediaId, text, replyToCommentPk) {
+    const data = { comment_text: String(text).slice(0, 500), media_id: String(mediaId) };
+    if (replyToCommentPk) data.reply_to_comment_id = String(replyToCommentPk);
+    const out = await gql('PolarisPostCommentInputRevampedMutation', CFG.GQL.comment,
+      { connections: [], data });
+    return (out && out.xig_comment_create) || out;
+  }
+
+  async function fetchComments(mediaId) {
+    const j = await socRest(`/api/v1/media/${mediaId}/comments/?can_support_threading=true&permalink=`);
+    const me = String(getCookie('ds_user_id') || '');
+    return (j.comments || []).map(c => ({
+      pk: String(c.pk), text: c.text || '',
+      user: (c.user && c.user.username) || '?',
+      mine: String(c.user && c.user.pk) === me,
+      created_at: (c.created_at || 0) * 1000,
+    }));
+  }
+
+  async function trayRead() {
+    const out = await gql('IGDInboxTrayQuery', CFG.GQL.tray, {});
+    const items = (((out || {}).response || {}).inbox_tray_items || []).map(it => ({
+      id: String(it.inbox_tray_item_id || ''),
+      type: it.inbox_tray_item_type || '',
+      text: (it.note_dict && it.note_dict.text) || '',
+      created_at: (it.note_dict && it.note_dict.created_at)
+        ? it.note_dict.created_at * 1000 : null,
+      authorId: String((it.note_dict && it.note_dict.author_id) || ''),
+      username: (it.pog_info && it.pog_info.pog_users &&
+        it.pog_info.pog_users[0] && it.pog_info.pog_users[0].username) || '',
+    }));
+    return { raw: out, items };
+  }
+
+  async function noteCreate(text, audience = 0) {
+    const out = await gql('usePolarisCreateInboxTrayItemSubmitMutation', CFG.GQL.noteCreate, {
+      input: {
+        actor_id: '17841479654032000',
+        client_mutation_id: String(Math.floor(Math.random() * 1000)),
+        additional_params: {
+          note_create_params: {
+            note_create_info: null, note_style: 0,
+            text: String(text).slice(0, CFG.SOCIAL.MAX_NOTE_CHARS),
+          },
+        },
+        audience,
+        inbox_tray_item_type: 'note',
+      },
+    });
+    return out && out.xdt_create_inbox_tray_item;
+  }
+
+  async function noteDelete(itemId) {
+    const out = await gql('usePolarisDeleteInboxTrayItemSubmitMutation', CFG.GQL.noteDelete,
+      { inbox_tray_item_id: String(itemId) });
+    return out && out.xdt_delete_inbox_tray_item;
+  }
+
+  /* React to a story → lands in that person's DMs as a story reply. */
+  async function storyReply(storyPk, storyId, text) {
+    const otid = String(BigInt(Date.now()) * 1000000n + BigInt(Math.floor(Math.random() * 999999)));
+    const out = await gql('IGDirectReelShareMutation', CFG.GQL.reelShare, {
+      ig_media_igid: String(storyId || storyPk),
+      otid,
+      data: { text: String(text).slice(0, 500), send_attribution: 'reel', client_context: otid },
+      clip_share_params: null,
+    });
+    return out && out.xig_direct_clip_share_with_slide_msg_response;
+  }
+
+  function socLog(tag, msg) { log(C.bot, tag, msg); }
+
+  /* ══════════════ CHAT ISOLATION — never let two chats collide ══════════════
+     Aduu talks to many people at once. A line written for @deeps20_ must
+     NEVER reach @adarshu.io, and a private line from one chat must never be
+     quoted in another — even by accident, even by the brain. Three locks:
+       1. HANDLE LOCK    — no other contact's @handle in an outgoing line.
+       2. CONTENT LOCK   — no verbatim sentence from another chat.
+       3. AUDIENCE LOCK  — every social action declares who sees it, and the
+                           guard re-checks the text against that audience.
+  ══════════════════════════════════════════════════════════════════════════ */
+
+  function otherHandles(audience) {
+    const me = cleanUsername(audience);
+    const set = new Set();
+    const push = h => { const c = cleanUsername(h); if (c && c !== me) set.add(c); };
+    for (const T of Object.values(S.transcripts)) push(T.user);
+    for (const k of Object.keys((S.globalMemory && S.globalMemory.people) || {})) push(k);
+    for (const c of (S.globalMemory && S.globalMemory.connections) || []) { push(c.a); push(c.b); }
+    if (Array.isArray(CFG.TARGETS)) CFG.TARGETS.forEach(push);
+    for (const list of [CFG.SOCIAL.WATCH, CFG.SOCIAL.COMMENT_TARGETS, CFG.SOCIAL.STORY_TARGETS]) {
+      if (Array.isArray(list)) list.forEach(push);
+    }
+    return [...set];
+  }
+
+  // every sentence another contact actually said (so we can spot a verbatim leak)
+  function foreignQuotes(audience, minLen = 14) {
+    const me = cleanUsername(audience);
+    const out = [];
+    for (const T of Object.values(S.transcripts)) {
+      if (cleanUsername(T.user) === me) continue;
+      for (const m of (T.messages || []).slice(-25)) {
+        if (m.mine || m.kind !== 'text' || !m.text) continue;
+        const s = String(m.text).replace(/\s+/g, ' ').trim();
+        if (s.length >= minLen) out.push({ user: T.user, text: s });
+      }
+    }
+    return out;
+  }
+
+  const ISOLATION_FILLERS = ['ek dost', 'kisi ne', 'someone', 'ek banda', 'ek friend'];
+
+  function isolationGuard(text, audience) {
+    let s = String(text || '');
+    if (!s.trim()) return s;
+    let hits = [];
+
+    // 1. HANDLE LOCK
+    for (const h of otherHandles(audience)) {
+      const re = new RegExp('@' + h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'gi');
+      if (re.test(s)) {
+        s = s.replace(re, ISOLATION_FILLERS[Math.floor(Math.random() * ISOLATION_FILLERS.length)]);
+        hits.push('handle:' + h);
+      }
+      // bare handle without the @ (only when it is a distinctive handle)
+      if (h.length >= 5) {
+        const bare = new RegExp('(^|[^@\\w.])' + h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+          '(?![\\w.])', 'gi');
+        if (bare.test(s)) {
+          s = s.replace(bare, '$1' + ISOLATION_FILLERS[Math.floor(Math.random() * ISOLATION_FILLERS.length)]);
+          hits.push('name:' + h);
+        }
+      }
+    }
+
+    // 2. CONTENT LOCK — a line someone else wrote must not be echoed
+    const norm = x => String(x || '').toLowerCase()
+      .replace(/[^a-z0-9\u0900-\u097F ]+/g, ' ').replace(/\s+/g, ' ').trim();
+    const ns = norm(s);
+    for (const q of foreignQuotes(audience)) {
+      const nq = norm(q.text);
+      if (nq.length >= 14 && ns.includes(nq)) {
+        s = s.replace(new RegExp(q.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'),
+          ISOLATION_FILLERS[Math.floor(Math.random() * ISOLATION_FILLERS.length)]);
+        hits.push('quote:' + q.user);
+      }
+    }
+
+    if (!hits.length) return s;          // nothing to fix — leave the draft exactly as written
+    socLog('isolate', `scrubbed ${hits.length} cross-chat leak(s) for @${audience}: ` +
+      hits.slice(0, 4).join(', '));
+    return s.replace(/\s+/g, ' ').trim();
+  }
+
+  /* Does this planned action stay inside its own audience? */
+  function collisionCheck(action) {
+    const target = cleanUsername(action.target || '');
+    const audience = target || 'public';
+    const problems = [];
+    for (const h of otherHandles(audience)) {
+      const re = new RegExp('@' + h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
+      if (re.test(String(action.text || ''))) problems.push('mentions @' + h);
+    }
+    const norm = x => String(x || '').toLowerCase()
+      .replace(/[^a-z0-9\u0900-\u097F ]+/g, ' ').replace(/\s+/g, ' ').trim();
+    for (const q of foreignQuotes(audience)) {
+      const nq = norm(q.text);
+      if (nq.length >= 14 && norm(action.text).includes(nq)) problems.push('quotes ' + q.user);
+    }
+    return { ok: problems.length === 0, problems, audience };
+  }
+
+  /* one decision at a time per contact so two brains never collide */
+  const LOCKS = new Map();
+  async function withLock(key, fn) {
+    if (LOCKS.has(key)) return { skipped: true, reason: 'locked:' + key };
+    LOCKS.set(key, true);
+    try { return await fn(); } finally { LOCKS.delete(key); }
+  }
+
+  /* ═══════════════════════ THE SOCIAL BRAIN ═══════════════════════════════ */
+
+  const SOCIAL_DECIDE_PROMPT = [
+    'You are the SOCIAL BRAIN of Aduu — a real 22-year-old Delhi guy who runs the Instagram account, not an assistant.',
+    'You decide EVERYTHING about the account\'s social life: whether to react to a story, comment on a post, reply to a comment on Aduu\'s own post, send a DM out of the blue, or change the Instagram NOTE.',
+    'Think in at most 12 short words, then output ONE valid JSON object. No markdown fences, no text before or after it.',
+    '',
+    '{',
+    '  "mode": "observe" | "act",',
+    '  "intent": "one line on what you are feeling about the account right now",',
+    '  "skip_reason": "why you are doing nothing (REQUIRED when mode is observe)",',
+    '  "actions": [',
+    '    { "kind": "note",         "op": "keep" | "replace" | "delete", "text": "<=60 chars>", "reason": "…" },',
+    '    { "kind": "story_reply",  "target": "handle", "story_pk": "…", "text": "…", "reason": "…" },',
+    '    { "kind": "comment",      "target": "handle", "media_pk": "…", "text": "…", "reason": "…" },',
+    '    { "kind": "comment_reply","target": "handle", "media_pk": "…", "comment_pk": "…", "text": "…", "reason": "…" },',
+    '    { "kind": "dm",           "target": "handle", "text": "…", "reason": "…" }',
+    '  ],',
+    '  "next_check_in_minutes": 75',
+    '}',
+    '',
+    'HOW TO WORK — the rules you decided for yourself:',
+    '1. DOING NOTHING IS THE DEFAULT. A real person scrolls past most stories and posts. Choose "act" only when something genuinely deserves it: a story you can actually say something real about, a fresh post from someone you care about, a comment on your own post that deserves an answer, or a note that has gone stale.',
+    '2. NEVER chase. If the timing looks needy, desperate, or repetitive, do nothing.',
+    '3. ONE THING AT A TIME. At most ONE action per cycle. Two is a spam tell.',
+    '4. TEXT RULES. Hinglish, lowercase-ish, real-person short: a comment is 4-12 words, a story reply 3-12 words, a DM 1-2 short sentences, a NOTE is 60 characters MAXIMUM. No hashtags, no "nice post🔥", no generic filler, no emoji spam — say the specific thing only you would notice.',
+    '5. PRIVACY IS ABSOLUTE. A line written for one person must never mention another person by name or handle, and must never quote what somebody else said in a private chat. Each action is seen by ONE audience — write only for that audience.',
+    '6. MATCH THE RELATIONSHIP. A close friend gets teasing and inside warmth; a stranger or a new follower gets light, polite, low-effort.',
+    '7. THE NOTE is your mood status, not an advertisement. Change it only when it is stale or your mood genuinely shifted. Keep the same one otherwise.',
+    '8. Never write anything that sounds like an AI, a bot, a brand or an assistant. You are Aduu.',
+  ].join('\n');
+
+  /* 1 · OBSERVE — everything the brain is allowed to see this cycle. */
+  async function buildSocialObservation() {
+    const timeCtx = getTimeContext();
+    const L = [];
+
+    /* ── the NOTE tray ── */
+    let mine = null, others = [];
+    try {
+      const { items } = await trayRead();
+      const meId = String(S.viewerIgId || getCookie('ds_user_id') || '');
+      mine = items.find(it => it.authorId === meId) || null;
+      others = items.filter(it => it !== mine).slice(0, 8);
+    } catch (e) {
+      L.push('NOTE TRAY: unavailable (' + e.message + ')');
+    }
+    if (mine || others.length) {
+      const ageMin = (mine && mine.created_at)
+        ? Math.round((now() - mine.created_at) / 60_000) : null;
+      L.push(`ADUU'S NOTE: ${(mine && mine.text) || '(none)'}${ageMin === null ? '' : ` (posted ${ageMin} min ago)`}`);
+      L.push("OTHER PEOPLE'S NOTES:\n" +
+        (others.map(it => `@${it.username || '?'}: ${String(it.text || '').slice(0, 40)}`).join('\n') || '(none)'));
+    }
+
+    /* ── the STORY tray (who posted a story in the last 24h) ── */
+    let stories = [];
+    try { stories = await storyTray(); } catch (_) {}
+    const watch = socialWatchList();
+    const freshStories = stories.filter(s => now() - (s.taken_at || 0) < 24 * 3600e3);
+    if (freshStories.length) {
+      L.push('LIVE STORY TRAY (you can react to these):\n' +
+        freshStories.slice(0, 12).map(s =>
+          `@${s.username} · ${Math.max(1, Math.round((now() - s.taken_at) / 60_000))}m old` +
+          `${s.seen ? ' · already seen' : ''} · pk=${s.pk}`).join('\n'));
+    } else {
+      L.push('LIVE STORY TRAY: (nobody you watch has a fresh story right now)');
+    }
+
+    /* ── watched people: latest post + private-chat pulse (NO verbatim) ── */
+    if (watch.length) {
+      const lines = [];
+      for (const u of watch.slice(0, 8)) {
+        const T = Object.values(S.transcripts).find(x => cleanUsername(x.user) === u);
+        let postBit = 'no posts readable';
+        try {
+          const feed = await userFeed(u, 3);
+          if (feed[0]) {
+            const ageH = Math.round((now() - feed[0].taken_at) / 3600e3);
+            postBit = `latest post ${ageH}h old · "${String(feed[0].caption).slice(0, 90)}" · ` +
+              `${feed[0].comments} comments · pk=${feed[0].pk}`;
+          }
+        } catch (_) {}
+        let dmBit = 'no DM history';
+        if (T) {
+          const lastMsg = (T.messages || [])[T.messages.length - 1];
+          const mins = lastMsg ? Math.round((now() - (lastMsg.ts || 0)) / 60_000) : null;
+          dmBit = lastMsg
+            ? `last ${lastMsg.mine ? 'from Aduu' : 'from them'} ${mins}m ago · mood ${(T.moodState && T.moodState.current_mood) || 'PLAYFUL_CHILL'}`
+            : 'no messages yet';
+        }
+        const lastAct = lastSocialActionFor(u);
+        lines.push(`@${u}: ${postBit}\n    dm: ${dmBit}` +
+          (lastAct ? `\n    your last action: ${lastAct.kind} ${Math.round((now() - lastAct.at) / 3600e3)}h ago` : ''));
+      }
+      L.push('WATCHED PEOPLE:\n' + lines.join('\n'));
+    } else {
+      L.push('WATCHED PEOPLE: (none configured — IGAgent.Social.watch("u1","u2"))');
+    }
+
+    /* ── unanswered comments on Aduu's own posts ── */
+    if (CFG.SOCIAL.COMMENT_REPLIES) {
+      try {
+        const pk = await myPk();
+        const j = await socRest(`/api/v1/feed/user/${pk}/?count=4`);
+        const pending = [];
+        for (const it of (j.items || [])) {
+          const cmts = await fetchComments(String(it.pk));
+          for (const c of cmts) {
+            if (c.mine || SO.handledComments.has(c.pk)) continue;
+            pending.push(`@${c.user} on post ${it.pk} (comment ${c.pk}): "${String(c.text).slice(0, 90)}"`);
+          }
+          if (pending.length >= 6) break;
+        }
+        L.push("UNANSWERED COMMENTS ON ADUU'S POSTS:\n" + (pending.join('\n') || '(none)'));
+      } catch (e) {
+        L.push("UNANSWERED COMMENTS ON ADUU'S POSTS: unavailable (" + e.message + ')');
+      }
+    }
+
+    /* ── what the account already did recently (so the brain self-limits) ── */
+    const today = SO.actionLog.filter(a => now() - a.at < 24 * 3600e3);
+    const counts = {};
+    today.forEach(a => { counts[a.kind] = (counts[a.kind] || 0) + 1; });
+    L.push(`WHAT ADUU DID IN THE LAST 24H: ${
+      Object.keys(counts).length ? Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(', ') : 'nothing'}` +
+      (today.length ? `\n  most recent: ${today.slice(-3).map(a => `${a.kind}→${a.target || 'note'} (${Math.round((now() - a.at) / 60_000)}m ago) "${String(a.text || '').slice(0, 40)}"`).join(' | ')}` : ''));
+    L.push(`DAILY LIMITS LEFT: ${Object.entries(CFG.SOCIAL.DAILY_CAP)
+      .map(([k, v]) => `${k} ${Math.max(0, v - (counts[k] || 0))}/${v}`).join(' · ')}`);
+
+    const head = [
+      `TIME: ${timeCtx.label} — ${timeCtx.vibeHint}`,
+      `MODE: ${CFG.SOCIAL.DRY_RUN ? 'DRY RUN (nothing is really sent)' : 'LIVE'}`,
+    ];
+    return head.concat(L).join('\n\n') + '\n\nDecide now — remember doing nothing is normal and usually correct:';
+  }
+
+  function socialWatchList() {
+    const set = new Set();
+    const add = u => { const c = cleanUsername(u); if (c) set.add(c); };
+    for (const list of [CFG.SOCIAL.WATCH, CFG.SOCIAL.COMMENT_TARGETS, CFG.SOCIAL.STORY_TARGETS]) {
+      if (Array.isArray(list)) list.forEach(add);
+    }
+    if (Array.isArray(CFG.TARGETS) && CFG.TARGETS !== 'all') CFG.TARGETS.forEach(add);
+    return [...set];
+  }
+
+  function lastSocialActionFor(user, kind = null) {
+    const u = cleanUsername(user);
+    for (let i = SO.actionLog.length - 1; i >= 0; i--) {
+      const a = SO.actionLog[i];
+      if (cleanUsername(a.target || '') !== u) continue;
+      if (kind && a.kind !== kind) continue;
+      return a;
+    }
+    return null;
+  }
+
+  /* 2 · PLAN */
+  async function brainSocialDecide() {
+    const observation = await buildSocialObservation();
+    try {
+      const res = await llmBrain([
+        { role: 'system', content: SOCIAL_DECIDE_PROMPT },
+        { role: 'user', content: observation },
+      ], { type: 'decide', model: CFG.BRAIN_MODEL, maxTokens: 700,
+           temperature: 0.45, timeoutMs: 90_000 });
+      const plan = parseSocialPlan(res.text);
+      if (!plan) throw new Error('brain returned no usable social plan');
+      return { ok: true, plan, observation, model: res.model,
+               reasoning_chars: res.reasoning_chars || 0, raw: res.text };
+    } catch (e) {
+      return { ok: false, error: e.message, observation };
+    }
+  }
+
+  function parseSocialPlan(raw) {
+    const s = String(raw || '').trim()
+      .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+    let obj = null;
+    const first = s.indexOf('{');
+    if (first !== -1) {
+      let depth = 0, inStr = false, esc = false;
+      for (let i = first; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (ch === '\\') esc = true;
+          else if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) {
+            try { obj = JSON.parse(s.slice(first, i + 1)); } catch (_) { obj = null; }
+            break;
+          }
+        }
+      }
+    }
+    if (!obj || typeof obj !== 'object') return null;
+
+    const scale = (x, lo, hi, dflt) => {
+      const n = Number(x);
+      return (Number.isFinite(n) && n > 0) ? Math.max(lo, Math.min(hi, n)) : dflt;
+    };
+    let mode = String(obj.mode || 'observe').toLowerCase();
+    if (mode !== 'act') mode = 'observe';
+    const isNote = a => a && a.kind === 'note';
+    let actions = Array.isArray(obj.actions) ? obj.actions : [];
+    actions = actions.filter(a => a && typeof a === 'object')
+      .map(a => ({
+        kind: String(a.kind || '').toLowerCase(),
+        op: String(a.op || (a.kind === 'note' ? 'replace' : '')).toLowerCase(),
+        target: cleanUsername(a.target || ''),
+        media_pk: String(a.media_pk || ''),
+        comment_pk: String(a.comment_pk || ''),
+        story_pk: String(a.story_pk || ''),
+        text: clip(a.text, a.kind === 'note' ? CFG.SOCIAL.MAX_NOTE_CHARS : 220),
+        reason: clip(a.reason, 160),
+      }))
+      .filter(a => a.kind || a.op);
+
+    // notes are always allowed through the mode gate (they are "keep" by default)
+    if (mode === 'observe') actions = actions.filter(isNote);
+
+    return {
+      mode,
+      intent: clip(obj.intent, 200),
+      skip_reason: clip(obj.skip_reason, 200),
+      actions: actions.slice(0, CFG.SOCIAL.MAX_ACTIONS_PER_CYCLE + 1),
+      next_check_in_minutes: scale(obj.next_check_in_minutes, 15, 240, 75),
+    };
+  }
+
+  /* 3 · GATE — the runtime's rarity rules. The brain wants; the gate allows. */
+  function socialGate(action, actedThisCycle) {
+    const kind = action.kind;
+    if (!CFG.SOCIAL.DAILY_CAP.hasOwnProperty(kind)) {
+      return { ok: false, reason: 'unknown_kind_' + kind };
+    }
+    if (kind === 'note' && action.op === 'keep') return { ok: false, reason: 'nothing_to_do' };
+    if (kind === 'note' && CFG.SOCIAL.NOTES_MODE !== 'agentic') {
+      return { ok: false, reason: 'notes_off' };
+    }
+    if (kind !== 'note') {
+      const h = getTimeContext().hour;
+      const [qStart, qEnd] = CFG.SOCIAL.QUIET_HOURS;
+      if (h >= qStart && h < qEnd) return { ok: false, reason: 'quiet_hours' };
+      if (!action.target) return { ok: false, reason: 'no_target' };
+      if (actedThisCycle) return { ok: false, reason: 'one_action_per_cycle' };
+    }
+
+    // per (kind,target) cooldown
+    const cooldown = CFG.SOCIAL.COOLDOWN_MS[kind] || 0;
+    const lastForTarget = kind === 'note'
+      ? SO.actionLog.filter(a => a.kind === 'note').slice(-1)[0]
+      : lastSocialActionFor(action.target, kind);
+    if (lastForTarget && (now() - lastForTarget.at) < cooldown) {
+      return {
+        ok: false,
+        reason: `cooldown_${Math.round((cooldown - (now() - lastForTarget.at)) / 60_000)}m_left`,
+      };
+    }
+
+    // minimum gap between any two PUBLIC actions (comments/story replies)
+    if (kind === 'comment' || kind === 'story_reply') {
+      const lastPublic = SO.actionLog.filter(a => a.kind === 'comment' || a.kind === 'story_reply')
+        .slice(-1)[0];
+      if (lastPublic &&
+          (now() - lastPublic.at) < CFG.SOCIAL.MIN_GAP_BETWEEN_PUBLIC_ACTIONS_MS) {
+        return { ok: false, reason: 'public_action_too_soon' };
+      }
+    }
+
+    // daily cap
+    const cap = CFG.SOCIAL.DAILY_CAP[kind] || 0;
+    const usedToday = SO.actionLog.filter(a => a.kind === kind && (now() - a.at) < 24 * 3600e3).length;
+    if (usedToday >= cap) return { ok: false, reason: 'daily_cap_' + cap };
+
+    // audience/target permissions
+    if (kind === 'comment' && CFG.SOCIAL.COMMENT_TARGETS.length &&
+        !CFG.SOCIAL.COMMENT_TARGETS.map(cleanUsername).includes(action.target)) {
+      return { ok: false, reason: 'target_not_allowed_for_comments' };
+    }
+    if (kind === 'story_reply' && CFG.SOCIAL.STORY_TARGETS.length &&
+        !CFG.SOCIAL.STORY_TARGETS.map(cleanUsername).includes(action.target)) {
+      return { ok: false, reason: 'target_not_allowed_for_stories' };
+    }
+    if (kind === 'comment_reply' && !CFG.SOCIAL.COMMENT_REPLIES) {
+      return { ok: false, reason: 'comment_replies_off' };
+    }
+    if (kind === 'dm' && Array.isArray(CFG.TARGETS) &&
+        !CFG.TARGETS.map(cleanUsername).includes(action.target)) {
+      return { ok: false, reason: 'target_not_a_dm_target' };
+    }
+
+    // 4 · ISOLATE
+    if (action.text) {
+      const col = collisionCheck(action);
+      if (!col.ok && kind === 'note') {
+        action.text = isolationGuard(action.text, 'public');
+      } else if (!col.ok) {
+        return { ok: false, reason: 'isolation_blocked:' + col.problems.slice(0, 2).join('+') };
+      }
+    }
+    return { ok: true, reason: 'allowed' };
+  }
+
+  /* 5 · ACT */
+  async function executeSocialAction(action) {
+    const kind = action.kind;
+    if (kind === 'note') {
+      if (action.op === 'delete') {
+        const { items } = await trayRead();
+        const meId = String(S.viewerIgId || getCookie('ds_user_id') || '');
+        const mine = items.find(it => it.authorId === meId);
+        if (!mine || !mine.id) return { done: false, note: 'no note to delete' };
+        if (CFG.SOCIAL.DRY_RUN) return { done: true, dry: true, note: 'would delete "' + mine.text + '"' };
+        await noteDelete(mine.id);
+        return { done: true, note: 'deleted "' + mine.text + '"' };
+      }
+      const text = clip(action.text, CFG.SOCIAL.MAX_NOTE_CHARS);
+      if (!text) return { done: false, note: 'empty note text' };
+      if (CFG.SOCIAL.DRY_RUN) return { done: true, dry: true, note: 'would set "' + text + '"' };
+      const { items } = await trayRead();
+      const meId = String(S.viewerIgId || getCookie('ds_user_id') || '');
+      const mine = items.find(it => it.authorId === meId);
+      if (mine && mine.id) { try { await noteDelete(mine.id); } catch (_) {} }
+      await noteCreate(text);
+      return { done: true, note: '"' + text + '"' };
+    }
+
+    const text = isolationGuard(String(action.text || '').trim(), action.target);
+    if (!text) return { done: false, note: 'empty text after isolation guard' };
+
+    if (kind === 'comment' || kind === 'comment_reply') {
+      const media = String(action.media_pk || '').replace(/\D/g, '');
+      if (!media) return { done: false, note: 'no media_pk' };
+      if (CFG.SOCIAL.DRY_RUN) {
+        return { done: true, dry: true, note: `would comment on ${media}: "${text}"` };
+      }
+      if (kind === 'comment_reply' && action.comment_pk) {
+        try { await postComment(media, text, action.comment_pk); }
+        catch (_) { await postComment(media, text); }
+      } else {
+        await postComment(media, text);
+      }
+      SO.seenPosts.add(media);
+      if (action.comment_pk) SO.handledComments.add(action.comment_pk);
+      return { done: true, note: `commented on ${media}: "${text}"` };
+    }
+
+    if (kind === 'story_reply') {
+      const pk = String(action.story_pk || '').replace(/\D/g, '');
+      if (!pk) return { done: false, note: 'no story_pk' };
+      if (CFG.SOCIAL.DRY_RUN) {
+        return { done: true, dry: true, note: `would react to story ${pk}: "${text}"` };
+      }
+      await storyReply(pk, pk, text);
+      return { done: true, note: `reacted to story ${pk}: "${text}"` };
+    }
+
+    if (kind === 'dm') {
+      const th = await findThread(action.target);
+      if (!th) return { done: false, note: 'no thread for @' + action.target };
+      const tid = String(th.thread_fbid || th.id);
+      if (CFG.SOCIAL.DRY_RUN) {
+        return { done: true, dry: true, note: `would DM @${action.target}: "${text}"` };
+      }
+      await sendText(tid, text);
+      return { done: true, note: `DM'd @${action.target}: "${text}"` };
+    }
+
+    return { done: false, note: 'unhandled kind ' + kind };
+  }
+
+  /* 1→6 · one full cycle */
+  async function socialCycle(force = false) {
+    if (SO.planning) return { skipped: true, reason: 'cycle_already_running' };
+    if (!CFG.SOCIAL.ENABLED && !force) return { skipped: true, reason: 'social_disabled' };
+    SO.planning = true;
+    const cycle = { at: now(), iso: new Date().toISOString(), dry: CFG.SOCIAL.DRY_RUN };
+    try {
+      const dec = await brainSocialDecide();
+      cycle.observation_chars = (dec.observation || '').length;
+      cycle.brain_model = dec.model || CFG.BRAIN_MODEL;
+      if (!dec.ok) {
+        cycle.status = 'brain_failed';
+        cycle.error = dec.error;
+        socLog('soc', 'social brain cycle failed: ' + dec.error);
+        return cycle;
+      }
+      const plan = dec.plan;
+      cycle.plan = plan;
+      cycle.decided_by = 'gemma-4-brain';
+      cycle.outcome = [];
+
+      if (plan.mode === 'observe' && !plan.actions.length) {
+        socLog('soc', `brain chose to do nothing — ${plan.skip_reason || 'no reason given'}`);
+      }
+
+      let acted = 0;
+      for (const action of plan.actions) {
+        if (acted >= CFG.SOCIAL.MAX_ACTIONS_PER_CYCLE) {
+          cycle.outcome.push({ kind: action.kind, status: 'deferred', reason: 'cycle_action_limit' });
+          continue;
+        }
+        const gate = socialGate(action, acted > 0);
+        if (!gate.ok) {
+          cycle.outcome.push({ kind: action.kind, target: action.target,
+            status: 'gated', reason: gate.reason });
+          socLog('soc', `${action.kind}${action.target ? '→@' + action.target : ''} gated (${gate.reason})`);
+          continue;
+        }
+        let res;
+        try {
+          // one social action at a time per person — two brains never collide
+          res = await withLock('social:' + (action.target || action.kind),
+            () => executeSocialAction(action));
+          if (res && res.skipped) {
+            cycle.outcome.push({ kind: action.kind, status: 'skipped', reason: res.reason });
+            continue;
+          }
+          const rec = {
+            kind: action.kind, target: action.target || '', at: now(),
+            text: action.text || '', reason: action.reason || '',
+            status: res.done ? (res.dry ? 'dry_run' : 'sent') : 'failed',
+            note: res.note || '',
+          };
+          SO.actionLog.push(rec);
+          if (SO.actionLog.length > 400) SO.actionLog = SO.actionLog.slice(-200);
+          if (action.kind === 'note') {
+            SO.noteLog.push({ at: now(), text: action.text, reason: action.reason, op: action.op });
+            SO.noteLog = SO.noteLog.slice(-20);
+          }
+          cycle.outcome.push(Object.assign({ status: rec.status }, rec));
+          socLog('soc', `${action.kind}${action.target ? '→@' + action.target : ''}: ${res.note}`);
+          if (res.done && !res.dry) acted++;
+          else if (res.done && res.dry) acted++;   // dry runs still consume the slot
+        } catch (e) {
+          cycle.outcome.push({ kind: action.kind, status: 'error', reason: e.message });
+          socLog('soc', `${action.kind} failed: ${e.message}`);
+          if (e.fatal) {                       // Instagram rate-limit → back off hard
+            socLog('soc', 'Instagram pushed back — social brain resting for 3h');
+            scheduleSocialBrain(180);
+            break;
+          }
+        }
+      }
+      cycle.status = 'completed';
+      cycle.next_check_in_minutes = plan.next_check_in_minutes;
+      saveSocialLocal();
+      scheduleSocialBrain(cycle.next_check_in_minutes || 75);
+      persistSocialBrain(cycle);
+      return cycle;
+    } finally {
+      SO.planning = false;
+    }
+  }
+
+  function scheduleSocialBrain(minutes) {
+    if (SO.timer) { clearTimeout(SO.timer); SO.timer = null; }
+    if (!CFG.SOCIAL.ENABLED) return;
+    const mins = Math.max(5, Number(minutes) || 75);
+    const delay = Math.round(mins * 60_000 * rand(0.9, 1.15));
+    SO.timer = setTimeout(() => {
+      socialCycle().catch(e => socLog('soc', 'cycle error: ' + e.message));
+    }, delay);
+    socLog('soc', `next social-brain cycle in ~${Math.round(delay / 60_000)} min`);
+  }
+
+  async function persistSocialBrain(cycle) {
+    SO.cycles.push(cycle);
+    if (SO.cycles.length > 60) SO.cycles = SO.cycles.slice(-40);
+    try {
+      if (S.wsReady) {
+        await wsRequest({
+          type: 'save_social',
+          social: {
+            schema_version: '9.0-social-brain-log',
+            updated_at: new Date().toISOString(),
+            config: {
+              enabled: CFG.SOCIAL.ENABLED, dry_run: CFG.SOCIAL.DRY_RUN,
+              notes_mode: CFG.SOCIAL.NOTES_MODE,
+              watch: CFG.SOCIAL.WATCH, comment_targets: CFG.SOCIAL.COMMENT_TARGETS,
+              story_targets: CFG.SOCIAL.STORY_TARGETS,
+            },
+            action_log: SO.actionLog.slice(-120),
+            note_log: SO.noteLog.slice(-20),
+            cycles: SO.cycles.slice(-20),
+          },
+        }, 10_000);
+      }
+    } catch (e) {
+      log(C.dim, 'soc', 'social brain log not mirrored to disk (' + e.message + ')');
+    }
+  }
+
+  function saveSocialLocal() {
+    try {
+      localStorage.setItem('ig_agent_social_v9', JSON.stringify({
+        seenPosts: [...SO.seenPosts].slice(-300),
+        handledComments: [...SO.handledComments].slice(-300),
+        actionLog: SO.actionLog.slice(-120),
+        noteLog: SO.noteLog.slice(-20),
+      }));
+    } catch (_) {}
+  }
+
+  function loadSocialLocal() {
+    try {
+      const p = JSON.parse(localStorage.getItem('ig_agent_social_v9') || '{}');
+      (p.seenPosts || []).forEach(x => SO.seenPosts.add(x));
+      (p.handledComments || []).forEach(x => SO.handledComments.add(x));
+      SO.actionLog = p.actionLog || [];
+      SO.noteLog = p.noteLog || [];
+    } catch (_) {}
+  }
+
+  function socialStart() {
+    if (SO.running) return;
+    SO.running = true;
+    loadSocialLocal();
+    socLog('soc', `SOCIAL BRAIN ON · dryRun=${CFG.SOCIAL.DRY_RUN} · ` +
+      `watch=[${socialWatchList().join(',')}] · comments=[${CFG.SOCIAL.COMMENT_TARGETS.join(',')}] · ` +
+      `stories=[${CFG.SOCIAL.STORY_TARGETS.join(',')}] · notes=${CFG.SOCIAL.NOTES_MODE}`);
+    const delay = rand(20_000, 60_000);   // never fire the instant it starts
+    SO.timer = setTimeout(() => {
+      socialCycle().catch(e => socLog('soc', 'cycle error: ' + e.message));
+    }, delay);
+  }
+
+  function socialStop() {
+    SO.running = false;
+    if (SO.timer) { clearTimeout(SO.timer); SO.timer = null; }
+    socLog('soc', 'SOCIAL BRAIN OFF');
+  }
+
   /* ──────────────────────────── PUBLIC API ──────────────────────────── */
 
   async function start() {
@@ -3706,12 +4589,15 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     log(C.ok, 'main',
       `started · bridge=${h.default_endpoint} (${h.chain.length}-model chain) · dryRun=${CFG.DRY_RUN} · memory=${CFG.MEMORY} · humanize=${CFG.HUMANIZE} · seen=${CFG.SEEN} · typing=${typingFn() ? 'ready' : 'unavailable'} · targets=${
         Array.isArray(CFG.TARGETS) ? CFG.TARGETS.join(',') : CFG.TARGETS}` +
-      (S.myInteropId ? ` · me=${S.myInteropId}` : ''));
+      (S.myInteropId ? ` · me=${S.myInteropId}` : '') +
+      (CFG.SOCIAL.ENABLED ? ` · social-brain=${CFG.SOCIAL.DRY_RUN ? 'dry' : 'LIVE'}` : ''));
     pollTick();
+    if (CFG.SOCIAL.ENABLED) socialStart();
   }
 
   function stop() {
     S.running = false;
+    socialStop();
     if (S.timer) { clearTimeout(S.timer); S.timer = null; }
     if (S.wsKeepalive) { clearInterval(S.wsKeepalive); S.wsKeepalive = null; }
     Object.values(S.pending).forEach(p => p.timer && clearTimeout(p.timer));
@@ -3961,7 +4847,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     ok &= await check('transcripts · bridge save roundtrip', async () => {
       if (!CFG.TRANSCRIPTS) return 'disabled';
       const r = await wsRequest({ type: 'save', transcript: {
-        schema_version: '8.0-brain-decides',
+        schema_version: '9.0-social-brain',
         user: '_selftest', thread_fbid: '0', updated_at: new Date().toISOString(),
         persona: 'test', owner_bio: 'test', memory_profile: '',
         models: { answering_model: CFG.MODEL, brain_model: CFG.BRAIN_MODEL },
@@ -4044,6 +4930,45 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       }), { joined: 'bhai 10 min mein yaad dila dena assignment ka', trigger: 'incoming_burst', user: 'deeps20_' });
       if (!ok.reminder || ok.reminder.due_in_minutes !== 10) throw new Error('evidence-backed reminder was dropped');
       return `evidence gate works (score ${ok.reminder.evidence_score})`;
+    });
+    ok &= await check('v9 · social brain · story tray + notes tray readable', async () => {
+      try {
+        const tray = await storyTray();
+        const notes = await trayRead();
+        return `${tray.length} live stories · ${notes.items.length} notes on the tray`;
+      } catch (e) {
+        return `unavailable now (${e.message}) — the brain degrades gracefully`;
+      }
+    });
+    ok &= await check('v9 · isolation guard keeps chats from colliding', async () => {
+      const me = 'isolationselftest';
+      const T = ensureTranscript('T_ISO_SELF', me);
+      T.messages = [{ id: 'iso1', ts: now(), mine: false, kind: 'text', label: 'text',
+                      text: 'ye meri private baat hai kabhi mat bolna' }];
+      const leak = isolationGuard(
+        'haan wahi, @isolationselftest ne kaha tha "ye meri private baat hai kabhi mat bolna"',
+        'someoneelse');
+      if (/isolationselftest/i.test(leak)) throw new Error('handle leaked: ' + leak);
+      if (/private baat hai kabhi mat bolna/i.test(leak)) throw new Error('private line leaked: ' + leak);
+      const own = isolationGuard('ye meri private baat hai kabhi mat bolna', me);
+      if (!/private baat hai/i.test(own)) throw new Error('own chat content was wrongly scrubbed: ' + own);
+      return 'foreign handle + verbatim line blocked, own chat untouched';
+    });
+    ok &= await check('v9 · social plan JSON parses + rarity gate works', async () => {
+      const p = parseSocialPlan(JSON.stringify({
+        mode: 'observe', skip_reason: 'nothing deserves a reply',
+        actions: [{ kind: 'note', op: 'keep' }], next_check_in_minutes: 5,
+      }));
+      if (!p) throw new Error('plan not parsed');
+      if (p.mode !== 'observe') throw new Error('mode lost');
+      if (p.next_check_in_minutes < 15) throw new Error('cadence not clamped: ' + p.next_check_in_minutes);
+      const SOs = S.social;
+      const saved = SOs.actionLog;
+      SOs.actionLog = [{ kind: 'comment', target: 'gated_selftest', at: now() - 1000, text: 'x' }];
+      const g = socialGate({ kind: 'comment', target: 'gated_selftest', text: 'dubara' }, false);
+      SOs.actionLog = saved;
+      if (g.ok) throw new Error('cooldown not enforced');
+      return `observe-mode parsed · cadence clamped · repeat blocked (${g.reason})`;
     });
     ok &= await check('caps · counters sane', async () => {
       if (hourCount() > CFG.MAX_REPLIES_PER_HOUR) throw new Error('hourly cap already hit');
@@ -4128,6 +5053,14 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
               getTimeContext, agentDecide, shouldStartProactiveConvo, buildProactiveHistory,
               runBackgroundBrain, parseBrainJson, ensureTranscript, llmBrain,
               brainDecide, decideTurn, brainDirective, applyBrainDecision,
+              // v9 social brain
+              socialCycle, brainSocialDecide, parseSocialPlan, socialGate,
+              executeSocialAction, buildSocialObservation, socialWatchList,
+              lastSocialActionFor, storyTray, userFeed, fetchComments, postComment,
+              trayRead, noteCreate, noteDelete, storyReply, socRest,
+              isolationGuard, collisionCheck, otherHandles, foreignQuotes, withLock,
+              socialStart, socialStop, saveSocialLocal, loadSocialLocal,
+              SOCIAL_DECIDE_PROMPT,
               parseDecisionJson, normalizeReminder, normalizeMission,
               localTaskExtraction, brainDecisionContext, evidenceScore, clip,
               onRealtimeSignal, nextPollDelayMs,
@@ -4267,6 +5200,170 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       const out = entry ? { user: entry.user, brainProfile: entry.brainProfile, agentState: entry.agentState } : null;
       console.log(`%cGemma-4 Brain Profile for @${q}`, C.info, out);
       return out;
+    },
+    /* ══════════ v9 · SOCIAL BRAIN ══════════
+       The same Gemma-4 brain runs the whole account: stories, comments,
+       comment replies, out-of-the-blue DMs and the Instagram NOTE.
+       Rare by design — it usually decides to do nothing at all. */
+    Social: {
+      enable() {
+        CFG.SOCIAL.ENABLED = true;
+        socLog('soc', 'SOCIAL BRAIN enabled · dryRun=' + CFG.SOCIAL.DRY_RUN +
+          ' (IGAgent.Social.dryRun(false) to actually send)');
+        if (S.running) socialStart();
+        return CFG.SOCIAL.ENABLED;
+      },
+      disable() { CFG.SOCIAL.ENABLED = false; socialStop(); return false; },
+      dryRun(v) {
+        if (v !== undefined) CFG.SOCIAL.DRY_RUN = !!v;
+        socLog('soc', 'SOCIAL DRY_RUN =', CFG.SOCIAL.DRY_RUN);
+        return CFG.SOCIAL.DRY_RUN;
+      },
+      /* who the social brain is allowed to engage with */
+      watch(...users) {
+        CFG.SOCIAL.WATCH = users.map(u => cleanUsername(u)).filter(Boolean);
+        socLog('soc', 'watch →', CFG.SOCIAL.WATCH.join(', ') || '(none)');
+        return CFG.SOCIAL.WATCH;
+      },
+      commentTargets(...users) {
+        CFG.SOCIAL.COMMENT_TARGETS = users.map(u => cleanUsername(u)).filter(Boolean);
+        socLog('soc', 'comment targets →', CFG.SOCIAL.COMMENT_TARGETS.join(', ') || '(none)');
+        return CFG.SOCIAL.COMMENT_TARGETS;
+      },
+      storyTargets(...users) {
+        CFG.SOCIAL.STORY_TARGETS = users.map(u => cleanUsername(u)).filter(Boolean);
+        socLog('soc', 'story targets →', CFG.SOCIAL.STORY_TARGETS.join(', ') || '(none)');
+        return CFG.SOCIAL.STORY_TARGETS;
+      },
+      commentReplies(v) {
+        if (v !== undefined) CFG.SOCIAL.COMMENT_REPLIES = !!v;
+        socLog('soc', 'comment replies =', CFG.SOCIAL.COMMENT_REPLIES);
+        return CFG.SOCIAL.COMMENT_REPLIES;
+      },
+      notes(mode) {
+        CFG.SOCIAL.NOTES_MODE = (mode === 'off') ? 'off' : 'agentic';
+        socLog('soc', 'notes mode =', CFG.SOCIAL.NOTES_MODE);
+        return CFG.SOCIAL.NOTES_MODE;
+      },
+      /* run the brain right now — see what it wants to do */
+      async plan() {
+        const dec = await brainSocialDecide();
+        if (!dec.ok) throw new Error(dec.error);
+        console.log('%cSocial brain plan', C.bot, dec.plan);
+        return dec.plan;
+      },
+      /* run a full cycle (observe → plan → gate → act). Respects DRY_RUN. */
+      async now() { return socialCycle(true); },
+      status() {
+        const today = SO.actionLog.filter(a => now() - a.at < 24 * 3600e3);
+        const counts = {};
+        today.forEach(a => { counts[a.kind] = (counts[a.kind] || 0) + 1; });
+        const out = {
+          enabled: CFG.SOCIAL.ENABLED, running: SO.running, dryRun: CFG.SOCIAL.DRY_RUN,
+          watch: socialWatchList(),
+          commentTargets: CFG.SOCIAL.COMMENT_TARGETS,
+          storyTargets: CFG.SOCIAL.STORY_TARGETS,
+          commentReplies: CFG.SOCIAL.COMMENT_REPLIES,
+          notesMode: CFG.SOCIAL.NOTES_MODE,
+          doneToday: counts,
+          capsToday: CFG.SOCIAL.DAILY_CAP,
+          lastActions: SO.actionLog.slice(-5),
+          lastNoteDecisions: SO.noteLog.slice(-5),
+          cyclesLogged: SO.cycles.length,
+        };
+        console.log('%cIGAgent.Social status', C.bot, out);
+        return out;
+      },
+      log() {
+        console.log('%cSocial brain cycles', C.bot, SO.cycles.slice(-10));
+        return SO.cycles;
+      },
+      /* manual primitives (bypass DRY_RUN — these are explicit orders) */
+      async comment(mediaPkOrUrl, text) {
+        const id = String(mediaPkOrUrl).replace(/\D*(\d+).*/, '$1');
+        const r = await postComment(id, text);
+        socLog('soc', `comment posted on ${id}: "${text}"`);
+        return r;
+      },
+      async replyToComment(mediaPk, commentPk, text) {
+        try { return await postComment(String(mediaPk), text, String(commentPk)); }
+        catch (_) { return postComment(String(mediaPk), text); }
+      },
+      async comments(mediaPk) { return fetchComments(String(mediaPk)); },
+      async feed(user, count = 6) { return userFeed(cleanUsername(user), count); },
+      async stories() { return storyTray(); },
+      async tray() {
+        const { items } = await trayRead();
+        console.table(items.map(it => ({
+          user: it.username || (it.authorId === String(S.viewerIgId) ? 'ME' : '?'),
+          text: String(it.text || '').slice(0, 50), id: it.id,
+          age_min: it.created_at ? Math.round((now() - it.created_at) / 60_000) : null,
+        })));
+        return items;
+      },
+      async note(text) {
+        const r = await noteCreate(text);
+        socLog('soc', 'note set: "' + text + '"');
+        return r;
+      },
+      async deleteNote() {
+        const { items } = await trayRead();
+        const meId = String(S.viewerIgId || getCookie('ds_user_id') || '');
+        const mine = items.find(it => it.authorId === meId);
+        if (!mine || !mine.id) throw new Error('no note of mine found on the tray');
+        const r = await noteDelete(mine.id);
+        socLog('soc', 'note deleted');
+        return r;
+      },
+      async storyReact(usernameOrStoryPk, text) {
+        const raw = String(usernameOrStoryPk);
+        let pk = raw.replace(/\D/g, '');
+        if (!/^\d+$/.test(raw)) {
+          const tray = await storyTray();
+          const hit = tray.find(s => s.username === cleanUsername(raw) && s.pk);
+          if (!hit) throw new Error('no fresh story found for @' + cleanUsername(raw));
+          pk = hit.pk;
+        }
+        const r = await storyReply(pk, pk, text);
+        socLog('soc', `reacted to story ${pk}: "${text}"`);
+        return r;
+      },
+      get _state() { return SO; },
+      get _cfg() { return CFG.SOCIAL; },
+    },
+    /* Nice notes, straight from the console */
+    async note(text) {
+      const t = clip(text, CFG.SOCIAL.MAX_NOTE_CHARS);
+      const r = await noteCreate(t);
+      socLog('note', 'NOTE → "' + t + '"');
+      return r;
+    },
+    async notes() {
+      const { items } = await trayRead();
+      console.log('%cInstagram notes tray', C.bot, items);
+      return items;
+    },
+    async deleteNote() {
+      const { items } = await trayRead();
+      const meId = String(S.viewerIgId || getCookie('ds_user_id') || '');
+      const mine = items.find(it => it.authorId === meId);
+      if (!mine || !mine.id) throw new Error('no note of mine found on the tray');
+      const r = await noteDelete(mine.id);
+      socLog('note', 'note deleted');
+      return r;
+    },
+    /* who has a live story right now (the brain's "story check") */
+    async stories() {
+      const tray = await storyTray();
+      const fresh = tray.filter(s => now() - (s.taken_at || 0) < 24 * 3600e3);
+      console.log('%cLive story tray', C.bot, fresh);
+      return fresh;
+    },
+    async noteNow() {
+      /* Ask the brain to take one note decision immediately. */
+      const cycle = await socialCycle(true);
+      const noteOutcome = (cycle.outcome || []).find(o => o.kind === 'note');
+      return noteOutcome || { status: 'nothing', reason: (cycle.plan && cycle.plan.skip_reason) || cycle.error };
     },
     /* ── v8: THE BRAIN DECIDES EVERYTHING ── */
     brainMode(v) {
@@ -4413,10 +5510,13 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   loadState();
   window.IGAgent = api;
 
-  console.log('%cIGAgent v8 BRAIN-FIRST loaded & ACTIVE ✅  (Gemma-4 decides · GLM-4.7-Flash writes · default targets: ' +
+  console.log('%cIGAgent v9 SOCIAL BRAIN loaded & ACTIVE ✅  (Gemma-4 decides everything · GLM-4.7-Flash writes · default targets: ' +
     (Array.isArray(CFG.TARGETS) ? CFG.TARGETS.join(', ') : CFG.TARGETS) + ')', C.ok,
     '\n• Auto-started LIVE with default targets: adarshu.io, deeps20_' +
     '\n• THE BRAIN DECIDES: mood, bubbles, silence, reminders, pranks — all from the chat messages' +
+    '\n• SOCIAL BRAIN (rare by design): stories · comments · replies · notes · out-of-the-blue DMs' +
+    '\n• IGAgent.Social.enable()     ← turn the social brain on (dry-run first)' +
+    '\n• IGAgent.note("chai aur code ☕") ← put a nice NOTE up · IGAgent.notes() · IGAgent.deleteNote()' +
     '\n• IGAgent.why("user")         ← see the brain\'s last JSON decision + its evidence line' +
     '\n• IGAgent.decide("user")      ← ask the brain to decide that chat right now (sends nothing)' +
     '\n• IGAgent.brainMode(false)    ← fall back to the old local rules' +

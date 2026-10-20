@@ -1,67 +1,76 @@
-# IG Agent — Aduu, the Brain-First Autonomous Agent on Instagram (v8)
+# IG Agent — Aduu, the Autonomous Social Brain on Instagram (v9)
 
-An autonomous Instagram DM agent. People message the account and **Aduu**
-responds how a real person responds in reality — across many chats at once,
-remembering each person, sharing cross-chat gossip, planning secret pranks with
-one friend and running them on another, and **restarting a dead conversation by
-himself only when there is a real reason to**.
+An autonomous Instagram agent. People message the account and **Aduu** responds
+how a real person responds in reality — and the same brain also runs the whole
+account's social life: it watches the story tray, reacts to a story when one
+deserves it, comments on a post, answers a comment on Aduu's own post, sends a
+DM out of the blue, and writes the **Instagram NOTE**.
 
-> **v8 — the brain decides everything.**
-> The Gemma-4 brain is handed the **actual incoming chat messages** and returns
-> one strict JSON decision that owns the entire turn: reply or stay silent,
-> live mood and *why*, how many bubbles and what each one must do, reminders the
-> person asked for, secret cross-chat pranks, gossip, the privacy verdict and
-> the steer for the next turn. GLM-4.7-Flash then **only writes** what the brain
-> decided. Every side-effect has to cite the chat line that caused it, so the
-> **chat messages are what make Aduu do the thing** — never a timer, never a
-> hard-coded rule. The old local regexes survive only as the fallback used when
-> the brain is unreachable.
+> **v9 — one brain, the whole account.**
+> The Gemma-4 brain is the single decision maker. For every DM turn it returns a
+> strict JSON decision that owns that turn. On a slow social cycle it returns a
+> strict JSON plan that owns the account. GLM-4.7-Flash only **writes** what the
+> brain decided.
+>
+> **Rare by design.** A real person scrolls past almost everything. The social
+> brain observes every 45–120 minutes, and the runtime lets at most **one**
+> public action per cycle through, with per-person cooldowns (story replies
+> 14h, comments 8h), daily caps (3 comments, 2 story replies, 4 notes) and
+> quiet hours. Doing nothing is the default and the correct answer most times.
+>
+> **Chats never collide.** Three locks guard every outgoing line: no other
+> contact's `@handle`, no verbatim line from another person's chat, and every
+> social action declares the single audience that will see it.
 
-> **Version archives:** the previous generations are kept intact —
-> [`v5/`](./v5) (gemma-4 edition) and [`v6/`](./v6) (Qwen3 + Gemma-4 dual model).
+> **Version archives:** [`v5/`](./v5) and [`v6/`](./v6) hold the previous
+> generations. The story/comment/notes primitives were ported in from the
+> experimental `arena/71d3f44b-dsk` branch and rebuilt brain-first here.
 
 ---
 
-## What changed in v8 (and why)
+## What changed in v9
 
-| v7 behaviour | v8 behaviour |
+| Before | v9 |
 |---|---|
-| Local rules (`agentDecide`) picked the action from regexes on the burst | **`decideTurn()` asks the Gemma-4 brain first.** It reads the real messages and returns the action, mood, bubble plan, reminders, missions, gossip and privacy verdict as one JSON object. Local rules only run if the brain call fails. |
-| The brain ran *after* the turn and merely suggested things for next time | The brain runs **before** every reply and is the decision maker; the post-turn brain pass only refreshes memory and the next-turn steer (and may never stomp on the mood the decision brain just chose). |
-| Only the writer model saw the plan | The decision is injected into the writer prompt as `[THE BRAIN DECIDED THIS TURN — WRITE EXACTLY THIS PLAN]`, including `my_last` so the reply **moves forward instead of repeating**. |
-| Aduu always answered any burst | The brain can decide **`STAY_SILENT`** and leave a dead burst on seen, like a real person (`BRAIN_ALLOW_SILENCE`). |
-| Reminders / pranks came from local regex extraction | Reminders and secret cross-chat missions now come from the brain **with an `evidence` field** — a quote from their message. Anything that cannot be traced back to the chat is **thrown away** (`evidenceScore()` gate). |
-| Decisions were invisible | Every turn logs `brain_decision` in the process log, `last_decision` at the top of the transcript, and `IGAgent.why('user')` prints the last decision in the console. `/v1/decide` exposes it over REST. |
+| DM brain + a separate experimental "social agent" with its own hard-coded prompts and cadence | **One brain.** The same Gemma-4 decision maker handles DM turns *and* the account's social life, with one consistent personality. |
+| Story handling proxied a post | **Real story tray** — `GET /api/v1/feed/reels_tray/` lists who has a live story and its media id, and the brain reacts to the actual story. |
+| Every social scan acted on everything it found | **Rarity gates.** Cooldowns per (kind, target), daily caps, quiet hours, a minimum 3h gap between public actions, and one action per cycle. The brain "wants"; the runtime "allows". |
+| Cross-chat leakage was possible | **Isolation engine.** `isolationGuard()` + `collisionCheck()` strip foreign handles and verbatim lines from other chats; actions that still leak are **dropped, not sent**. |
+| Notes were an experimental extra | **First-class NOTE power** — `IGAgent.note()`, `IGAgent.notes()`, `IGAgent.deleteNote()`, `IGAgent.noteNow()` — and the brain writes/replaces/deletes the note by itself, ≤60 chars. |
+| Social activity was invisible | Every cycle is reflected into `transcripts/_social_brain.json`: what the brain saw, what it decided, what the gate allowed, what it did. |
 
-Everything from v7 is kept: task-driven time triggers (no blind 30-minute
-spam), the six-mood engine, the privacy wall, logical `||` multi-bubble
-continuity, minimal thinking, and the glitch guard.
+Everything from v8 is kept: brain-first DM turns, the evidence gate, moods,
+task-driven reminders, secret cross-chat pranks, the privacy wall, logical
+`||` multi-bubble continuity, minimal thinking and the glitch guard.
 
 ---
 
-## Brain-first architecture
+## Architecture
 
 ```
  instagram.com tab                     your machine                            internet
 ┌──────────────────────────┐  WebSocket ┌─────────────────────────┐   SSE   ┌──────────────────────────────┐
-│ ig-agent-chat.js (v8)    │ ─────────► │ server.py :8787         │ ──────► │ llmchat.in (no API key)      │
+│ ig-agent-chat.js (v9)    │ ─────────► │ server.py :8787         │ ──────► │ llmchat.in (no API key)      │
 │                          │ ws://local │ + llmchat_provider.py   │  stream │ • @cf/google/gemma-4-26b     │
-│ 1. BRAIN DECIDES         │            │ • /v1/decide  (brain)   │         │   THE DECISION MAKER         │
-│    decideTurn()          │ ◄───────── │ • /v1/chat/completions  │ ◄────── │ • @cf/zai-org/glm-4.7-flash  │
-│    → JSON decision       │ decisions  │ • /inference/stream     │  tokens │   the WRITER, minimal-think  │
-│ 2. GLM-4.7-Flash WRITES  │ replies +  │ • /ws  (CSP-proof)      │         │ • @cf/qwen/qwen3-30b-a3b-fp8 │
-│    exactly that plan     │ brain      │ • /transcripts, /global │         │   fast fallback              │
-│ 3. brain updates memory  │            │   -memory, /health      │         │ • llama-3.3-70b … (last)     │
-│                          │            │ • glitch guard +        │         └──────────────────────────────┘
-│ • mood / reminder /      │            │   auto model fallback   │
-│   mission engines        │            └─────────────────────────┘
-│ • privacy wall           │
+│  ONE BRAIN, TWO LOOPS    │            │ • /v1/decide  (brain)   │         │   THE DECISION MAKER         │
+│                          │            │ • /v1/chat/completions  │ ◄────── │ • @cf/zai-org/glm-4.7-flash  │
+│  A · DM TURN LOOP        │ decisions  │ • /inference/stream     │  tokens │   the WRITER, minimal-think  │
+│    per contact, instant  │ replies +  │ • /ws  (CSP-proof)      │         │ • @cf/qwen/qwen3-30b-a3b-fp8 │
+│  B · SOCIAL LOOP         │ brain      │ • /transcripts          │         │   fast fallback              │
+│    account-wide, 45-120m │ ◄───────── │ • /global-memory        │         │ • llama-3.3-70b … (last)     │
+│                          │            │ • /social-brain (diary) │         └──────────────────────────────┘
+│ ISOLATION ENGINE         │            │ • glitch guard +        │
+│  handle · quote ·        │            │   auto model fallback   │
+│  audience locks          │            └─────────────────────────┘
 └──────────────────────────┘
-        │ seen / typing: Instagram's own GraphQL + DGW gateway
-        └─ transcripts/<user>.json — schema 8.0-brain-decides
+   │ Instagram surface: GraphQL DM + notes tray + comments,
+   │ private REST: story tray · user feed · media comments
+   └─ transcripts/<user>.json (9.0-social-brain) + _social_brain.json (diary)
 ```
 
-### The decision contract (what the brain answers)
+---
+
+## A · The DM turn decision (v8, unchanged contract)
 
 ```jsonc
 {
@@ -85,26 +94,137 @@ continuity, minimal thinking, and the glitch guard.
 }
 ```
 
-**The evidence gate** — `reminder` / `cross_chat_mission` are only accepted when
-`evidenceScore(evidence, their_messages) >= 0.4` (or `>= 0.34` when they named the
-target handle outright). A decision the chat does not support is dropped. That is
-what makes the system **message-driven** instead of hallucination-driven.
+The **evidence gate**: a reminder or secret prank is accepted only when it
+quotes a line the person actually sent (`evidenceScore ≥ 0.4`). Decisions the
+chat does not support are thrown away — the messages are what make Aduu act.
 
-### The writer prompt the brain produces
+---
+
+## B · The social brain (v9)
+
+### The loop it designed for itself
 
 ```
-[THE BRAIN DECIDED THIS TURN — WRITE EXACTLY THIS PLAN]
-WHAT THEY MEANT: they went quiet and are poking Aduu for a reaction
-WHAT YOU ALREADY SAID (never repeat or remix it): Aduu teased them about the chocolates
-YOUR ONE JOB THIS TURN: tease back and leave a hook
-STAY ON THIS TOPIC: their last message
-MOOD: PLAYFUL_CHILL — witty, flirty-teasy, effortless…
-SEND EXACTLY 2 BUBBLE(S). Each one is a DIFFERENT forward step —
-never a rephrase of the one before:
-  1. tease them about going quiet
-  2. ask what they are really up to
-Join the bubbles with " || ". Never repeat a line you already sent in this chat.
+1 · OBSERVE   notes tray · live story tray · watched people's latest posts
+              unanswered comments on Aduu's own posts · privacy-safe DM pulse
+2 · PLAN      the brain returns ONE strict JSON plan (usually mode = "observe")
+3 · GATE      cooldowns · daily caps · quiet hours · one action per cycle
+4 · ISOLATE   every line is audience-checked before it can leave
+5 · ACT       note · story reply · comment · comment reply · DM
+6 · REFLECT   the whole cycle is written to _social_brain.json
 ```
+
+### The plan JSON
+
+```jsonc
+{
+  "mode": "observe" | "act",
+  "intent": "one line on what Aduu is feeling about the account right now",
+  "skip_reason": "why you are doing nothing (required when mode is observe)",
+  "actions": [
+    { "kind": "note",         "op": "keep" | "replace" | "delete",
+      "text": "chai, code aur thodi si shanti ☕", "reason": "old note is 5h old" },
+    { "kind": "story_reply",  "target": "deeps20_", "story_pk": "341…",
+      "text": "oye ye kahan ghoomne nikla hai 😏", "reason": "fresh story, 10 min old" },
+    { "kind": "comment",      "target": "adarshu.io", "media_pk": "341…",
+      "text": "ye shot kahan ka hai bhai 🔥", "reason": "new post, 2h old" },
+    { "kind": "comment_reply","target": "somefan", "media_pk": "341…", "comment_pk": "178…",
+      "text": "haan bhai, pura tutorial aa raha hai", "reason": "they asked how" },
+    { "kind": "dm",           "target": "deeps20_",
+      "text": "oye sun, ek baat yaad aayi teri 👀", "reason": "3 days quiet" }
+  ],
+  "next_check_in_minutes": 75
+}
+```
+
+### The rarity gate (why it is "not always, so less times")
+
+| Rule | Value |
+|---|---|
+| Observe/plan cadence | 45–120 min (the brain also suggests `next_check_in_minutes`) |
+| Actions allowed per cycle | **1** |
+| Note change cooldown | 4 h |
+| Comment cooldown (per person) | 8 h |
+| Comment-reply cooldown | 2 h |
+| Story reply cooldown (per person) | **14 h** |
+| Out-of-the-blue DM cooldown | 6 h |
+| Minimum gap between public actions | 3 h |
+| Daily caps | notes 4 · comments 3 · replies 6 · story replies 2 · DMs 2 |
+| Quiet hours | 02:00–09:00 IST — never acts |
+
+Nothing runs until you call `IGAgent.Social.enable()`, and even then
+`DRY_RUN` is on until you flip it off.
+
+### What the brain sees each cycle
+
+```
+TIME: evening (20:00 IST) — evening chill / chai-gedi / high-energy teasing
+MODE: DRY RUN (nothing is really sent)
+
+ADUU'S NOTE: chai aur code ☕ (posted 320 min ago)
+OTHER PEOPLE'S NOTES:
+  @deeps20_: assignment kar raha hoon
+
+LIVE STORY TRAY (you can react to these):
+  @deeps20_ · 12m old · pk=341…
+
+WATCHED PEOPLE:
+  @deeps20_: latest post 5h old · "shaam ki chai aur coding ☕" · 12 comments · pk=341…
+      dm: last from them 47m ago · mood PLAYFUL_CHILL
+      your last action: story_reply 62h ago
+
+WHAT ADUU DID IN THE LAST 24H: note=1
+DAILY LIMITS LEFT: note 3/4 · comment 3/3 · comment_reply 6/6 · story_reply 2/2 · dm 2/2
+```
+
+The DM pulse carries **mood and timing only** — never a verbatim line from
+someone else's chat, so the account-wide view can never become a leak source.
+
+---
+
+## Chat isolation — chats never collide
+
+```
+1 · HANDLE LOCK    no other contact's @handle (or bare handle) in an outgoing line
+2 · CONTENT LOCK   no verbatim sentence another contact actually wrote
+3 · AUDIENCE LOCK  every action names the one person who will see it, and the
+                   text is re-checked against that audience
+4 · LOCK           one decision at a time per person (withLock), so two brain
+                   runs can never interleave on the same contact
+```
+
+```js
+isolationGuard('haan wahi, @deeps20_ ne bola tha na 😏', 'adarshu.io')
+// → "haan wahi, ek dost ne bola tha na 😏"        (handle scrubbed, logged)
+
+isolationGuard('kal raat party mein kya hua tha?', 'adarshu.io')
+// → scrubbed when that exact line belongs to @deeps20_'s chat
+
+collisionCheck({kind:'comment', target:'adarshu.io', text:'yeh @deeps20_ wali baat…'})
+// → { ok:false, problems:['mentions @deeps20_'] } → the action is DROPPED
+```
+
+The DM path runs `privacyGuard()` **and** `isolationGuard()` on every draft
+before it is sent.
+
+---
+
+## The NOTE (new power)
+
+Instagram's note is the 60-character bubble on top of the inbox. Aduu can put a
+nice one up, take it down, and — by default — let the brain manage it.
+
+```js
+IGAgent.note('chai, code aur thodi si shanti ☕')  // put a note up right now
+IGAgent.notes()                                    // read the whole tray (mine + theirs)
+IGAgent.deleteNote()                               // take it down
+IGAgent.noteNow()                                  // ask the brain for one note decision
+IGAgent.Social.notes('agentic' | 'off')            // brain-managed or manual only
+```
+
+Brain-managed notes are capped at 4 changes/day with a 4h cooldown, and the
+brain's own rule is *"the note is your mood status, not an advertisement —
+change it only when it is stale or your mood genuinely shifted."*
 
 ---
 
@@ -112,14 +232,9 @@ Join the bubbles with " || ". Never repeat a line you already sent in this chat.
 
 | Role | Model | Job |
 |---|---|---|
-| **Decision brain** (boss) | `@cf/google/gemma-4-26b-a4b-it` | Decides the whole turn from the chat messages; afterwards refreshes the privacy-safe memory and the next-turn steer. |
-| **Frontline writer** | `@cf/zai-org/glm-4.7-flash` | Writes the Hinglish bubbles the brain planned, with `THINKING BUDGET: MINIMAL` so it thinks one short sentence. |
+| **Decision brain** (boss) | `@cf/google/gemma-4-26b-a4b-it` | Decides every DM turn and every social cycle; refreshes memory and next-turn steer afterwards. |
+| **Frontline writer** | `@cf/zai-org/glm-4.7-flash` | Writes the Hinglish lines the brain planned, with `THINKING BUDGET: MINIMAL`. |
 | Fast fallback | `@cf/qwen/qwen3-30b-a3b-fp8` (then llama-3.3-70b …) | Automatic, on glitch / empty / HTTP 500. |
-
-GLM-4.7-Flash streams `delta.reasoning`/`reasoning_content` first, then
-`delta.content`, and ends with `{"response":"", "usage":{…}}` + `data: [DONE]`.
-Both `reasoning` and `reasoning_content` carry the **same token** on every frame
-— the parser reads only one, so thinking is never doubled.
 
 ---
 
@@ -134,61 +249,41 @@ Both `reasoning` and `reasoning_content` carry the **same token** on every frame
 | `ANGRY_SAVAGE_ROAST` | "fuck off / chup / bkl" | cold savage Delhi roast, no please, never begs |
 | `FURIOUS_ABUSE_CLAPBACK` | hard gali | **drops the sharif act**, claps back in street style, **then explains his real feelings** in a second bubble |
 
-After two turns of venting, Aduu cools back down to `PLAYFUL_CHILL` — a real
-person does not stay furious forever. In v8 the mood is chosen by the brain with
-a quoted `mood_reason`, and you can still force one with `IGAgent.mood(...)`.
-
----
+After two turns of venting, Aduu cools back down to `PLAYFUL_CHILL`.
 
 ## Task-driven time triggers (NOT blind 30-minute spam)
 
 ```
 them: "chal 10 min mein baat karte hai, yaad dila dena"
   → brain DECISION: reminder {topic, due_in_minutes: 10, evidence: "yaad dila dena"}
-  → applyBrainDecision() → transcript.reminders[] + agent_state.next_proactive_after
   → pollTick() sees reminderDue → processThread() → brain decides START_CONVO
   → Aduu: "oii abhi yaad aaya, wahi baat adhuri thi…"
   → consumeReminder()  (never fires twice)
 ```
 
-Supported patterns: `N min mein`, `N ghante mein`, `kal subah/shaam/raat`,
-`baad mein baat karte hai` (→ default 30m), `yaad rakhna …`, `remind me to …`.
 With no reminder and no mission queued, Aduu **stays quiet on purpose** —
 `UNCONDITIONAL_IDLE_STARTER` is `false`.
 
-## Cross-chat pranks & relays (with a hard privacy wall)
-
-```
-@deeps20_: "adarshu.io ko bol do ki main chocolate nahi dunga"
-  → brain DECISION: cross_chat_mission {target: adarshu.io, type: relay, evidence: "…ko bol do"}
-  → Aduu messages @adarshu.io acting on his own
-  → PRIVACY WALL: never names @deeps20_, never quotes her chat, never leaks another handle
-  → consumeMission() (one shot)
-```
-
-`privacyGuard()` scrubs every outbound draft, and the brain's `privacy_ok: false`
-verdict switches the gossip/leak paths off for that turn.
-
 ---
 
-## Repo layout (flat — this folder *is* the v8 project)
+## Repo layout (flat — this folder *is* the v9 project)
 
 | Path | What it is |
 |---|---|
 | `llmchat_provider.py` | Async llmchat.in client — GLM-4.7-Flash / Gemma-4 / Qwen3 SSE parsing, minimal-think injection, glitch guard, auto fallback |
-| `server.py` | v8 bridge — HTTP (`/health`, `/v1/models`, `/v1/chat/completions`, `/inference/stream`, **`/v1/decide`**, `/transcripts`, `/global-memory`) **and** WebSocket (`/ws` with `reply` / `brain` / **`decide`**) |
-| `ig-agent-chat.js` | The in-page agent — brain-first decision engine, mood engine, reminder scheduler, mission runner, privacy wall, GLM writer |
+| `server.py` | v9 bridge — HTTP (`/health`, `/v1/models`, `/v1/chat/completions`, `/inference/stream`, `/v1/decide`, **`/social-brain`**, `/transcripts`, `/global-memory`) **and** WebSocket (`/ws` with `reply` / `brain` / `decide` / **`save_social`** / **`get_social`**) |
+| `ig-agent-chat.js` | The in-page agent — one Gemma-4 brain (DM turns + social loop), GLM writer, isolation engine, mood engine, reminder scheduler, mission runner, notes |
 | `v5/`, `v6/` | Full archives of the previous generations |
 | `clone-and-run.bat` | Windows one-click: clone → install → copy to clipboard → start |
 | `clone-and-run.sh` | Linux / macOS / Git Bash one-command launcher |
 | `run.py` | Cross-platform Python starter (keeps the bridge running non-stop) |
-| `tests/mock_llmchat.py` | Byte-faithful offline mock of GLM-4.7-Flash / Gemma-4 / Qwen3 SSE + **decision brain** + glitch & empty modes |
-| `tests/test_pipeline.py` | Provider + bridge + WebSocket + `/v1/decide` end-to-end (offline) |
-| `tests/test_bot_flow.js` | Full page pipeline: brain decisions, moods, reminders, missions, bubbles, proactive triggers, fallback |
-| `tests/test_humanize.js` | Humanizer, persona, config, state migration, v7/v8 engine units |
-| `tests/live_check.py` | Live llmchat.in check (needs internet) |
+| `tests/mock_llmchat.py` | Offline mock of GLM-4.7-Flash / Gemma-4 / Qwen3 SSE + the decision brain |
+| `tests/test_pipeline.py` | Provider + bridge + WebSocket + `/v1/decide` + social-brain diary (offline) |
+| `tests/test_bot_flow.js` | Full page pipeline: brain decisions, isolation, rarity gates, notes, stories, moods, reminders, missions |
+| `tests/test_humanize.js` | Humanizer, persona, config, state migration, engine units |
+| `tests/live_check.py` | Live llmchat.in check (`--decide` for the brain) |
 | `vendor/ig-human/` | MIT lexicon from jakeschincariol/instagram-agent-skill |
-| `transcripts/` | Per-contact `8.0-brain-decides` JSON: messages + process log + **last decision** + brain profile + mood + reminders + missions |
+| `transcripts/` | Per-contact `9.0-social-brain` JSON + `_global_memory.json` + **`_social_brain.json`** |
 | `requirements.txt` | `curl_cffi` — the only runtime dependency |
 
 ---
@@ -216,51 +311,59 @@ the one-liner the launcher prints:
 
 It auto-starts **LIVE** with the default targets `adarshu.io` and `deeps20_`
 (`DRY_RUN: false`, `AUTO_START: true`, no timeouts — it runs non-stop).
+The social brain stays **off** until you enable it.
 
 ---
 
 ## Console API
 
 ```js
-/* ── v8 · THE BRAIN ── */
+/* ── v9 · SOCIAL BRAIN ── */
+IGAgent.Social.enable()                  // turn it on (dry-run first!)
+IGAgent.Social.dryRun(false)             // when you trust it
+IGAgent.Social.watch('deeps20_', 'adarshu.io')   // who it may engage with
+IGAgent.Social.commentTargets('deeps20_')        // whose posts may get a comment
+IGAgent.Social.storyTargets('deeps20_')          // whose stories may get a reaction
+IGAgent.Social.commentReplies(true)              // answer comments on my posts
+IGAgent.Social.notes('agentic')                  // brain writes the note ('off' = manual)
+IGAgent.Social.plan()                    // what would the brain do right now? (no side effects)
+IGAgent.Social.now()                     // run one full cycle now
+IGAgent.Social.status() · .log()         // caps, last actions, cycle diary
+IGAgent.Social.stories() · .feed('u') · .comments(pk) · .tray()
+IGAgent.Social.comment(pkOrUrl, 'text') · .replyToComment(mediaPk, commentPk, 'text')
+IGAgent.Social.storyReact('deeps20_', 'oye ye kahan 😏')
+IGAgent.Social.disable()
+
+/* ── NOTES ── */
+IGAgent.note('chai, code aur thodi si shanti ☕')   // put a nice note up
+IGAgent.notes() · IGAgent.deleteNote() · IGAgent.noteNow()
+
+/* ── v8 · BRAIN ── */
 IGAgent.why('deeps20_')          // the brain's last JSON decision + its evidence line
-IGAgent.decide('deeps20_')       // ask the brain to decide that chat right now (sends nothing)
+IGAgent.decide('deeps20_')       // ask the brain to decide that chat right now
 IGAgent.brainMode(false)         // fall back to the old local rules
 IGAgent.brainSilence(false)      // never let the brain leave a burst unanswered
 
 /* targets */
-IGAgent.targets('u1, u2')                    // replace the group
-IGAgent.addTargets('u3, u4, u5')             // add a group at once
-IGAgent.allTargets()                         // reply to EVERYONE in 1:1 DMs
+IGAgent.targets('u1, u2') · IGAgent.addTargets('u3, u4') · IGAgent.allTargets()
 IGAgent.status() · IGAgent.test() · IGAgent.stop()
 
-/* MOODS — change Aduu's mood any time */
-IGAgent.mood('deeps20_')                     // read the current mood
-IGAgent.mood('deeps20_', 'ANGRY_SAVAGE_ROAST')
-IGAgent.mood('FURIOUS_ABUSE_CLAPBACK')       // force it on every target
-IGAgent.moods()                              // list all moods
+/* MOODS */
+IGAgent.mood('deeps20_') · IGAgent.mood('deeps20_', 'ANGRY_SAVAGE_ROAST') · IGAgent.moods()
 
-/* REMINDERS — real task-driven time triggers */
-IGAgent.remind('deeps20_', 'assignment submit karna hai', 15)
-IGAgent.reminders('deeps20_') · IGAgent.reminders()
-IGAgent.idleStarter(false)                   // default: never blind-spam a dead chat
+/* REMINDERS (task-driven, never blind spam) */
+IGAgent.remind('deeps20_', 'assignment submit karna hai', 15) · IGAgent.reminders()
+IGAgent.idleStarter(false)
 
 /* SECRET CROSS-CHAT PRANKS / RELAYS */
 IGAgent.prank('deeps20_', 'adarshu.io', 'tease him about the chocolate')
-IGAgent.relay('deeps20_', 'adarshu.io', 'bol do main kal aa raha hoon')
-IGAgent.missions() · IGAgent.runMission('adarshu.io')
-IGAgent.privacyWall(true)                    // default ON
+IGAgent.relay(...) · IGAgent.missions() · IGAgent.runMission('adarshu.io')
+IGAgent.privacyWall(true)
 
 /* brain, process log, global memory */
-IGAgent.brain('deeps20_')                    // Gemma-4 profile + relationship state
-IGAgent.processLog('deeps20_')               // complete turn-by-turn agentic log
+IGAgent.brain('deeps20_') · IGAgent.processLog('deeps20_')
 IGAgent.globalMemory() · IGAgent.peekChat('deeps20_')
 IGAgent.linkFriends('adarshu.io', 'deeps20_') · IGAgent.addGossip('…')
-
-/* older controls still here */
-IGAgent.proactive(true) · IGAgent.proactiveNow('deeps20_')
-IGAgent.brainModel('@cf/google/gemma-4-26b-a4b-it')
-IGAgent.dryRun(false) · IGAgent.seen(true) · IGAgent.typing(true)
 ```
 
 ---
@@ -269,55 +372,60 @@ IGAgent.dryRun(false) · IGAgent.seen(true) · IGAgent.typing(true)
 
 | Endpoint | What it does |
 |---|---|
-| `GET /health` | models, endpoints, `brain_decides`, `decide_endpoint`, fallback chain |
+| `GET /health` | models, endpoints, `brain_decides`, `decide_endpoint`, `social_brain` |
 | `GET /v1/models` | the 8-model registry with thinking/context flags |
 | `POST /v1/chat/completions` | OpenAI-compatible completion (thinking-budget floor enforced) |
 | `POST /inference/stream` | Raw SSE passthrough |
-| `POST /v1/decide` | **Ask the brain to decide a turn.** Body `{messages, context?}` → `{decision, decision_valid, raw, model, thinking_trace}` |
+| `POST /v1/decide` | **Ask the brain to decide a DM turn** → `{decision, decision_valid, raw, model}` |
+| `GET,POST /social-brain` | **The social brain's diary** — cycles, action log, note log, config |
 | `GET /transcripts` · `GET,POST /transcripts/<user>` | per-contact JSON round-trip |
 | `GET,POST /global-memory` | social graph, contacts, cross-chat gossip |
-| `WS /ws` | `health` · `bot` · `reply` (GLM) · `brain` (Gemma-4 memory pass) · **`decide`** (Gemma-4 decision) · `save` · `save_global` · `get_global` |
+| `WS /ws` | `health` · `bot` · `reply` (GLM) · `brain` (memory pass) · `decide` (brain) · **`save_social`** · **`get_social`** · `save` · `save_global` · `get_global` |
 
 ---
 
-## Saved format — `transcripts/<user>.json`
+## Saved format
+
+### `transcripts/<user>.json` — schema `9.0-social-brain`
 
 ```jsonc
 {
-  "schema_version": "8.0-brain-decides",
+  "schema_version": "9.0-social-brain",
   "models": { "answering_model": "@cf/zai-org/glm-4.7-flash",
               "brain_model": "@cf/google/gemma-4-26b-a4b-it" },
   "agent_state": { "relationship_stage": "flirty-banter", "proactive_streak": 0, … },
   "mood_state":  { "current_mood": "FURIOUS_ABUSE_CLAPBACK", "mood_intensity": 3,
                    "feeling_note": "genuinely pissed off",
                    "updated_by": "gemma-4-brain-decide" },
-  "reminders":   [ { "topic": "baat karte hai", "due_in_minutes": 10, "due_at": …,
-                     "status": "scheduled", "evidence": "yaad dila dena", "evidence_score": 1 } ],
+  "reminders":   [ { "topic": "baat karte hai", "due_in_minutes": 10,
+                     "evidence": "yaad dila dena", "evidence_score": 1 } ],
   "missions":    [ { "target_user": "adarshu.io", "type": "prank", "requested_by": "deeps20_" } ],
-  "brain_profile": { "personality": …, "recommended_mood": …, "proactive_hooks": […], "summary": … },
-  "last_decision": { "action": "REPLY", "mood": "PLAYFUL_CHILL", "bubble_count": 2, … },
-  "process_log": [ {
-      "turn_id": "turn_…", "trigger": "incoming_burst | reminder_due_trigger | cross_chat_mission_trigger",
-      "coalesced_input": "…",
-      "emotion_tool":  { "their_mood": […], "emotion_mode": "…", "coaching": "…" },
-      "mood_tool":     { "mood": "FURIOUS_ABUSE_CLAPBACK", "detected_from_burst": "…" },
-      "reminder_tool": [ { "topic": …, "due_in_minutes": 10, "evidence": "…", "evidence_score": 1 } ],
-      "mission_tool":  [ { "target_user": …, "type": "prank", "evidence": "…" } ],
-      "gossip_tool":   [ { "friend": "deeps20_", "recent_messages": […] } ],
-      "agent_decision": { "action": "BRAIN_REPLY", "mood": "…", "decided_by": "gemma-4-brain",
-                          "directive": "…" },
-      "brain_decision": { "action": "REPLY", "understand": "…", "my_last": "…",
-                          "next_move": "…", "mood": "…", "mood_reason": "their abuse",
-                          "feeling_note": "…", "bubble_count": 2, "bubble_plan": ["…", "…"],
-                          "topic_lock": "…", "use_gossip": false, "privacy_ok": true,
-                          "steer_next": "…", "brain_model": "google/gemma-4-26b-a4b-it" },
-      "answering_trace": { "model": "zai-org/glm-4.7-flash", "thinking_trace": "…",
-                           "raw_draft": "…", "final_bubbles": ["…", "…"], "human_score": 88 },
-      "brain_update": { "recommended_mood": "…", "reminder_scheduled": true, "cross_chat_mission": … }
-  } ],
-  "messages": [ { "id": …, "ts": …, "mine": true, "text": "…",
-                  "process": { "turn_id": …, "trigger": …, "mood": "…", "action": "BRAIN_REPLY",
-                               "bubble_index": 1, "bubble_total": 2, "replied_to": "…" } } ]
+  "brain_profile": { … }, "last_decision": { … },
+  "process_log": [ { "turn_id": …, "trigger": …, "agent_decision": { "decided_by": "gemma-4-brain" },
+                     "brain_decision": { … }, "answering_trace": { … } } ],
+  "messages": [ { "text": "…", "process": { "action": "BRAIN_REPLY", … } } ]
+}
+```
+
+### `transcripts/_social_brain.json` — schema `9.0-social-brain-log`
+
+```jsonc
+{
+  "schema_version": "9.0-social-brain-log",
+  "updated_at": "2026-10-21T…",
+  "config": { "enabled": true, "dry_run": false, "notes_mode": "agentic",
+              "watch": ["deeps20_"], "comment_targets": [], "story_targets": ["deeps20_"] },
+  "action_log": [ { "kind": "story_reply", "target": "deeps20_", "text": "oye ye kahan 😏",
+                    "reason": "fresh story, 10 min old", "status": "sent" } ],
+  "note_log":   [ { "text": "chai, code aur thodi si shanti ☕", "reason": "…", "op": "replace" } ],
+  "cycles": [ {
+      "at": …, "iso_time": "…", "status": "completed", "decided_by": "gemma-4-brain",
+      "observation_chars": 1420,
+      "plan": { "mode": "act", "intent": "…", "actions": [ … ] },
+      "outcome": [ { "kind": "note", "status": "dry_run", "note": "would set \"…\"" },
+                   { "kind": "story_reply", "status": "deferred", "reason": "cycle_action_limit" } ],
+      "next_check_in_minutes": 80
+  } ]
 }
 ```
 
@@ -326,13 +434,13 @@ IGAgent.dryRun(false) · IGAgent.seen(true) · IGAgent.typing(true)
 ## Tests
 
 ```bash
-node tests/test_humanize.js     # 30 passed
-node tests/test_bot_flow.js     # 28 passed
+node tests/test_humanize.js     # 32 passed
+node tests/test_bot_flow.js     # 51 passed
 python tests/test_pipeline.py   # 5 passed   (needs curl_cffi)
 ```
 
 All suites run fully offline against `tests/mock_llmchat.py`, which also
-impersonates the v8 decision brain.
+impersonates the decision brain.
 
 ---
 
@@ -346,5 +454,7 @@ impersonates the v8 decision brain.
 * **Last-reply gate** — replies only when the newest message is theirs.
 * **Evidence gate** — the brain's reminders and pranks must be traceable to a
   line the person actually sent.
+* **Isolation gate** — no handle, no quote, no private line ever crosses chats.
+* **Rarity gate** — the social brain is capped, cooled down and quiet at night.
 * Zero AI mention, ever: Aduu never breaks character.
 * Errors are swallowed and retried, never surfaced — it runs non-stop.

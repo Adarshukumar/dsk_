@@ -67,6 +67,56 @@ TRANSCRIPTS_DIR = Path(
 )
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 GLOBAL_MEMORY_FILE = TRANSCRIPTS_DIR / "_global_memory.json"
+SOCIAL_BRAIN_FILE = TRANSCRIPTS_DIR / "_social_brain.json"
+
+
+def _load_social_brain() -> dict[str, Any]:
+    if not SOCIAL_BRAIN_FILE.exists():
+        return {
+            "schema_version": "9.0-social-brain-log",
+            "updated_at": None,
+            "config": {},
+            "action_log": [],
+            "note_log": [],
+            "cycles": [],
+        }
+    try:
+        data = json.loads(SOCIAL_BRAIN_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Invalid social brain root")
+        data.setdefault("schema_version", "9.0-social-brain-log")
+        data.setdefault("config", {})
+        data.setdefault("action_log", [])
+        data.setdefault("note_log", [])
+        data.setdefault("cycles", [])
+        return data
+    except Exception as exc:
+        log.warning("Failed to read social brain log: %s", exc)
+        return {
+            "schema_version": "9.0-social-brain-log",
+            "updated_at": None,
+            "config": {},
+            "action_log": [],
+            "note_log": [],
+            "cycles": [],
+        }
+
+
+def _save_social_brain(update: dict[str, Any]) -> dict[str, Any]:
+    existing = _load_social_brain()
+    payload = dict(existing)
+    payload.update(update or {})
+    payload["schema_version"] = "9.0-social-brain-log"
+    payload["updated_at"] = int(time.time() * 1000)
+    payload["updated_iso"] = _iso_utc()
+    # keep the log files bounded
+    payload["action_log"] = list(payload.get("action_log") or [])[-200:]
+    payload["note_log"] = list(payload.get("note_log") or [])[-40:]
+    payload["cycles"] = list(payload.get("cycles") or [])[-40:]
+    SOCIAL_BRAIN_FILE.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return payload
 
 # Token floor for thinking models (GLM-4.7-Flash, Gemma-4, Qwen3) so internal
 # reasoning_content never starves the visible reply content.
@@ -517,7 +567,7 @@ class BridgeServer:
             self._handle_client, self.host, self.port
         )
         log.info(
-            "IG Bridge Server v8 (brain-first) listening on http://%s:%d (brain=%s decides, %s writes -> %s)",
+            "IG Bridge Server v9 (social brain) listening on http://%s:%d (brain=%s decides, %s writes -> %s)",
             self.host,
             self.port,
             DEFAULT_BRAIN_MODEL,
@@ -617,8 +667,11 @@ class BridgeServer:
                     200,
                     {
                         "status": "ok",
-                        "version": "8.0",
-                        "architecture": "brain-first (gemma-4 decides, glm-4.7-flash writes)",
+                        "version": "9.0",
+                        "architecture": (
+                            "one-brain (gemma-4 decides DM turns + the whole "
+                            "account's social life, glm-4.7-flash writes)"
+                        ),
                         "provider": "llmchat.in",
                         "default_model": DEFAULT_MODEL,
                         "default_endpoint": resolve_wire_model(DEFAULT_MODEL),
@@ -628,6 +681,8 @@ class BridgeServer:
                         "brain_wire_model": resolve_wire_model(DEFAULT_BRAIN_MODEL),
                         "brain_decides": True,
                         "decide_endpoint": "/v1/decide",
+                        "social_brain": True,
+                        "social_brain_endpoint": "/social-brain",
                         "fallback_chain": FALLBACK_CHAIN,
                         "chain": FALLBACK_CHAIN,
                         "models": list(MODEL_REGISTRY.keys()),
@@ -660,6 +715,16 @@ class BridgeServer:
                 )
                 return
 
+            # ── v9: the social brain's own diary (cycles, actions, notes) ──
+            if path == "/social-brain":
+                if method == "GET":
+                    await self._send_json(writer, 200, _load_social_brain())
+                    return
+                if method in ("POST", "PUT"):
+                    payload = json.loads(body_bytes.decode("utf-8") or "{}")
+                    await self._send_json(writer, 200, _save_social_brain(payload))
+                    return
+
             if path == "/global-memory":
                 if method == "GET":
                     await self._send_json(writer, 200, _load_global_memory())
@@ -676,7 +741,7 @@ class BridgeServer:
                     files = sorted(TRANSCRIPTS_DIR.glob("*.json"))
                     items = []
                     for f in files:
-                        if f.name == "_global_memory.json":
+                        if f.name in ("_global_memory.json", "_social_brain.json"):
                             continue
                         try:
                             d = json.loads(f.read_text(encoding="utf-8"))
@@ -838,6 +903,7 @@ class BridgeServer:
                     "brain_model": DEFAULT_BRAIN_MODEL,
                     "brain_endpoint": resolve_wire_model(DEFAULT_BRAIN_MODEL),
                     "brain_decides": True,
+                    "social_brain": True,
                     "chain": FALLBACK_CHAIN,
                     "models": list(MODEL_REGISTRY.keys()),
                     "uptime_s": round(time.time() - START),
@@ -893,6 +959,24 @@ class BridgeServer:
                 doc = _load_global_memory()
                 await conn.send_json({
                     "id": rid, "ok": True, "global_memory": doc, "global": doc})
+                return
+
+            # ── v9: mirror the social brain's diary to disk ──
+            if rtype == "save_social":
+                sb = req.get("social")
+                if not isinstance(sb, dict):
+                    raise ValueError("'social' dict is required")
+                saved = _save_social_brain(sb)
+                await conn.send_json({
+                    "id": rid, "ok": True,
+                    "cycles": len(saved.get("cycles", [])),
+                    "actions": len(saved.get("action_log", [])),
+                })
+                return
+
+            if rtype == "get_social":
+                await conn.send_json({
+                    "id": rid, "ok": True, "social_brain": _load_social_brain()})
                 return
 
             await conn.send_json({"id": rid, "ok": False, "error": f"unknown type {rtype}"})

@@ -32,9 +32,10 @@ const api = global.window.IGAgent;
 assert(api, 'IGAgent failed to load');
 
 const h = api._debug.humanizeReply;
+let PASS = 0, FAILN = 0;
 const check = (name, fn) => {
-  fn();
-  console.log(`  ✅ ${name}`);
+  try { fn(); PASS++; console.log(`  ✅ ${name}`); }
+  catch (e) { FAILN++; console.log(`  ❌ ${name} — ${e.message}`); }
 };
 
 console.log('\nIG-Agent humanizer / config tests\n');
@@ -49,7 +50,32 @@ check('config · Gemma-4 brain decides + GLM-4.7-Flash writes', () => {
   assert.strictEqual(api.config.PRIVACY_WALL, true);
   assert.strictEqual(api.config.HUMANIZE, true);
   assert.strictEqual(api.config.MAX_REPLY_CHARS, 300);
-  assert.strictEqual(api.config.PERSONA_VERSION, 8);
+  assert.strictEqual(api.config.PERSONA_VERSION, 9);
+});
+
+check('config · v9 SOCIAL BRAIN is off, dry-run, rare and note-aware', () => {
+  const S = api.config.SOCIAL;
+  assert(S, 'CFG.SOCIAL missing');
+  assert.strictEqual(S.ENABLED, false, 'nothing social runs until you enable it');
+  assert.strictEqual(S.DRY_RUN, true, 'social actions must be dry-run first');
+  assert.strictEqual(S.BRAIN_AUTOPILOT, true, 'the brain must decide by itself');
+  assert.strictEqual(S.NOTES_MODE, 'agentic');
+  assert.strictEqual(S.MAX_NOTE_CHARS, 60, 'Instagram note limit');
+  assert.strictEqual(S.MAX_ACTIONS_PER_CYCLE, 1, 'one thing at a time');
+  assert(S.CYCLE_MIN_MS >= 30 * 60_000, 'cycles must be slow (not always)');
+  assert(S.DAILY_CAP.comment <= 3 && S.DAILY_CAP.story_reply <= 2, 'public actions capped hard');
+  assert(S.COOLDOWN_MS.story_reply >= 12 * 3600_000, 'story replies must be rare');
+  assert(Array.isArray(S.QUIET_HOURS));
+  return 'off · dry · 1 action/cycle · 45-120min cycles · capped · 60-char notes';
+});
+
+check('config · v9 social GraphQL ops are wired', () => {
+  assert.strictEqual(api.config.GQL.tray, '29231580869776032');
+  assert.strictEqual(api.config.GQL.noteCreate, '28592645767037889');
+  assert.strictEqual(api.config.GQL.noteDelete, '28419182984337833');
+  assert.strictEqual(api.config.GQL.comment, '27261905640092552');
+  assert.strictEqual(api.config.GQL.reelShare, '26212720875066239');
+  return 'notes tray · create · delete · comment · story→DM';
 });
 
 check('state · stale persona + llama model ignored; default targets active', () => {
@@ -381,4 +407,5 @@ check('prompt() · custom persona persists', () => {
   assert.strictEqual(saved.systemPrompt, 'my custom persona');
 });
 
-console.log('\n30 passed, 0 failed\n');
+console.log(`\n${PASS} passed, ${FAILN} failed\n`);
+process.exit(FAILN ? 1 : 0);

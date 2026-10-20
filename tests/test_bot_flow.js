@@ -48,9 +48,60 @@ global.window = {};
 global.window.require = (name) =>
   (name === 'IGDMAPISendTypingIndicator' ? async () => true : null);
 
+/* ── v9: private REST surface used by the social brain ─────────────────── */
+const REST = {
+  '/api/v1/feed/reels_tray/': {
+    tray: [{
+      user: { username: 'deeps20_' },
+      latest_reel_media: Math.floor(Date.now() / 1000) - 600,
+      media: [{ pk: 'STORY1', id: 'STORY1_ID', taken_at: Math.floor(Date.now() / 1000) - 600, media_type: 1 }],
+    }, {
+      user: { username: 'adarshu.io' },
+      latest_reel_media: Math.floor(Date.now() / 1000) - 7200,
+      media: [{ pk: 'STORY2', id: 'STORY2_ID', taken_at: Math.floor(Date.now() / 1000) - 7200, media_type: 2 }],
+    }],
+  },
+  '/api/v1/users/web_profile_info/?username=deeps20_': {
+    data: { user: { id: '777' } },
+  },
+  '/api/v1/feed/user/777/?count=3': {
+    items: [{
+      pk: 'POST1', id: 'POST1', media_type: 1,
+      caption: { text: 'shaam ki chai aur coding ☕' },
+      taken_at: Math.floor(Date.now() / 1000) - 3600,
+      comment_count: 12, like_count: 90,
+    }],
+  },
+  '/api/v1/media/POST1/comments/?can_support_threading=true&permalink=': {
+    comments: [{
+      pk: 'C1', text: 'bhai ye kab banaya?', created_at: Math.floor(Date.now() / 1000) - 300,
+      user: { username: 'somefan', pk: '555' },
+    }],
+  },
+  '/api/v1/feed/user/999/?count=4': {
+    items: [{ pk: 'MYPOST1', id: 'MYPOST1', media_type: 1, caption: { text: 'agent banaya' }, taken_at: Math.floor(Date.now() / 1000) - 86400 }],
+  },
+  '/api/v1/media/MYPOST1/comments/?can_support_threading=true&permalink=': {
+    comments: [{
+      pk: 'MC1', text: 'ye kaise banaya bhai?', created_at: Math.floor(Date.now() / 1000) - 600,
+      user: { username: 'somefan', pk: '555' },
+    }],
+  },
+};
+const REST_CALLS = [];
+
 global.fetch = async (url, opts = {}) => {
   const body = opts.body;
   const name = body && body.get ? body.get('fb_api_req_friendly_name') : '';
+
+  // plain REST (no GraphQL envelope) — the social brain's private endpoints
+  if (typeof url === 'string' && url.startsWith('/api/v1/')) {
+    REST_CALLS.push(url);
+    const payload = REST[url];
+    if (!payload) return { ok: false, status: 404, json: async () => ({}) };
+    return { ok: true, status: 200, json: async () => payload };
+  }
+
   const vars = body && body.get ? JSON.parse(body.get('variables') || '{}') : {};
   IG.calls.push({ name, vars });
   let data = {};
@@ -95,6 +146,44 @@ global.fetch = async (url, opts = {}) => {
     };
   } else if (/MarkThreadAsRead/.test(name)) {
     IG.seen += 1;
+  } else if (name === 'IGDInboxTrayQuery') {
+    data = {
+      response: {
+        inbox_tray_items: [
+          {
+            inbox_tray_item_id: 'NOTE_MINE', inbox_tray_item_type: 'note',
+            note_dict: {
+              text: 'chai aur code ☕', created_at: Math.floor(Date.now() / 1000) - 5 * 3600,
+              author_id: '999',
+            },
+          },
+          {
+            inbox_tray_item_id: 'NOTE_THEM', inbox_tray_item_type: 'note',
+            note_dict: {
+              text: 'assignment kar raha hoon', created_at: Math.floor(Date.now() / 1000) - 600,
+              author_id: '888',
+            },
+            pog_info: { pog_users: [{ username: 'deeps20_' }] },
+          },
+        ],
+      },
+    };
+  } else if (name === 'usePolarisCreateInboxTrayItemSubmitMutation') {
+    IG.notes = IG.notes || [];
+    const np = (((vars.input || {}).additional_params || {}).note_create_params) || {};
+    IG.notes.push(String(np.text || ''));
+    data = { xdt_create_inbox_tray_item: { inbox_tray_item_id: 'NOTE_NEW' } };
+  } else if (name === 'usePolarisDeleteInboxTrayItemSubmitMutation') {
+    IG.noteDeletes = (IG.noteDeletes || 0) + 1;
+    data = { xdt_delete_inbox_tray_item: { success: true } };
+  } else if (name === 'PolarisPostCommentInputRevampedMutation') {
+    IG.comments = IG.comments || [];
+    IG.comments.push({ media: String(vars.data.media_id), text: String(vars.data.comment_text) });
+    data = { xig_comment_create: { pk: 'NEWCOMMENT' } };
+  } else if (name === 'IGDirectReelShareMutation') {
+    IG.storyReplies = IG.storyReplies || [];
+    IG.storyReplies.push({ story: String(vars.ig_media_igid), text: String(vars.data.text) });
+    data = { xig_direct_clip_share_with_slide_msg_response: { success: true } };
   }
 
   return {
@@ -146,6 +235,34 @@ function buildDecision(req) {
   };
 }
 
+const SOCIAL_SAVES = [];
+
+/* v9: the same brain answering for the SOCIAL layer (stories/comments/notes).
+   It sees the observation text and returns one strict JSON plan. */
+function buildSocialPlan(req) {
+  const ctx = (req.messages || []).map(m => String(m.content || '')).join('\n');
+  const hasStory = /LIVE STORY TRAY/.test(ctx) && !/nobody you watch/.test(ctx);
+  const actions = [];
+  // the brain wants TWO things — the runtime must only allow ONE
+  actions.push({
+    kind: 'note', op: 'replace', text: 'chai, code aur thodi si shanti ☕',
+    reason: 'old note is 5h old, mood is calm',
+  });
+  if (hasStory) {
+    actions.push({
+      kind: 'story_reply', target: 'deeps20_', story_pk: 'STORY1',
+      text: 'oye ye kahan ghoomne nikla hai 😏', reason: 'fresh story, 10 min old',
+    });
+  }
+  if (!actions.length) {
+    return { mode: 'observe', intent: 'nothing deserves a reply right now',
+             skip_reason: 'no fresh story from anyone i care about',
+             actions: [{ kind: 'note', op: 'keep', text: '', reason: 'note still fits' }],
+             next_check_in_minutes: 90 };
+  }
+  return { mode: 'act', intent: 'one quiet move', actions, next_check_in_minutes: 80 };
+}
+
 class FakeWS {
   constructor() {
     this.readyState = 0;
@@ -183,7 +300,9 @@ class FakeWS {
         reasoning_chars: 19,
       });
     } else if (req.type === 'decide') {
-      const d = buildDecision(req);
+      const isSocial = (req.messages || []).some(
+        m => String(m.content || '').includes('SOCIAL BRAIN'));
+      const d = isSocial ? buildSocialPlan(req) : buildDecision(req);
       reply({
         id: req.id, ok: true, role_type: 'decide',
         text: JSON.stringify(d), decision: d, decision_valid: true,
@@ -199,6 +318,11 @@ class FakeWS {
         thinking_trace: 'Short casual reply.',
         reasoning_chars: 19,
       });
+    } else if (req.type === 'save_social') {
+      SOCIAL_SAVES.push(req.social);
+      reply({ id: req.id, ok: true,
+              cycles: (req.social.cycles || []).length,
+              actions: (req.social.action_log || []).length });
     } else if (req.type === 'save_global') {
       reply({ id: req.id, ok: true, people: 2 });
     } else if (req.type === 'save') {
@@ -560,6 +684,230 @@ const check = (name, fn) => {
     assert(w.source === 'brain' || w.source === 'local', w.source);
     assert.strictEqual(w.user, 'deeps20_');
     assert(w.decision, 'decision JSON missing');
+  });
+
+  /* ═════════════════════ v9 · SOCIAL BRAIN ═════════════════════
+     The same Gemma-4 brain runs stories, comments, comment replies,
+     out-of-the-blue DMs and the Instagram NOTE — rarely, and with a hard
+     isolation rule: chats must never collide.
+     ══════════════════════════════════════════════════════════════════════ */
+  api.Social.watch('deeps20_', 'testuser');
+  api.Social.commentTargets('deeps20_');
+  api.Social.storyTargets('deeps20_');
+  api.Social.notes('agentic');
+  api.Social.dryRun(true);            // nothing is really posted in tests
+  // the gate tests must not depend on what time of day CI runs
+  const SAVED_QUIET = api.config.SOCIAL.QUIET_HOURS;
+  api.config.SOCIAL.QUIET_HOURS = [25, 26];   // never quiet during the tests
+
+  check('social · live story tray is readable', () => {
+    assert(api._debug.socialWatchList().includes('deeps20_'));
+    assert.strictEqual(api.config.SOCIAL.ENABLED, false, 'must be OFF until enabled');
+  });
+
+  const stories = await api._debug.storyTray();
+  check('social · story tray lists who posted a story + its media id', () => {
+    assert.strictEqual(stories.length, 2, JSON.stringify(stories));
+    assert.strictEqual(stories[0].username, 'deeps20_');
+    assert.strictEqual(stories[0].pk, 'STORY1');
+  });
+
+  const obs = await api._debug.buildSocialObservation();
+  check('social · observation shows note, stories, watched people and limits', () => {
+    assert(/ADUU'S NOTE/.test(obs), 'own note missing');
+    assert(/LIVE STORY TRAY/.test(obs), 'story tray missing');
+    assert(/WATCHED PEOPLE/.test(obs), 'watched people missing');
+    assert(/DAILY LIMITS LEFT/.test(obs), 'daily limits missing');
+    assert(!/DM: .{40,}/.test(obs), 'verbatim DM content must not leak into the account-wide view');
+  });
+
+  const socDec = await api._debug.brainSocialDecide();
+  check('social · the brain plans the account by itself', () => {
+    assert.strictEqual(socDec.ok, true, socDec.error);
+    assert(socDec.plan, 'no plan');
+    assert(['observe', 'act'].includes(socDec.plan.mode), socDec.plan.mode);
+    assert.strictEqual(socDec.model, 'google/gemma-4-26b-a4b-it', socDec.model);
+  });
+
+  check('social · NOTE text is clamped to Instagram\'s 60-char limit', () => {
+    const p = api._debug.parseSocialPlan(JSON.stringify({
+      mode: 'act', actions: [{ kind: 'note', op: 'replace', text: 'x'.repeat(140) }],
+    }));
+    assert.strictEqual(p.actions[0].text.length, api.config.SOCIAL.MAX_NOTE_CHARS);
+  });
+
+  check('social · observe mode is the default and carries a skip_reason', () => {
+    const p = api._debug.parseSocialPlan(JSON.stringify({
+      mode: 'observe', skip_reason: 'nothing deserves a reply',
+      actions: [{ kind: 'note', op: 'keep' }],
+    }));
+    assert.strictEqual(p.mode, 'observe');
+    assert.strictEqual(p.skip_reason, 'nothing deserves a reply');
+    assert.strictEqual(p.actions.length, 1);   // note "keep" is not an action
+  });
+
+  /* ── ISOLATION: chats must never collide ── */
+  const T_ISO_A = api._debug.ensureTranscript('T_ISO_A', 'isoalpha');
+  T_ISO_A.messages = [
+    { id: 'i1', ts: Date.now(), mine: false, kind: 'text', label: 'text',
+      text: 'kal raat ko woh party mein kya hua tha yaar' },
+  ];
+  const T_ISO_B = api._debug.ensureTranscript('T_ISO_B', 'isobeta');
+
+  check('isolation · another contact\'s @handle is scrubbed from an outgoing line', () => {
+    const out = api._debug.isolationGuard('haan wahi, @isoalpha ne bola tha na 😏', 'isobeta');
+    assert(!/isoalpha/i.test(out), 'handle leaked: ' + out);
+    out.length && assert(out.length > 5, 'line destroyed: ' + out);
+  });
+
+  check('isolation · a verbatim line from ANOTHER chat is never repeated', () => {
+    const out = api._debug.isolationGuard(
+      'kal raat ko woh party mein kya hua tha yaar? sach bata', 'isobeta');
+    assert(!/party mein kya hua/i.test(out), 'foreign quote leaked: ' + out);
+  });
+
+  check('isolation · the same line is untouched inside its OWN chat', () => {
+    const out = api._debug.isolationGuard(
+      'kal raat ko woh party mein kya hua tha yaar? sach bata', 'isoalpha');
+    assert(/party mein kya hua/i.test(out), 'own content must stay: ' + out);
+  });
+
+  check('isolation · a planned action that leaks is blocked, not sent', () => {
+    const bad = api._debug.collisionCheck({
+      kind: 'comment', target: 'isobeta',
+      text: 'yeh @isoalpha wali baat sach thi kya?',
+    });
+    assert.strictEqual(bad.ok, false, 'collision not detected');
+    assert(bad.problems.some(p => /isoalpha/.test(p)), JSON.stringify(bad.problems));
+
+    const good = api._debug.collisionCheck({
+      kind: 'comment', target: 'isobeta', text: 'arre ye shot kahan ka hai bhai 🔥',
+    });
+    assert.strictEqual(good.ok, true, JSON.stringify(good.problems));
+  });
+
+  /* ── RARITY: the runtime gate says "not always, so less times" ── */
+  check('social · gate blocks a repeat action that is still on cooldown', () => {
+    const SOs = api.Social._state;
+    SOs.actionLog = [];
+    SOs.actionLog.push({ kind: 'comment', target: 'deeps20_', at: Date.now() - 60_000, text: 'x' });
+    const g = api._debug.socialGate({ kind: 'comment', target: 'deeps20_', text: 'nice one' }, false);
+    assert.strictEqual(g.ok, false, 'cooldown not enforced');
+    assert(/cooldown/.test(g.reason), g.reason);
+  });
+
+  check('social · gate blocks a public action that comes too soon after the last one', () => {
+    const SOs = api.Social._state;
+    SOs.actionLog = [];
+    SOs.actionLog.push({ kind: 'story_reply', target: 'adarshu.io', at: Date.now() - 10 * 60_000, text: 'x' });
+    const g = api._debug.socialGate(
+      { kind: 'comment', target: 'deeps20_', media_pk: 'POST1', text: 'mast hai bhai' }, false);
+    assert.strictEqual(g.ok, false, 'public gap not enforced');
+    assert.strictEqual(g.reason, 'public_action_too_soon', g.reason);
+  });
+
+  check('social · gate enforces the daily cap', () => {
+    const SOs = api.Social._state;
+    const cap = api.config.SOCIAL.DAILY_CAP.note;
+    SOs.actionLog = [];
+    for (let i = 0; i < cap; i++) {
+      SOs.actionLog.push({ kind: 'note', target: '', at: Date.now() - (i + 6) * 3600_000, text: 'n' + i });
+    }
+    const g = api._debug.socialGate({ kind: 'note', op: 'replace', text: 'ek aur note' }, false);
+    assert.strictEqual(g.ok, false, 'daily cap not enforced');
+    assert(/daily_cap/.test(g.reason), g.reason);
+  });
+
+  check('social · gate refuses a target that is not allowed for that kind', () => {
+    const SOs = api.Social._state;
+    SOs.actionLog = [];
+    const g = api._debug.socialGate(
+      { kind: 'comment', target: 'stranger99', media_pk: 'POST9', text: 'nice' }, false);
+    assert.strictEqual(g.ok, false);
+    assert.strictEqual(g.reason, 'target_not_allowed_for_comments', g.reason);
+  });
+
+  /* ── a full cycle: observe → plan → gate → act (dry run) ── */
+  const cycle = await api.Social.now();
+  check('social · a full brain cycle runs, acts and logs itself', () => {
+    assert.strictEqual(cycle.status, 'completed', cycle.error || cycle.status);
+    assert(cycle.plan, 'no plan recorded');
+    assert(Array.isArray(cycle.outcome), 'no outcome');
+    assert(cycle.decided_by === 'gemma-4-brain', cycle.decided_by);
+    assert(cycle.next_check_in_minutes >= 15, 'must schedule the next rare cycle');
+  });
+
+  check('social · "one thing at a time" — the second wish of the same cycle is deferred', () => {
+    const acted = (cycle.outcome || []).filter(o => /dry_run|sent/.test(String(o.status)));
+    assert.strictEqual(acted.length, 1, 'cycle performed ' + acted.length + ' actions');
+    assert.strictEqual(acted[0].kind, 'note', JSON.stringify(acted));
+    const deferred = (cycle.outcome || []).find(o => o.status === 'deferred');
+    assert(deferred, 'second action was not deferred: ' + JSON.stringify(cycle.outcome));
+    assert.strictEqual(deferred.reason, 'cycle_action_limit', deferred.reason);
+  });
+
+  // put the note on cooldown so the SAME plan now lands on the story reply
+  api.Social._state.actionLog.push(
+    { kind: 'note', target: '', at: Date.now() - 60_000, text: 'chai, code…' });
+  const cycle2 = await api.Social.now();
+  check('social · next cycle executes the story reaction the gate now allows', () => {
+    assert.strictEqual(cycle2.status, 'completed', cycle2.error);
+    const gated = (cycle2.outcome || []).find(o => o.kind === 'note');
+    assert(gated && /cooldown/.test(gated.reason), 'note should be on cooldown: ' + JSON.stringify(gated));
+    const acted = (cycle2.outcome || []).filter(o => /dry_run|sent/.test(String(o.status)));
+    assert.strictEqual(acted.length, 1, JSON.stringify(cycle2.outcome));
+    assert.strictEqual(acted[0].kind, 'story_reply', JSON.stringify(acted));
+    assert.strictEqual(acted[0].target, 'deeps20_');
+  });
+
+  check('social · every outgoing line passes the isolation guard before sending', () => {
+    const leaks = (cycle.outcome || []).concat(cycle2.outcome || []).filter(o =>
+      o.text && /@(isoalpha|adarshu\.io)/.test(String(o.text)));
+    assert.strictEqual(leaks.length, 0, JSON.stringify(leaks));
+  });
+
+  check('social · the cycle is mirrored to the bridge for _social_brain.json', () => {
+    assert(SOCIAL_SAVES.length >= 1, 'social brain log never saved');
+    const last = SOCIAL_SAVES[SOCIAL_SAVES.length - 1];
+    assert.strictEqual(last.schema_version, '9.0-social-brain-log');
+    assert(Array.isArray(last.cycles) && last.cycles.length >= 1);
+    assert(Array.isArray(last.action_log));
+  });
+
+  /* ── the NOTE power ── */
+  IG.notes = [];
+  api.Social.dryRun(false);
+  await api.note('chai, code aur thodi si shanti ☕');
+  check('notes · Aduu can put a nice note on the tray', () => {
+    assert.strictEqual(IG.notes.length, 1, JSON.stringify(IG.notes));
+    assert.strictEqual(IG.notes[0], 'chai, code aur thodi si shanti ☕');
+    assert(IG.notes[0].length <= api.config.SOCIAL.MAX_NOTE_CHARS);
+  });
+
+  const tray = await api.notes();
+  check('notes · the tray is readable (mine + other people\'s)', () => {
+    assert.strictEqual(tray.length, 2, JSON.stringify(tray));
+    const mine = tray.find(t => t.authorId === '999');
+    assert(mine, 'my own note not found');
+    assert.strictEqual(mine.text, 'chai aur code ☕');
+    assert(tray.some(t => t.username === 'deeps20_'), "other people's notes missing");
+  });
+
+  IG.noteDeletes = 0;
+  await api.deleteNote();
+  check('notes · and he can take it down again', () => {
+    assert.strictEqual(IG.noteDeletes, 1, 'note delete mutation not fired');
+  });
+
+  api.config.SOCIAL.QUIET_HOURS = SAVED_QUIET;
+  api.Social.dryRun(true);
+
+  check('social · Social.status() reports caps, mode and last actions', () => {
+    const st = api.Social.status();
+    assert(st.notesMode === 'agentic' || st.notesMode === 'off');
+    assert(st.capsToday && st.capsToday.note > 0);
+    assert(Array.isArray(st.watch));
+    assert(st.watch.includes('deeps20_'));
   });
 
   // 4. Aduu's mood flips to FURIOUS when someone abuses him
