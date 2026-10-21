@@ -27,6 +27,10 @@ const IG = {
   calls: [],
   sent: [],
   seen: 0,
+  rateLimitMsgs: false,     // v10.2 · force the per-thread fetch to rate-limit
+  rateLimitRest: false,     // v10.2 · force the social REST fetch to rate-limit
+  httpStatus: 0,            // v10.2 · force an HTTP status on every GQL call
+  rlCalls: 0,               // v10.2 · how many calls actually hit the network
 };
 let BRIDGE_REPLY = '**Haan bro!** <think>internal</think> kya haal hai? 😄';
 
@@ -97,6 +101,10 @@ global.fetch = async (url, opts = {}) => {
   // plain REST (no GraphQL envelope) — the social brain's private endpoints
   if (typeof url === 'string' && url.startsWith('/api/v1/')) {
     REST_CALLS.push(url);
+    if (IG.rateLimitRest) {
+      const body = JSON.stringify({ message: 'Rate limit exceeded', status: 'fail' });
+      return { ok: true, status: 200, json: async () => JSON.parse(body) };
+    }
     const payload = REST[url];
     if (!payload) return { ok: false, status: 404, json: async () => ({}) };
     return { ok: true, status: 200, json: async () => payload };
@@ -105,6 +113,13 @@ global.fetch = async (url, opts = {}) => {
   const vars = body && body.get ? JSON.parse(body.get('variables') || '{}') : {};
   IG.calls.push({ name, vars });
   let data = {};
+
+  // v10.2 · let a test force an HTTP-level rate limit (429 / 403)
+  if (IG.httpStatus) {
+    return { ok: false, status: IG.httpStatus,
+             text: async () => 'Rate limit exceeded',
+             json: async () => ({ message: 'Rate limit exceeded' }) };
+  }
 
   if (name === 'PolarisDirectInboxQuery') {
     data = {
@@ -124,6 +139,13 @@ global.fetch = async (url, opts = {}) => {
       },
     };
   } else if (name === 'IGDMessageListOffMsysQuery') {
+    if (IG.rateLimitMsgs) {
+      // v10.2 · what Instagram ACTUALLY sends: HTTP 200 + an errors array.
+      // It is not a 429, which is exactly why the old code never saw it.
+      IG.rlCalls += 1;
+      const body = JSON.stringify({ errors: [{ message: 'Rate limit exceeded' }], status: 'fail' });
+      return { ok: true, status: 200, text: async () => body, json: async () => JSON.parse(body) };
+    }
     const tid = vars.id || 'T1';
     const list = (IG.byThread && IG.byThread[tid]) || IG.messages;
     const newer = vars.newer_than_message_id;
@@ -1024,9 +1046,16 @@ const check = (name, fn) => {
   // add histuser WITHOUT disturbing the target list the earlier tests rely on
   api.addTargets('histuser');
 
+  /* v10.2 · the background poll sweep runs for the whole suite. Hold it for
+     this block: these assertions are about one thread's backlog gate and must
+     not race a concurrent sweep for the same thread (which would simply hit
+     the S.busy guard and skip, leaving the assertions non-deterministic). */
+  api._debug.holdPolls();
+  await api._debug.settleThread('T_HIST');
+
   const sentBeforeHist = IG.sent.length;
   await api._debug.processThread('T_HIST', 'histuser');
-  await new Promise(r => setTimeout(r, 400));
+  await api._debug.settleThread('T_HIST');
 
   check('v10.1 · a refetched backlog is absorbed, never answered', () => {
     assert.strictEqual(IG.sent.length, sentBeforeHist,
@@ -1038,7 +1067,7 @@ const check = (name, fn) => {
   // now wipe the handled-set — the classic "history deleted" scenario
   S.handled.clear();
   await api._debug.processThread('T_HIST', 'histuser');
-  await new Promise(r => setTimeout(r, 400));
+  await api._debug.settleThread('T_HIST');
 
   check('v10.1 · lost handled-set still cannot trigger a re-answer', () => {
     assert.strictEqual(IG.sent.length, sentBeforeHist,
@@ -1055,7 +1084,7 @@ const check = (name, fn) => {
   IG.threads.find(t => t.thread_fbid === 'T_HIST').last_activity_timestamp_ms = NEW_TS;
 
   await api._debug.processThread('T_HIST', 'histuser');
-  await new Promise(r => setTimeout(r, 600));
+  await api._debug.settleThread('T_HIST');
 
   check('v10.1 · a genuinely new message is still answered', () => {
     assert.strictEqual(IG.sent.length, sentBeforeHist + 1,
@@ -1067,12 +1096,216 @@ const check = (name, fn) => {
   const afterFirst = IG.sent.length;
   S.handled.clear();
   await api._debug.processThread('T_HIST', 'histuser');
-  await new Promise(r => setTimeout(r, 400));
+  await api._debug.settleThread('T_HIST');
 
   check('v10.1 · a message already answered is never answered again', () => {
     assert.strictEqual(IG.sent.length, afterFirst,
       'answered the same message twice after a refetch');
   });
+
+  api._debug.releasePolls();
+
+
+  /* ═════════════════════ v10.2 · INSTAGRAM RATE-LIMIT PACER ══════════════
+     The console log that triggered v10.2 was an endless loop of
+         retrying (IG GQL: Rate limit exceeded) — retry in 4s
+         LLM circuit breather — retry in 2s
+     for all five targets, forever. Three separate defects, all fixed here:
+
+       1. Instagram rate-limits with HTTP 200 + errors:[{message:"Rate limit
+          exceeded"}]. res.status was 200, so the 429/403 branch never ran and
+          the error came out as a plain Error with no rate-limit marker.
+       2. Every one of those errors was counted as an LLM failure
+          (S.llmFailStreak++), so after 10 of them a "circuit breather" tripped
+          — for five seconds — and then we walked straight back into the wall.
+       3. The retry was a flat rand(3s, 6s) with no escalation, and the first
+          poll fired all targets at once. Five targets × a flat 4s retry is a
+          permanent ~1 request/second hammer, which is what got the account
+          rate-limited in the first place.
+     ═══════════════════════════════════════════════════════════════════════ */
+
+  const D = api._debug;
+  const RLO = D.RL;
+  api._debug.holdPolls();                    // no background sweep during this
+
+  check('v10.2 · Instagram\'s HTTP-200 "Rate limit exceeded" is recognised', () => {
+    assert(D.isRateLimitMessage('Rate limit exceeded'));
+    assert(D.isRateLimitMessage('rate limit'));
+    assert(D.isRateLimitMessage('Too many requests, please wait'));
+    assert(D.isRateLimitMessage('Please try again later'));
+    assert(D.isRateLimitMessage('you are being throttled'));
+    // …and a genuine failure is NOT mistaken for one
+    assert(!D.isRateLimitMessage('IG GQL: went wrong'));
+    assert(!D.isRateLimitMessage('missing_required_variable'));
+    assert(!D.isRateLimitMessage('session tokens not found'));
+  });
+
+  // ── the wire-level test: fake Instagram answers 200 + rate-limit ────────
+  IG.rlCalls = 0;
+  IG.rateLimitMsgs = true;
+  RLO.cooldownUntil = 0; RLO.strikes = 0;
+
+  let rlErr = null;
+  await D.gql('IGDMessageListOffMsysQuery', 'x', { id: 'T1' }).catch(e => { rlErr = e; });
+
+  check('v10.2 · an HTTP-200 rate limit is thrown as rate-limited, not fatal', () => {
+    assert(rlErr, 'no error thrown at all — the rate limit was swallowed');
+    assert.strictEqual(rlErr.rateLimited, true,
+      'rateLimited not set — the retry path cannot tell this apart');
+    assert(!rlErr.fatal, 'a rate limit must never be treated as fatal');
+    assert(/rate limit/i.test(rlErr.message), rlErr.message);
+    assert.strictEqual(IG.rlCalls, 1, 'expected exactly one network call');
+  });
+
+  check('v10.2 · one rate limit pauses ALL Instagram calls', () => {
+    assert(D.igCooldownRemaining() > 30_000,
+      'cooldown too short: ' + D.igCooldownRemaining() + 'ms');
+    assert.strictEqual(RLO.strikes, 1);
+  });
+
+  // during the cooldown, gql must NOT touch the network at all
+  let duringErr = null;
+  const callsBefore = IG.rlCalls;
+  await D.gql('IGDMessageListOffMsysQuery', 'x', { id: 'T1' }).catch(e => { duringErr = e; });
+
+  check('v10.2 · during cooldown no request is sent — it fails locally', () => {
+    assert(duringErr, 'no error — the call went out during a cooldown');
+    assert.strictEqual(duringErr.rateLimited, true);
+    assert.strictEqual(IG.rlCalls, callsBefore,
+      'a request left the browser while Instagram was cooling us down');
+    assert(duringErr.retryAfterMs > 0, 'retryAfterMs missing');
+  });
+
+  check('v10.2 · the cooldown escalates instead of retrying forever', () => {
+    const steps = [];
+    for (let i = 0; i < 5; i++) steps.push(D.noteRateLimit('Rate limit exceeded'));
+    assert(steps[1] > steps[0], 'second pause must be longer: ' + steps.join(','));
+    assert(steps[2] > steps[1], 'third pause must be longer: ' + steps.join(','));
+    assert.strictEqual(RLO.strikes, 5, 'strikes should be capped at the ladder length');
+    // and once Instagram accepts calls again the ladder resets
+    D.igNoteSuccess();
+    assert.strictEqual(RLO.strikes, 0, 'strikes did not reset after a success');
+  });
+
+  // ── HTTP-level 429 must get the same treatment ──────────────────────────
+  RLO.cooldownUntil = 0; RLO.strikes = 0;
+  IG.rateLimitMsgs = false;
+  IG.httpStatus = 429;
+  let httpErr = null;
+  await D.gql('IGDMessageListOffMsysQuery', 'x', { id: 'T1' }).catch(e => { httpErr = e; });
+  IG.httpStatus = 0;
+
+  check('v10.2 · an HTTP 429 also triggers the Instagram cooldown', () => {
+    assert(httpErr && httpErr.rateLimited, '429 not marked rate-limited');
+    assert(RLO.strikes >= 1, '429 did not start a cooldown');
+    assert(D.igCooldownRemaining() > 30_000);
+  });
+
+  // ── IG failures must never be counted as LLM failures ───────────────────
+  RLO.cooldownUntil = 0; RLO.strikes = 0;
+  IG.rateLimitMsgs = true;
+  const llmStreakBefore = S.llmFailStreak || 0;
+  const circuitBefore = S.circuitUntil || 0;
+  await api._debug.processThread('T1', 'testuser');
+  const llmStreakAfter = S.llmFailStreak || 0;
+
+  check('v10.2 · an Instagram rate limit is not counted as an LLM failure', () => {
+    assert.strictEqual(llmStreakAfter, llmStreakBefore,
+      `llmFailStreak moved ${llmStreakBefore} -> ${llmStreakAfter}; ` +
+      'that is the bug that produced the bogus "LLM circuit breather" lines');
+  });
+
+  check('v10.2 · a rate-limited thread backs off for minutes, not 4 seconds', () => {
+    const pend = S.pending['T1'];
+    assert(pend, 'the thread was not requeued at all');
+    assert(pend.at - Date.now() > 30_000,
+      'retry scheduled only ' + Math.round((pend.at - Date.now()) / 1000) +
+      's out — that is the hammering bug');
+    assert(/rate limit/i.test(pend.reason || ''),
+      'the requeue reason must say rate limit, got: ' + pend.reason);
+  });
+
+  // ── genuine failures still retry, but with exponential backoff ─────────
+  IG.rateLimitMsgs = false;
+  RLO.cooldownUntil = 0; RLO.strikes = 0;
+  S.tries = S.tries || {};
+  S.tries['T1'] = 6;                      // already failed a few times
+  IG.httpStatus = 500;
+  await api._debug.processThread('T1', 'testuser');
+  IG.httpStatus = 0;
+
+  check('v10.2 · a genuine failure backs off exponentially, not flat', () => {
+    const pend = S.pending['T1'];
+    assert(pend, 'a genuine failure was not requeued');
+    const wait = pend.at - Date.now();
+    assert(wait > 60_000,
+      'backoff after 7 failures should be minutes, got ' +
+      Math.round(wait / 1000) + 's');
+  });
+
+  // clean up: clear the pending retry so nothing fires after api.stop()
+  if (S.pending['T1'] && S.pending['T1'].timer) clearTimeout(S.pending['T1'].timer);
+  delete S.pending['T1'];
+  S.tries['T1'] = 0;
+  IG.rateLimitMsgs = false;
+  RLO.cooldownUntil = 0; RLO.strikes = 0;
+
+  /* ── the headline regression: five targets must not hammer ─────────────
+     Before v10.2 this logged 25 Instagram calls in 20 seconds and never
+     stopped. Now it must be a couple of calls followed by a long silence. */
+  IG.rateLimitMsgs = true;
+  IG.rlCalls = 0;
+  RLO.cooldownUntil = 0; RLO.strikes = 0;
+  api._debug.releasePolls();
+  if (typeof api.pollNow === 'function') api.pollNow();
+  await new Promise(r => setTimeout(r, 12_000));
+
+  check('v10.2 · five rate-limited targets no longer hammer Instagram', () => {
+    assert(IG.rlCalls <= 6,
+      `${IG.rlCalls} Instagram calls in 12s — that is the hammering bug ` +
+      '(was 25 in 20s before v10.2)');
+    assert(RLO.strikes >= 1, 'the rate limit was never noticed at all');
+    assert(D.igCooldownRemaining() > 0, 'no cooldown is active after the burst');
+  });
+
+  IG.rateLimitMsgs = false;
+  RLO.cooldownUntil = 0; RLO.strikes = 0;
+
+  /* The social brain talks to Instagram over REST, not GraphQL — and before
+     v10.2 it skipped the pacer entirely, so it kept hammering the same
+     rate-limited account while the DM side was politely backing off. */
+  check('v10.2 · the social REST path respects the same Instagram cooldown', () => {
+    assert.strictEqual(D.igCooldownRemaining(), 0, 'precondition: no cooldown');
+  });
+
+  IG.rateLimitRest = true;
+  let restErr = null;
+  await D.socRest('/api/v1/feed/reels_tray/').catch(e => { restErr = e; });
+  IG.rateLimitRest = false;
+
+  check('v10.2 · a REST rate limit starts the shared cooldown', () => {
+    assert(restErr, 'the REST rate limit was swallowed');
+    assert.strictEqual(restErr.rateLimited, true,
+      'REST rate limit not marked rate-limited: ' + restErr.message);
+    assert(!restErr.fatal, 'a rate limit must not be reported as fatal');
+    assert(RLO.strikes >= 1, 'REST rate limit did not start the cooldown');
+    assert(D.igCooldownRemaining() > 30_000);
+  });
+
+  // and while that cooldown is running the REST path must not hit the network
+  const restBefore = REST_CALLS.length;
+  let restErr2 = null;
+  await D.socRest('/api/v1/feed/reels_tray/').catch(e => { restErr2 = e; });
+  IG.rateLimitRest = false;
+
+  check('v10.2 · during cooldown the REST path also sends nothing', () => {
+    assert(restErr2 && restErr2.rateLimited, 'REST call went out anyway');
+    assert.strictEqual(REST_CALLS.length, restBefore,
+      'a REST request left the browser during an Instagram cooldown');
+  });
+
+  RLO.cooldownUntil = 0; RLO.strikes = 0;
+  api._debug.holdPolls();
 
   api.stop();
   const failed = results.filter(r => !r[0]);

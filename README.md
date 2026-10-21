@@ -28,6 +28,14 @@ DM out of the blue, and writes the **Instagram NOTE**.
 > contact's `@handle`, no verbatim line from another person's chat, and every
 > social action declares the single audience that will see it.
 
+> **v10.2 — it stops when Instagram says stop.** Instagram rate-limits by
+> returning **HTTP 200** with `errors:[{message:"Rate limit exceeded"}]`. v10.1
+> did not recognise that at all, counted every one of them as an *LLM* failure,
+> and retried on a flat 3–6 s loop. The result was a permanent ~1 request/second
+> hammer that kept the account rate-limited forever. v10.2 adds a global request
+> **pacer** and an **escalating cooldown** 60 s → 2 m → 5 m → 10 m → 15 m, and
+> keeps Instagram failures out of the LLM circuit breaker.
+
 > **Version archives:** [`v5/`](./v5) and [`v6/`](./v6) hold the previous
 > generations. The story/comment/notes primitives were ported in from the
 > experimental `arena/71d3f44b-dsk` branch and rebuilt brain-first here.
@@ -107,6 +115,113 @@ is bypassed by manual turns (`IGAgent.say()`, `forceProactive`).
           message is 1291 min old (history, not a new message)
 [backlog] @testuser: absorbed 4 existing message(s) — already read up to 2:54:07 PM
 ```
+
+---
+
+## What changed in v10.2 — it stops hammering Instagram
+
+### The symptom
+
+The console was an endless loop, for **all five targets at once**:
+
+```
+[IGAgent:queue] @adarshu.io: retrying (IG GQL: Rate limit exceeded) — retry in 4s
+[IGAgent:queue] @deeps20_:    retrying (IG GQL: Rate limit exceeded) — retry in 4s
+[IGAgent:queue] @adarshu.io: LLM circuit breather — retry in 2s
+[IGAgent:queue] @deeps20_:    LLM circuit breather — retry in 2s
+… forever, every few seconds, on every target
+```
+
+Nothing was broken about the LLM. The "LLM circuit breather" lines were a
+**lie** — they were Instagram failures wearing an LLM label.
+
+### Root cause 1 — Instagram rate-limits with HTTP 200, not 429
+
+```json
+HTTP/1.1 200 OK
+{"errors":[{"message":"Rate limit exceeded"}],"status":"fail"}
+```
+
+`res.status` was `200`, so the existing `if (res.status === 429 || 403)` branch
+never ran. The error surfaced as a plain `Error('IG GQL: Rate limit exceeded')`
+with **no** `fatal` flag and **no** rate-limit marker, so the retry path could
+not tell a rate limit from a genuine failure.
+
+Fixed: `isRateLimitMessage()` matches Instagram's wording (`rate limit`,
+`too many requests`, `please wait`, `try again later`, `slow down`, `throttl`)
+and the throw is now tagged `{ fatal: false, rateLimited: true }`.
+
+### Root cause 2 — Instagram failures were counted as LLM failures
+
+The single `catch` in `processThread` did `S.llmFailStreak++` on *every*
+failure. Ten of them and the circuit breaker tripped — for `CIRCUIT_COOLDOWN_MS`
+= **5 seconds** — logging `LLM circuit breather`, then immediately retrying
+straight back into the same rate limit.
+
+Fixed: the catch now has two branches.
+
+| | behaviour |
+|---|---|
+| `e.rateLimited` | `S.tries[tid] = 0` (a rate limit is not a failed attempt), wait `max(retryAfterMs, 5s) + rand(0, 10s)`, log `Instagram rate limit — backing off Ns`, **never touches `llmFailStreak`** |
+| genuine failure | exponential backoff `min(RETRY_BASE_MS · 2^n, RETRY_MAX_MS) · rand(.85, 1.15)` — 4 s → 8 s → 16 s … → 5 min cap |
+
+### Root cause 3 — no pacing at all, and the first poll fired everything at once
+
+Five targets × a flat `rand(3s, 6s)` retry is a sustained ~1 req/s. And on the
+very first poll all of them went out together.
+
+Fixed: `BASELINE_STAGGER_MS` spreads the first sweep, and **every** Instagram
+call now goes through one choke point.
+
+### The pacer
+
+```
+                    ┌─ cooldown active? ──► throw {rateLimited, retryAfterMs}   (no network)
+every IG call  ──►  ├─ serialize on RL.queue (no burst can leave at once)
+                    ├─ min gap IG_MIN_GAP_MS + jitter between calls
+                    └─ success?  ──► reset the escalation ladder
+                        rate limited? ──► pause EVERYTHING, escalate the ladder
+```
+
+| knob | default | what it does |
+|---|---|---|
+| `IG_MIN_GAP_MS` | `900` | minimum gap between two Instagram calls |
+| `IG_GAP_JITTER_MS` | `700` | random spread on top of that gap |
+| `IG_COOLDOWN_STEPS_MS` | `[60s, 120s, 300s, 600s, 900s]` | the escalation ladder |
+| `RETRY_BASE_MS` / `RETRY_MAX_MS` | `4s` / `300s` | genuine-failure backoff |
+| `BASELINE_STAGGER_MS` | `2500` | spacing of the first sweep across targets |
+
+The ladder only relaxes when calls start succeeding again (`igNoteSuccess()`),
+so a persistent rate limit walks itself up to a 15-minute pause instead of
+sitting at 60 s forever.
+
+**The social brain shares it.** The REST calls (`/api/v1/feed/reels_tray/`,
+profile lookups) used to bypass the pacer entirely — so the story tray kept
+hammering the same rate-limited account while the DM side was politely backing
+off. They now go through the same choke point, and a rate limit there rests the
+social brain for 3 hours instead of being mislabelled `fatal`.
+
+### What it looks like when it happens
+
+```
+[IGAgent:ig]    Instagram rate limit — all Instagram calls paused for 60s
+                (strike 1/5). This is Instagram protecting the account, not a bug.
+[IGAgent:queue] @deeps20_: Instagram rate limit — backing off 61s — retry in 61s
+[IGAgent:queue] @adarshu.io: Instagram rate limit — backing off 64s — retry in 64s
+```
+
+…then silence. That silence is the fix. `IGAgent.igStatus()` tells you so:
+
+```
+> IGAgent.igStatus()
+{ coolingFor: '47s', until: '2:04:03 PM', strikes: '1/5', nextPause: '120s',
+  minGapMs: 900, pollsHeld: false,
+  queued: [ { user: 'deeps20_', retryIn: '48s', why: 'Instagram rate limit — backing off 61s' } ] }
+```
+
+`IGAgent.status()` now reports the same thing under `instagram`, and the retry
+queue entries carry `retryIn` + `why` so a 60-second pause is never mistaken
+for a hung bot.
 
 ---
 
@@ -494,6 +609,9 @@ IGAgent.why('deeps20_')          // the brain's last JSON decision + its evidenc
 IGAgent.decide('deeps20_')       // ask the brain to decide that chat right now
 IGAgent.backlogWindow(45)         // v10.1 · first-contact freshness window (min)
 IGAgent.resetBacklog('deeps20_')  // v10.1 · forget how far we read that thread
+IGAgent.igStatus()                // v10.2 · the Instagram pacer: cooldown, strikes, retry queue
+IGAgent.holdPolls()               // v10.2 · pause the background sweep (keep state)
+IGAgent.releasePolls()            // v10.2 · resume it
 IGAgent.brainStatus()            // v10 · is the decision brain actually answering?
                                  //   → {ok, degraded, last_error, decisions, last_ok_ago_s, ...}
 IGAgent.brainMode(false)         // fall back to the old local rules
@@ -590,13 +708,34 @@ IGAgent.linkFriends('adarshu.io', 'deeps20_') · IGAgent.addGossip('…')
 
 ```bash
 node tests/test_humanize.js        #  32 passed
-node tests/test_bot_flow.js        #  60 passed
+node tests/test_bot_flow.js        #  73 passed
 python tests/test_pipeline.py      #   5 passed   (needs curl_cffi)
 python tests/test_resilience.py    #  18 passed   ← the outage suite
 ```
 
-**115 tests, fully offline** against `tests/mock_llmchat.py`, which also
+**128 tests, fully offline** against `tests/mock_llmchat.py`, which also
 impersonates the decision brain.
+
+`tests/test_bot_flow.js` also carries the **v10.2 rate-limit suite** — 13 tests
+that fail against the pre-v10.2 code. It reproduces the exact bug at the wire
+level: a fake Instagram that answers `HTTP 200 + {errors:[{message:"Rate limit
+exceeded"}]}` for the per-thread message fetch while the inbox keeps working,
+five targets, and a 12-second window.
+
+Before v10.2 that logged **25 Instagram calls in 20 s** and never stopped.
+The suite asserts:
+
+- Instagram's HTTP-200 wording is recognised — and a genuine failure is not
+- the throw is tagged `rateLimited`, never `fatal`
+- one rate limit pauses **all** Instagram calls for at least 30 s
+- during the cooldown **zero** requests leave the browser
+- the cooldown **escalates** (60 s → 120 s → 300 s …) and resets on success
+- an HTTP 429 gets the same treatment
+- an Instagram rate limit does **not** move `llmFailStreak` — the bug that
+  produced the bogus `LLM circuit breather` lines
+- a rate-limited thread requeues **minutes** out, not 4 seconds
+- five rate-limited targets make ≤ 6 calls in 12 s
+- the social **REST** path shares the same cooldown and sends nothing during it
 
 `tests/test_resilience.py` exists so the v10 outage can never come back
 silently. It asserts, at the wire level, that:

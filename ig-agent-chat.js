@@ -406,6 +406,19 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
     CIRCUIT_FAILS: 10,
     CIRCUIT_COOLDOWN_MS: 5_000,
+
+    /* v10.2 · Instagram pacing (anti-IP-block). These are deliberately
+       conservative: the point is to look like a person scrolling, not a bot. */
+    IG_MIN_GAP_MS: 900,        // minimum gap between two IG GraphQL calls
+    IG_GAP_JITTER_MS: 700,     // extra random spread on top of that gap
+    // Escalating pause when Instagram actually rate-limits us. Every thread
+    // stops for this long; the level only resets once calls succeed again.
+    IG_COOLDOWN_STEPS_MS: [60_000, 120_000, 300_000, 600_000, 900_000],
+    // Retry backoff for genuine (non-rate-limit) failures: 4s → 8s → 16s …
+    RETRY_BASE_MS: 4_000,
+    RETRY_MAX_MS: 300_000,
+    // Stagger the very first poll so N targets don't all fire at once
+    BASELINE_STAGGER_MS: 2_500,
     RETRIES_PER_BATCH: 999,
 
     // reverse-engineered GraphQL doc ids (do not change)
@@ -1213,7 +1226,118 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   }
   function resetTokens() { TOK = null; }
 
+  /* ══════════════ v10.2 · INSTAGRAM REQUEST PACER ══════════════════════════
+     Instagram rate-limits hard, and the old behaviour made it worse: five
+     targets fired at once on the first poll, every rate-limit was retried
+     after a flat 3-6s, and each failure was counted as an LLM failure until a
+     5-second "circuit breather" tripped. Result: a permanent ~1 request/second
+     hammer that kept the account rate-limited forever.
+
+     Two independent protections, both global (not per-thread):
+
+       1. PACER — every Instagram GraphQL call is serialized and spaced by a
+          minimum gap, so no burst can ever leave the browser at once.
+
+       2. COOLDOWN — when Instagram actually says "rate limit exceeded", ALL
+          calls stop for a while. The pause ESCALATES (60s → 2m → 5m → 10m →
+          15m) and only relaxes once calls start succeeding again. This is the
+          difference between backing off and hammering.
+     ═══════════════════════════════════════════════════════════════════════ */
+
+  const RL = {
+    cooldownUntil: 0,      // epoch ms — no IG calls at all until this passes
+    strikes: 0,            // consecutive rate-limit hits (drives escalation)
+    lastCall: 0,           // when the last IG call actually went out
+    queue: Promise.resolve(),
+  };
+
+  function isRateLimitMessage(msg) {
+    return /rate.?limit|too many requests|please wait|try again later|slow down|throttl/i
+      .test(String(msg || ''));
+  }
+
+  function igCooldownRemaining() {
+    return Math.max(0, RL.cooldownUntil - now());
+  }
+
+  /* Instagram pushed back — pause EVERYTHING, and escalate if it keeps
+     happening. Returns how long we are paused for. */
+  function noteRateLimit(msg, resStatus) {
+    RL.strikes = Math.min(RL.strikes + 1, CFG.IG_COOLDOWN_STEPS_MS.length);
+    const ms = CFG.IG_COOLDOWN_STEPS_MS[RL.strikes - 1];
+    RL.cooldownUntil = Math.max(RL.cooldownUntil, now() + ms);
+    log(C.warn, 'ig',
+      `Instagram rate limit${resStatus ? ' (status ' + resStatus + ')' : ''} — ` +
+      `all Instagram calls paused for ${Math.round(ms / 1000)}s ` +
+      `(strike ${RL.strikes}/${CFG.IG_COOLDOWN_STEPS_MS.length}). ` +
+      `This is Instagram protecting the account, not a bug.`);
+    return ms;
+  }
+
+  function igNoteSuccess() {
+    if (RL.strikes) {
+      log(C.dim, 'ig', `Instagram accepted calls again — cooldown reset ` +
+        `(was at strike ${RL.strikes})`);
+      RL.strikes = 0;
+    }
+  }
+
+  /* Serialize every IG call and keep a minimum gap between them. Concurrent
+     callers queue up instead of stampeding. */
+  function igPaced(task) {
+    const run = RL.queue.then(task, task);          // never blocked by a reject
+    RL.queue = run.then(() => {}, () => {});        // keep the chain alive
+    return run;
+  }
+
+  async function igGap() {
+    const gap = CFG.IG_MIN_GAP_MS - (now() - RL.lastCall);
+    if (gap > 0) await sleep(gap + rand(0, CFG.IG_GAP_JITTER_MS));
+    else await sleep(rand(0, 150));                 // small spread anyway
+    RL.lastCall = now();
+  }
+
+  /* The one entry point every Instagram call goes through. Fails fast while
+     the account is cooling down, and paces everything that does go out. */
   async function gql(name, docId, variables, opts = {}, retried = false) {
+    // 1 · global cooldown — don't even touch the network while IG is angry
+    const cooling = igCooldownRemaining();
+    if (cooling > 0) {
+      const e = new Error(
+        `Instagram cooldown — ${Math.round(cooling / 1000)}s left`);
+      throw Object.assign(e, {
+        fatal: false, rateLimited: true, retryAfterMs: cooling,
+      });
+    }
+    // 2 · serialize + space out the real call
+    return igPaced(async () => {
+      // re-check: a cooldown may have started while we were queued
+      const still = igCooldownRemaining();
+      if (still > 0) {
+        throw Object.assign(
+          new Error(`Instagram cooldown — ${Math.round(still / 1000)}s left`),
+          { fatal: false, rateLimited: true, retryAfterMs: still });
+      }
+      await igGap();
+      try {
+        const data = await gqlRaw(name, docId, variables, opts, retried);
+        igNoteSuccess();
+        return data;
+      } catch (e) {
+        const rl = e && (e.rateLimited || isRateLimitMessage(e.message));
+        if (rl) {
+          const ms = noteRateLimit(e.message, 0);
+          throw Object.assign(e, {
+            rateLimited: true,
+            retryAfterMs: Math.max(e.retryAfterMs || 0, ms),
+          });
+        }
+        throw e;
+      }
+    });
+  }
+
+  async function gqlRaw(name, docId, variables, opts = {}, retried = false) {
     const T = extractTokens();
     const body = new URLSearchParams({
       av: T.av, __user: '0', __a: '1', dpr: '1', __ccg: 'EXCELLENT', __comet_req: '7',
@@ -1243,7 +1367,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     if (res.status === 429 || res.status === 403) {
       // rate-limit on a non-critical op (seen) shouldn't halt the whole bot
       throw Object.assign(new Error('IG_RATE_LIMIT status=' + res.status),
-        { fatal: !!opts.fatalOnRL });
+        { fatal: !!opts.fatalOnRL, rateLimited: true });
     }
     const txt = await res.text();
     let j = null;
@@ -1253,12 +1377,14 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       if (/missing_required_variable|went wrong/i.test(msg) && !retried) {
         // stale fb_dtsg — tokens rotate; refresh once and retry
         resetTokens();
-        return gql(name, docId, variables, opts, true);
+        return gqlRaw(name, docId, variables, opts, true);
       }
       throw Object.assign(new Error('IG GQL: ' + msg), { fatal: res.status === 400 || res.status === 401 });
     }
     if (j.errors && j.errors.length && !j.data) {
-      throw new Error('IG GQL: ' + (j.errors[0].message || 'unknown'));
+      const msg = j.errors[0].message || 'unknown';
+      throw Object.assign(new Error('IG GQL: ' + msg),
+        { fatal: !!opts.fatalOnRL, rateLimited: isRateLimitMessage(msg) });
     }
     return j.data;
   }
@@ -3193,11 +3319,18 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     let p = S.pending[tid];
     if (!p) p = S.pending[tid] = { firstAt: now(), timer: null };
     if (p.timer) clearTimeout(p.timer);
+    const fireIn = Math.max(150, ms);
+    // v10.2 · remember WHEN we will retry and WHY. Without this the retry
+    // queue is invisible to diagnostics (and to the tests): you cannot tell a
+    // healthy 60s rate-limit pause from the 4s hammer that broke v10.1.
+    p.at = now() + fireIn;
+    p.reason = reason || p.reason || null;
+    p.user = user;
     if (reason) log(C.dim, 'queue', `@${user}: ${reason} — retry in ${Math.round(ms / 1000)}s`);
     p.timer = setTimeout(() => {
       delete S.pending[tid];
       processThread(tid, user, opts).catch(e => log(C.err, 'proc', `@${user}: ${e.message}`));
-    }, Math.max(150, ms));
+    }, fireIn);
   }
 
   /* ── v10.1 · BACKLOG GATE ───────────────────────────────────────────────
@@ -3707,14 +3840,33 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       // never leave a stuck "typing…" if the draft failed
       if (S.typingThreads.has(String(tid))) await typingOff(tid);
       if (/token|dtsg|csrf|400|401/i.test(e.message || '')) resetTokens();
+
+      /* v10.2 · Instagram rate limits are NOT LLM failures. Previously they
+         incremented the LLM failure streak and tripped a 5-second "circuit
+         breather", which then retried straight back into the same rate limit —
+         a permanent hammer. Back off properly instead, and leave the LLM
+         circuit breaker for actual model failures. */
+      if (e && e.rateLimited) {
+        S.tries[tid] = 0;               // rate limits are not "failed attempts"
+        const wait = Math.max(e.retryAfterMs || 60_000, 5_000) + rand(0, 10_000);
+        queueThread(tid, user, wait,
+          `Instagram rate limit — backing off ${Math.round(wait / 1000)}s`);
+        return;
+      }
+
       S.llmFailStreak++;
       if (S.llmFailStreak >= CFG.CIRCUIT_FAILS) {
         S.llmFailStreak = 0;
         S.circuitUntil = now() + CFG.CIRCUIT_COOLDOWN_MS;
       }
+      // genuine failure → exponential backoff with jitter, never a flat retry
       const tries = (S.tries[tid] || 0) + 1;
       S.tries[tid] = tries;
-      queueThread(tid, user, rand(3e3, 6e3), `retrying (${e.message})`);
+      const backoff = Math.min(
+        CFG.RETRY_BASE_MS * Math.pow(2, Math.min(tries - 1, 6)),
+        CFG.RETRY_MAX_MS);
+      queueThread(tid, user, backoff * rand(0.85, 1.15),
+        `retrying (${e.message}) — ${Math.round(backoff / 1000)}s backoff`);
     } finally {
       S.busy[tid] = false;
       if (S.recheckAfterBusy[tid]) {
@@ -3800,14 +3952,24 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   }
 
   async function pollTick() {
-    if (!S.running) return;
+    if (!S.running || S.pollsHeld) return;
     if (S.timer) { clearTimeout(S.timer); S.timer = null; }
+    // v10.2 · while Instagram is cooling us down, don't even start a poll —
+    // just re-arm for when the cooldown ends. Nothing to fetch until then.
+    const _cool = igCooldownRemaining();
+    if (_cool > 0) {
+      if (S.running && !S.pollsHeld) {
+        S.timer = setTimeout(pollTick, _cool + rand(500, 2_500));
+      }
+      return;
+    }
     let hadActivity = false;
     try {
       if (!S.wsReady) wsConnect().catch(() => {});
       const threads = await fetchInbox();
       const baseline = !(S.startedPolls > 0);
       S.startedPolls = (S.startedPolls || 0) + 1;
+      let baselineIdx = 0;          // v10.2 · staggers the first poll
 
       for (const th of threads) {
         const tid = String(th.thread_fbid || th.id);
@@ -3832,10 +3994,16 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         S.checkedTargets.add(tid);
 
         if (baseline) {
+          /* v10.2 · stagger the first poll. Queueing every target at once
+             fired N Instagram calls in the same instant, which is exactly
+             what earns an immediate rate limit. Each thread now gets its own
+             slot a couple of seconds apart (the pacer spaces the calls too). */
           if (CFG.TRANSCRIPTS && !S.transcripts[tid]) backfillThread(tid, user);
           if (act > 10_000) {
             hadActivity = true;
-            queueThread(tid, user, rand(CFG.DEBOUNCE_MIN_MS, CFG.DEBOUNCE_MAX_MS), null);
+            const slot = baselineIdx++ * CFG.BASELINE_STAGGER_MS;
+            queueThread(tid, user,
+              slot + rand(CFG.DEBOUNCE_MIN_MS, CFG.DEBOUNCE_MAX_MS), null);
           }
           continue;
         }
@@ -3885,15 +4053,57 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       S.lastPollAt = now();
     } catch (e) {
       if (/token|dtsg|csrf|400|401/i.test(e.message || '')) resetTokens();
+      if (e && e.rateLimited) {
+        // Instagram is cooling us down — the poll loop must wait it out
+        // rather than spinning every few seconds and logging noise.
+        const wait = igCooldownRemaining() + rand(500, 3_000);
+        log(C.warn, 'poll',
+          `Instagram cooldown — pausing all polling for ` +
+          `${Math.round(wait / 1000)}s`);
+        if (S.running && !S.pollsHeld) S.timer = setTimeout(pollTick, wait);
+        return;
+      }
       log(C.warn, 'poll', 'retrying after transient error:', e.message);
     }
-    if (S.running) S.timer = setTimeout(pollTick, nextPollDelayMs());
+    if (S.running && !S.pollsHeld) S.timer = setTimeout(pollTick, nextPollDelayMs());
   }
 
   function pollNow() {
-    if (!S.running) return;
+    if (!S.running || S.pollsHeld) return;
     if (S.timer) { clearTimeout(S.timer); S.timer = null; }
     pollTick();
+  }
+
+  /* v10.2 · hold / release the background poll loop WITHOUT tearing down
+     state. `stop()` clears pending queues and typing trails, which is right
+     for shutting the bot down but wrong for "I want to drive this one thread
+     myself for a moment" — the poller must simply step aside and come back.
+     Also used by the test suite so a direct processThread() is never racing
+     the background sweep for the same thread. */
+  function holdPolls() {
+    S.pollsHeld = true;
+    if (S.timer) { clearTimeout(S.timer); S.timer = null; }
+  }
+
+  function releasePolls() {
+    S.pollsHeld = false;
+    if (S.running && !S.timer) S.timer = setTimeout(pollTick, nextPollDelayMs());
+  }
+
+  /* Wait until a thread is genuinely idle: not mid-turn, and nothing queued
+     to retry. Returns false if it never settles within the budget. */
+  async function settleThread(tid, budgetMs = 20_000) {
+    const t0 = now();
+    let quiet = 0;
+    while (now() - t0 < budgetMs) {
+      if (!S.busy[tid] && !S.pending[tid]) {
+        if (++quiet >= 3) return true;          // three clean samples in a row
+      } else {
+        quiet = 0;
+      }
+      await sleep(40);
+    }
+    return false;
   }
 
   function isTarget(user) {
@@ -3944,18 +4154,57 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
   /* ── raw Instagram primitives ─────────────────────────────────────────── */
 
+  /* v10.2 · the social brain's REST calls are Instagram calls too. Before this
+     they bypassed the pacer completely — so while the GQL side was politely
+     sitting out a cooldown, the story tray / profile fetches kept hammering
+     the same rate-limited account. They now share one pacer and one cooldown,
+     which is the only thing that actually gets an account out of a rate limit. */
   async function socRest(path) {
-    const csrf = getCookie('csrftoken') || '';
-    const res = await fetch(path, {
-      headers: { 'X-CSRFToken': csrf, 'X-IG-App-ID': CFG.APP_ID },
-      credentials: 'same-origin',
-    });
-    if (res.status === 429 || res.status === 403) {
-      throw Object.assign(new Error('IG_RATE_LIMIT status=' + res.status), { fatal: true });
+    const cooling = igCooldownRemaining();
+    if (cooling > 0) {
+      throw Object.assign(
+        new Error(`Instagram cooldown — ${Math.round(cooling / 1000)}s left`),
+        { fatal: false, rateLimited: true, retryAfterMs: cooling });
     }
-    const j = await res.json().catch(() => null);
-    if (!res.ok) throw new Error('REST HTTP ' + res.status + ' ' + path);
-    return j || {};
+    return igPaced(async () => {
+      const still = igCooldownRemaining();
+      if (still > 0) {
+        throw Object.assign(
+          new Error(`Instagram cooldown — ${Math.round(still / 1000)}s left`),
+          { fatal: false, rateLimited: true, retryAfterMs: still });
+      }
+      await igGap();
+      const csrf = getCookie('csrftoken') || '';
+      let res;
+      try {
+        res = await fetch(path, {
+          headers: { 'X-CSRFToken': csrf, 'X-IG-App-ID': CFG.APP_ID },
+          credentials: 'same-origin',
+        });
+      } catch (e) {
+        throw Object.assign(new Error('network: ' + e.message), { fatal: false });
+      }
+      if (res.status === 429 || res.status === 403) {
+        const ms = noteRateLimit('IG_RATE_LIMIT status=' + res.status, res.status);
+        throw Object.assign(new Error('IG_RATE_LIMIT status=' + res.status),
+          { fatal: false, rateLimited: true, retryAfterMs: ms });
+      }
+      const j = await res.json().catch(() => null);
+      // v10.2 · exactly like GraphQL, Instagram can rate-limit REST with a
+      // cheerful HTTP 200 and the words "Rate limit exceeded" in the body.
+      // Check the body BEFORE trusting res.ok.
+      const rlMsg = j && (j.message
+        || (j.errors && j.errors[0] && j.errors[0].message)
+        || (j.status === 'fail' ? 'Rate limit exceeded' : ''));
+      if (rlMsg && isRateLimitMessage(rlMsg)) {
+        const ms = noteRateLimit(rlMsg, res.status);
+        throw Object.assign(new Error('IG REST: ' + rlMsg),
+          { fatal: false, rateLimited: true, retryAfterMs: ms });
+      }
+      if (!res.ok) throw new Error('REST HTTP ' + res.status + ' ' + path);
+      igNoteSuccess();
+      return j || {};
+    });
   }
 
   async function myPk() {
@@ -4651,7 +4900,10 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         } catch (e) {
           cycle.outcome.push({ kind: action.kind, status: 'error', reason: e.message });
           socLog('soc', `${action.kind} failed: ${e.message}`);
-          if (e.fatal) {                       // Instagram rate-limit → back off hard
+          // v10.2 · a rate limit is now its own thing, not just `fatal`.
+          // Either way the social brain must rest instead of retrying — poking
+          // a rate-limited account is what keeps it rate-limited.
+          if (e.fatal || e.rateLimited) {
             socLog('soc', 'Instagram pushed back — social brain resting for 3h');
             scheduleSocialBrain(180);
             break;
@@ -4815,7 +5067,20 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       transcripts: Object.entries(S.transcripts).map(([tid, T]) =>
         ({ user: T.user, msgs: T.messages.length, dirty: T.dirty })),
       circuitOpen: S.circuitUntil > now() ? ('until ' + new Date(S.circuitUntil).toLocaleTimeString()) : false,
-      queuedThreads: Object.keys(S.pending),
+      // v10.2 · the Instagram pacer, so a rate-limit pause is visible instead
+      // of looking like a hung bot
+      instagram: {
+        coolingFor: igCooldownRemaining()
+          ? Math.round(igCooldownRemaining() / 1000) + 's' : false,
+        strikes: RL.strikes + '/' + CFG.IG_COOLDOWN_STEPS_MS.length,
+        minGapMs: CFG.IG_MIN_GAP_MS,
+      },
+      queuedThreads: Object.entries(S.pending).map(([tid, p]) => ({
+        thread: tid,
+        user: p.user || S.usernameCache.get(tid) || tid,
+        retryIn: p.at ? Math.round((p.at - now()) / 1000) + 's' : '?',
+        why: p.reason || null,
+      })),
       lastPollAt: S.lastPollAt ? new Date(S.lastPollAt).toLocaleTimeString() : null,
       knownThreads: [...S.usernameCache.entries()].map(([tid, u]) => ({ user: u, threadId: tid })),
     };
@@ -5285,10 +5550,42 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     return CFG.TARGETS;
   }
 
+  /* v10.2 · one-line view of the Instagram pacer. When the console goes quiet
+     this is the first thing to look at: if `coolingFor` is set, Instagram told
+     us to back off and the bot is deliberately sleeping — not broken. */
+  function igStatus() {
+    const left = igCooldownRemaining();
+    const out = {
+      coolingFor: left ? Math.round(left / 1000) + 's' : false,
+      until: left ? new Date(RL.cooldownUntil).toLocaleTimeString() : null,
+      strikes: RL.strikes + '/' + CFG.IG_COOLDOWN_STEPS_MS.length,
+      nextPause: CFG.IG_COOLDOWN_STEPS_MS[Math.min(RL.strikes, CFG.IG_COOLDOWN_STEPS_MS.length - 1)] / 1000 + 's',
+      minGapMs: CFG.IG_MIN_GAP_MS,
+      pollsHeld: !!S.pollsHeld,
+      queued: Object.entries(S.pending).map(([tid, p]) => ({
+        user: p.user || S.usernameCache.get(tid) || tid,
+        retryIn: p.at ? Math.round((p.at - now()) / 1000) + 's' : '?',
+        why: p.reason || null,
+      })),
+    };
+    if (left) {
+      log(C.warn, 'ig',
+        `Instagram is cooling us down for another ${out.coolingFor} ` +
+        `(${out.strikes}). The bot is fine — it is deliberately waiting.`);
+    } else {
+      log(C.ok, 'ig',
+        'Instagram pacing healthy — no cooldown, ' + out.strikes +
+        ' strikes, min gap ' + CFG.IG_MIN_GAP_MS + 'ms');
+    }
+    console.log('%cIGAgent instagram', C.info, out);
+    return out;
+  }
+
   /* expose */
   const api = {
     start, stop, status, test, threads, history, memory, forget, memories, say,
     typingDemo, markSeenNow, transcripts, saveTranscriptsNow, pollNow,
+    holdPolls, releasePolls, igStatus,
     config: CFG,
     // debug hooks (used to drive the pipeline manually when needed)
     _debug: { processThread, fetchMessages, fetchInbox, fetchThreadMeta, sendText, markSeen, sendTyping,
@@ -5311,6 +5608,11 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
               normalizeTiming,
               localTaskExtraction, brainDecisionContext, evidenceScore, clip,
               onRealtimeSignal, nextPollDelayMs,
+              holdPolls, releasePolls, settleThread,
+              // v10.2 Instagram pacer
+              isRateLimitMessage, noteRateLimit, igNoteSuccess, igCooldownRemaining,
+              gql,
+              get RL() { return RL; },
               MOODS, defaultMoodState, detectLocalMood, setMood,
               extractReminderRequests, addReminder, dueReminder, consumeReminder, processReminderRequests,
               extractCrossChatMissions, addMission, pendingMissionFor, consumeMission,
@@ -5802,7 +6104,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   loadState();
   window.IGAgent = api;
 
-  console.log('%cIGAgent v10 RESILIENT BRAIN loaded & ACTIVE ✅  (Gemma-4 decides everything · GLM-4.7-Flash writes · default targets: ' +
+  console.log('%cIGAgent v10.2 RESILIENT BRAIN loaded & ACTIVE ✅  (Gemma-4 decides everything · GLM-4.7-Flash writes · default targets: ' +
     (Array.isArray(CFG.TARGETS) ? CFG.TARGETS.join(', ') : CFG.TARGETS) + ')', C.ok,
     '\n• Auto-started LIVE with default targets: adarshu.io, deeps20_' +
     '\n• THE BRAIN DECIDES: mood, bubbles, silence, reminders, pranks, PACING — all from the chat messages' +
@@ -5818,6 +6120,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     '\n• IGAgent.remind("user", "topic", 15)        ← task-driven time trigger (NOT blind spam)' +
     '\n• IGAgent.prank("adarshu.io", "deeps20_", "tease her about the chocolate") ← secret mission' +
     '\n• IGAgent.missions() · IGAgent.reminders() · IGAgent.brain("user") · IGAgent.processLog("user")' +
+    '\n• IGAgent.igStatus() ← is Instagram rate-limiting us? (cooldown + retry queue)' +
     '\n• IGAgent.status() · IGAgent.test() · IGAgent.stop()');
 
   // Auto-start immediately when pasted/run in the browser console (skipped in Node test harness)
