@@ -40,6 +40,16 @@ FALLBACK_MODEL_WIRE = "@cf/qwen/qwen3-30b-a3b-fp8"
 REASONING = "One short sentence then answer."
 CONTENT = "Alright, I'm listening. What's up, bro?"
 
+# v9: what the Gemma-4 SOCIAL brain answers with when it decides to do nothing.
+OBSERVE_PLAN = {
+    "mode": "observe",
+    "intent": "let the conversation breathe",
+    "skip_reason": "nothing worth reacting to right now",
+    "actions": [],
+    "next_check_in_minutes": 90,
+}
+
+
 # v8: what the Gemma-4 decision brain answers with.
 DECISION_JSON = {
     "action": "REPLY",
@@ -208,6 +218,73 @@ def build_decision_stream(decision: dict | None = None) -> bytes:
     return build_gemma_stream(content=body, reasoning="Decide from the chat.")
 
 
+def build_social_decision_stream(plan: dict | None = None) -> bytes:
+    """v9: the Gemma-4 social brain answering with its JSON plan."""
+    body = json.dumps(plan or OBSERVE_PLAN, ensure_ascii=False,
+                      separators=(", ", ": "))
+    return build_gemma_stream(content=body, reasoning="Scan the account.")
+
+
+# ── Round-9 outage shapes ────────────────────────────────────────────────────
+# These reproduce the production failure: HTTP 200, `reasoning=0 chars`, and
+# absolutely no content. The old parser turned all of them into ("", "").
+
+def build_silent_stream() -> bytes:
+    """HTTP 200, well-formed SSE, but the model says nothing at all."""
+    return "".join([
+        glm_frame({"role": "assistant", "content": "", "reasoning_content": None}),
+        *_tail(_usage(94, 250, 12.0)),
+    ]).encode()
+
+
+def build_challenge_page() -> bytes:
+    """A Cloudflare-ish interstitial served with a 200 instead of SSE."""
+    return (b"<!DOCTYPE html><html><head><title>Just a moment...</title>"
+            b"</head><body><h1>Checking your browser</h1></body></html>")
+
+
+def build_error_packet_stream(msg: str = "rate limited") -> bytes:
+    """Upstream answers with a JSON error object inside the stream."""
+    return "".join([
+        _frame({"success": False, "error": msg}),
+        "data: [DONE]\n\n",
+    ]).encode()
+
+
+def build_bare_json_stream(content: str = CONTENT,
+                           reasoning: str = REASONING) -> bytes:
+    """Format change: JSON objects with NO `data:` SSE prefix."""
+    out = [json.dumps({"choices": [{"delta": {"role": "assistant",
+                                              "content": ""}}]})]
+    for tok in reasoning.split(" "):
+        out.append(json.dumps({"choices": [{"delta": {"reasoning": tok + " "}}],
+                               "model": MODEL_WIRE}))
+    for tok in content.split(" "):
+        out.append(json.dumps({"choices": [{"delta": {"content": tok + " "}}],
+                               "model": MODEL_WIRE}))
+    out.append(json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    return ("\n".join(out) + "\n").encode()
+
+
+def build_delta_key_stream(content: str = CONTENT) -> bytes:
+    """Format change: a bare `delta:` key instead of `data:`."""
+    out = ["delta: " + json.dumps({"role": "assistant", "content": ""})]
+    for tok in content.split(" "):
+        out.append("delta: " + json.dumps({"content": tok + " ",
+                                           "reasoning_content": None}))
+    out.append("data: [DONE]\n\n")
+    return ("\n\n".join(out) + "\n\n").encode()
+
+
+def build_top_level_message_stream(content: str = CONTENT) -> bytes:
+    """Format change: a single non-streaming `message` object."""
+    return (_frame({"choices": [{"message": {"role": "assistant",
+                                             "content": content},
+                                 "finish_reason": "stop"}],
+                    "usage": _usage(10, 20, 1.0)})
+            + "data: [DONE]\n\n").encode()
+
+
 def is_decide_request(body: dict) -> bool:
     """True when the request carries the v8 DECISION BRAIN system prompt."""
     try:
@@ -217,6 +294,23 @@ def is_decide_request(body: dict) -> bool:
     except Exception:
         pass
     return False
+
+
+def is_social_decide_request(body: dict) -> bool:
+    """True when the request carries the v9 SOCIAL BRAIN system prompt."""
+    try:
+        for m in body.get("messages") or []:
+            if isinstance(m, dict) and "SOCIAL BRAIN" in str(m.get("content", "")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def count_system_messages(body: dict) -> int:
+    """How many `system` messages this request put on the wire."""
+    return sum(1 for m in (body.get("messages") or [])
+               if isinstance(m, dict) and m.get("role") == "system")
 
 
 def build_stream(model: str = "") -> bytes:
@@ -236,14 +330,34 @@ class MockLLM:
     fail_models   → HTTP 500 for matching model substrings
     glitch_models → return the "!!!!!!" glitch body (tests the bridge's guard)
     empty_models  → return reasoning-only body (tests the empty-content fallback)
+
+    Round-9 outage modes (these are what broke production):
+    silent_all    → every model returns a well-formed but EMPTY stream
+    challenge     → HTTP 200 with an HTML interstitial instead of SSE
+    error_packet  → the stream carries {"success":false,"error":...}
+    bare_json     → SSE frames with no `data:` prefix (wire-format change)
+    delta_key     → `delta:` key instead of `data:` (wire-format change)
+    message_obj   → one non-streaming `message` object (wire-format change)
     """
 
     def __init__(self, port: int = 0, fail_models: tuple[str, ...] = (),
                  glitch_models: tuple[str, ...] = (),
-                 empty_models: tuple[str, ...] = ()):
+                 empty_models: tuple[str, ...] = (),
+                 silent_all: bool = False,
+                 challenge: bool = False,
+                 error_packet: bool = False,
+                 bare_json: bool = False,
+                 delta_key: bool = False,
+                 message_obj: bool = False):
         self.fail_models = tuple(fail_models)
         self.glitch_models = tuple(glitch_models)
         self.empty_models = tuple(empty_models)
+        self.silent_all = silent_all
+        self.challenge = challenge
+        self.error_packet = error_packet
+        self.bare_json = bare_json
+        self.delta_key = delta_key
+        self.message_obj = message_obj
         self.requests: list[dict] = []
         self.lock = threading.Lock()
         outer = self
@@ -270,16 +384,42 @@ class MockLLM:
                     return self._json(404, {"error": "unknown path"})
                 if any(part in model for part in outer.fail_models):
                     return self._json(500, {"error": "mock upstream failure"})
-                if is_decide_request(body):
+                # ── Round-9 outage modes take priority over everything ──
+                if outer.challenge:
+                    data = build_challenge_page()
+                    ctype = "text/html; charset=utf-8"
+                elif outer.error_packet:
+                    data = build_error_packet_stream()
+                    ctype = "text/event-stream"
+                elif outer.silent_all:
+                    data = build_silent_stream()
+                    ctype = "text/event-stream"
+                elif outer.bare_json:
+                    data = build_bare_json_stream()
+                    ctype = "text/plain; charset=utf-8"
+                elif outer.delta_key:
+                    data = build_delta_key_stream()
+                    ctype = "text/event-stream"
+                elif outer.message_obj:
+                    data = build_top_level_message_stream()
+                    ctype = "text/event-stream"
+                elif is_decide_request(body) and not is_social_decide_request(body):
                     data = build_decision_stream()
+                    ctype = "text/event-stream"
+                elif is_social_decide_request(body):
+                    data = build_social_decision_stream()
+                    ctype = "text/event-stream"
                 elif any(part in model for part in outer.glitch_models):
                     data = build_glitch_stream()
+                    ctype = "text/event-stream"
                 elif any(part in model for part in outer.empty_models):
                     data = build_empty_stream()
+                    ctype = "text/event-stream"
                 else:
                     data = build_stream(model)
+                    ctype = "text/event-stream"
                 self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Type", ctype)
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -327,14 +467,43 @@ class MockLLM:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="offline llmchat.in stream mock (v7)")
+    ap = argparse.ArgumentParser(
+        description="offline llmchat.in stream mock (v10)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Round-9 outage modes — reproduce the production failure locally:\n"
+            "  --silent-all    every model returns a well-formed but EMPTY stream\n"
+            "  --challenge     HTTP 200 with an HTML interstitial instead of SSE\n"
+            "  --error-packet  the stream carries {\"success\":false,\"error\":...}\n"
+            "  --bare-json     SSE frames with no `data:` prefix\n"
+            "  --delta-key     `delta:` key instead of `data:`\n"
+            "  --message-obj   one non-streaming `message` object\n"
+        ))
     ap.add_argument("--port", type=int, default=8899)
-    ap.add_argument("--fail", default="", help="comma-separated model substrings to fail")
+    ap.add_argument("--fail", default="",
+                    help="comma-separated model substrings to fail")
+    ap.add_argument("--silent-all", action="store_true")
+    ap.add_argument("--challenge", action="store_true")
+    ap.add_argument("--error-packet", action="store_true")
+    ap.add_argument("--bare-json", action="store_true")
+    ap.add_argument("--delta-key", action="store_true")
+    ap.add_argument("--message-obj", action="store_true")
     args = ap.parse_args()
     fails = tuple(x.strip() for x in args.fail.split(",") if x.strip())
-    with MockLLM(args.port, fails) as mock:
+    with MockLLM(args.port, fail_models=fails, silent_all=args.silent_all,
+                 challenge=args.challenge, error_packet=args.error_packet,
+                 bare_json=args.bare_json, delta_key=args.delta_key,
+                 message_obj=args.message_obj) as mock:
+        modes = [k for k in ("silent_all", "challenge", "error_packet",
+                             "bare_json", "delta_key", "message_obj")
+                 if getattr(args, k)]
         print(f"mock llmchat stream → {mock.url}")
-        print(f"frontline {MODEL_WIRE} · brain {BRAIN_MODEL_WIRE} · fallback {FALLBACK_MODEL_WIRE}")
+        print(f"frontline {MODEL_WIRE} · brain {BRAIN_MODEL_WIRE} · "
+              f"fallback {FALLBACK_MODEL_WIRE}")
+        if modes:
+            print(f"!! OUTAGE MODE: {', '.join(modes)}")
+        if fails:
+            print(f"!! failing models: {', '.join(fails)}")
         try:
             threading.Event().wait()
         except KeyboardInterrupt:

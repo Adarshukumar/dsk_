@@ -110,7 +110,7 @@
     BACKFILL_ON_START: 40,        // pull N msgs of history per target at start
 
     // Bumped whenever the default persona / model architecture changes.
-    PERSONA_VERSION: 9,
+    PERSONA_VERSION: 10,
 
     SYSTEM_PROMPT:
 `You are Aduu — a real 22-year-old Delhi Gen-Z guy who handles Adarsh's Instagram DMs. You are not Adarsh; you're his close friend and the guy who runs his DMs. You are Aduu in every message, and that is the only answer to "who are you".
@@ -300,8 +300,15 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       '  "cross_chat_mission": null,',
       '  "use_gossip": false,',
       '  "privacy_ok": true,',
+      '  "timing": {"seen_delay_s": 2, "typing_s": 4, "bubble_gap_s": 2},',
       '  "steer_next": "one line of coaching for Aduu\'s next turn"',
       '}',
+      '',
+      'THE "timing" OBJECT IS YOURS — it is how a real person paces this reply:',
+      '  · "seen_delay_s" (0-45) seconds before their message shows as seen. 0 = Aduu replied instantly; bigger = he was busy, is making them wait, or is sulking.',
+      '  · "typing_s"     (1-25) seconds the typing bubble is up. Long for a serious/long reply, short for a one-liner.',
+      '  · "bubble_gap_s" (1-8)  seconds between bubbles when you send more than one.',
+      'Choose them FROM THE MOOD AND THEIR MESSAGE: eager/hyped = fast; ANNOYED, ANGRY or FURIOUS = slow and heavy; teasing = a deliberate pause before the punchline. Never use the same numbers twice in a row.',
       '',
       'Set "reminder" to {"topic": "...", "due_in_minutes": 15, "evidence": "their exact words"} ONLY when they asked to be reminded of something or to talk later.',
       'Set "cross_chat_mission" to {"target_user": "handle", "type": "prank" | "relay", "instruction": "what to do WITHOUT revealing who asked", "evidence": "their exact words"} ONLY when they asked Aduu to message, prank, tease or relay something to another person.',
@@ -312,7 +319,8 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       '3. "bubble_count" is 1, 2 or 3. Every entry of "bubble_plan" must be a DIFFERENT forward step — never a rephrase of bubble 1 and never a repeat of "my_last".',
       '4. "mood" may flip to ANGRY_SAVAGE_ROAST or FURIOUS_ABUSE_CLAPBACK only when their own words were abusive or disrespectful; put that line in "mood_reason".',
       '5. "privacy_ok" must be false if the plan would leak another chat, another person\'s @handle, or a verbatim private quote.',
-      '6. Never write anything that sounds like an AI or an assistant. Aduu is a real person texting a real person.',
+      '6. "timing" is mandatory. A real friend is NOT instantly available and does NOT type at a constant speed — it is not decoration.',
+      '7. Never write anything that sounds like an AI or an assistant. Aduu is a real person texting a real person.',
     ].join('\n'),
 
     BRAIN_PROMPT:
@@ -1470,7 +1478,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         const r = await wsRequest({
           type: 'save',
           transcript: {
-            schema_version: '9.0-social-brain',
+            schema_version: '10.0-brain-resilient',
             user: T.user, thread_fbid: T.threadFbid,
             updated_at: new Date().toISOString(),
             models: {
@@ -1603,6 +1611,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       fast_think: opts.fastThink !== undefined ? opts.fastThink : CFG.FAST_THINK,
       max_tokens: opts.maxTokens || CFG.MAX_TOKENS,
       temperature: opts.temperature !== undefined ? opts.temperature : CFG.TEMPERATURE,
+      kind: opts.kind || undefined,
     }, opts.timeoutMs || CFG.LLM_TIMEOUT_MS);
     return {
       text: (m.text || '').trim(),
@@ -1612,6 +1621,9 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       reasoning_chars: Number(m.reasoning_chars || 0),
       elapsed_ms: Number(m.elapsed_ms || 0),
       usage: m.usage || {},
+      _fallback: !!m._fallback,
+      _fallback_reason: m._fallback_reason || '',
+      decision_valid: m.decision_valid !== false,
     };
   }
 
@@ -2727,7 +2739,36 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         : normalizeMission(obj.cross_chat_mission, joined, o.user),
       use_gossip: !!obj.use_gossip,
       privacy_ok: obj.privacy_ok === undefined ? true : !!obj.privacy_ok,
+      // v10: the brain owns the HUMAN PACING of the turn, not just its words.
+      timing: normalizeTiming(obj.timing, mood, plan.length),
       steer_next: clip(obj.steer_next, 250),
+    };
+  }
+
+  /* The brain's pacing, clamped to something a human would actually do.
+     Anything missing or nonsense falls back to a natural random jitter. */
+  function normalizeTiming(t, mood, bubbleCount) {
+    const secs = (v, lo, hi, dfltLo, dfltHi) => {
+      // Fast moods answer quickly, heavy moods make the person wait.
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0) return null;
+      return Math.max(lo, Math.min(hi, n)) * 1000;
+    };
+    const heavy = /ANNOYED|ANGRY|FURIOUS/.test(String(mood || ''));
+    const o = (t && typeof t === 'object') ? t : {};
+    return {
+      // seen: 0-45 s. Heavy moods default slower than light ones.
+      seen_delay_ms: secs(o.seen_delay_s, 0, 45) ??
+        Math.round(rand(heavy ? 3_000 : 600, heavy ? 9_000 : 2_200)),
+      // typing: 1-25 s, and never shorter than the reply needs
+      typing_ms: secs(o.typing_s, 1, 25) ??
+        Math.round(rand(heavy ? 4_000 : 1_500, heavy ? 9_000 : 6_000)),
+      // gap between bubbles: 1-8 s
+      bubble_gap_ms: secs(o.bubble_gap_s, 1, 8) ??
+        Math.round(rand(700, 1_800)),
+      bubble_count: Math.max(1, bubbleCount || 1),
+      source: (o.seen_delay_s !== undefined || o.typing_s !== undefined ||
+               o.bubble_gap_s !== undefined) ? 'gemma-4-brain' : 'default-jitter',
     };
   }
 
@@ -2813,6 +2854,8 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       if (!dec) throw new Error('brain returned no usable JSON decision');
       return {
         ok: true, decision: dec,
+        fallback: !!res._fallback,
+        fallback_reason: res._fallback_reason || '',
         model: res.model, endpoint: res.endpoint,
         reasoning_chars: res.reasoning_chars || 0,
         thinking_trace: res.thinking_trace || '',
@@ -2929,6 +2972,15 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         taskInstruction: (proactiveCtx && proactiveCtx.mission) ? proactiveCtx.mission.instruction : '',
       });
     }
+    // A synthesized (degraded) decision means the brain never actually spoke —
+    // the local rules do a better job than a canned reply: they can still read
+    // the abuse, set the mood, and pull reminders / secret missions out.
+    if (bd && bd.fallback) {
+      log(C.warn, 'brain',
+        `@${user}: ⚠ BRAIN UNREACHABLE — ${bd.fallback_reason || 'no answer'} ` +
+        `· local rules take over. Run IGAgent.brainStatus() for details.`);
+      bd = null;
+    }
     if (bd && bd.ok && bd.decision) {
       const dec = bd.decision;
       const applied = applyBrainDecision(tid, user, dec, joined);
@@ -2938,8 +2990,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         trigger,
         timeSlot: timeCtx.slot, timeLabel: timeCtx.label, timeVibe: timeCtx.vibeHint,
         bubbleStrategy: dec.bubble_count > 1 ? 'multi_thought' : 'single',
-        seenDelayMs: trigger === 'incoming_burst'
-          ? Math.round(rand(CFG.SEEN_DELAY_MIN_MS, CFG.SEEN_DELAY_MAX_MS)) : 0,
+        seenDelayMs: (trigger === 'incoming_burst' && dec.timing)
+          ? dec.timing.seen_delay_ms
+          : (trigger === 'incoming_burst'
+             ? Math.round(rand(CFG.SEEN_DELAY_MIN_MS, CFG.SEEN_DELAY_MAX_MS))
+             : 0),
+        timing: dec.timing || null,
         mood,
         mood_directive: MOODS[mood].directive +
           (dec.feeling_note ? `\nHOW ADUU ACTUALLY FEELS: ${dec.feeling_note}` : ''),
@@ -2954,6 +3010,13 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         brain_reasoning_chars: bd.reasoning_chars || 0,
         brain_thinking_trace: bd.thinking_trace || '',
       };
+      if (bd.fallback) {
+        log(C.warn, 'brain',
+          `@${user}: ⚠ BRAIN DEGRADED — upstream returned nothing usable ` +
+          `(${bd.fallback_reason || 'empty output'}). Using a safe human ` +
+          `fallback decision so the reply still lands. Check ` +
+          `IGAgent.brainStatus() / GET /health.`);
+      }
       log(C.info, 'brain',
         `@${user}: ${dec.action} · ${dec.mood} · ${dec.bubble_count} bubble(s) · ` +
         `${dec.next_move ? clip(dec.next_move, 60) : ''}`);
@@ -3265,7 +3328,10 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       // read receipt — real "Seen just now" on their phone (skipped in DRY_RUN / proactive).
       if (!isProactiveTurn && CFG.SEEN && !CFG.DRY_RUN && newest && !newest.mine) {
         try {
-          await sleep(decision.seenDelayMs || rand(CFG.SEEN_DELAY_MIN_MS, CFG.SEEN_DELAY_MAX_MS));
+          const seenWait = (decision.seenDelayMs != null
+          ? decision.seenDelayMs
+          : (decision.timing ? decision.timing.seen_delay_ms : 0));
+        await sleep(seenWait);
           await markSeen(tid, newest.id, newest.ts);
           log(C.dim, 'seen', `@${user}: marked seen (up to ${new Date(newest.ts).toLocaleTimeString()})`);
         } catch (e) {
@@ -3437,8 +3503,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
       if (typing) {
         const elapsed = now() - t0;
-        const floor = Math.min(CFG.TYPING_MAX_MS,
+        // v10: the brain chose the typing duration; only ever stretch it, never
+        // cut it short — a real person still needs the time to type the words.
+        const natural = Math.min(CFG.TYPING_MAX_MS,
           Math.max(CFG.TYPING_MIN_MS, reply.length * CFG.TYPING_MS_PER_CHAR));
+        const brainMs = decision.timing ? decision.timing.typing_ms : 0;
+        const floor = Math.max(natural, brainMs);
         const target = floor * rand(0.85, 1.2);
         if (elapsed < target) await sleep(target - elapsed);
       }
@@ -3454,7 +3524,11 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         for (let i = 0; i < bubbles.length; i++) {
           if (i > 0) {
             if (typing) await typingOn(tid);
-            await sleep(rand(CFG.BUBBLE_GAP_MIN_MS, CFG.BUBBLE_GAP_MAX_MS) + bubbles[i].length * 20);
+            // v10: the brain owns the gap between bubbles too.
+            const gap = decision.timing
+              ? decision.timing.bubble_gap_ms
+              : rand(CFG.BUBBLE_GAP_MIN_MS, CFG.BUBBLE_GAP_MAX_MS);
+            await sleep(gap + bubbles[i].length * 20);
           }
           const sent = await sendText(tid, bubbles[i]);
           S.sentHour.push(now()); S.sentDay.push(now());
@@ -4181,11 +4255,13 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       const res = await llmBrain([
         { role: 'system', content: SOCIAL_DECIDE_PROMPT },
         { role: 'user', content: observation },
-      ], { type: 'decide', model: CFG.BRAIN_MODEL, maxTokens: 700,
-           temperature: 0.45, timeoutMs: 90_000 });
+      ], { type: 'decide', kind: 'social', model: CFG.BRAIN_MODEL,
+           maxTokens: 700, temperature: 0.45, timeoutMs: 90_000 });
       const plan = parseSocialPlan(res.text);
       if (!plan) throw new Error('brain returned no usable social plan');
       return { ok: true, plan, observation, model: res.model,
+               fallback: !!res._fallback,
+               fallback_reason: res._fallback_reason || '',
                reasoning_chars: res.reasoning_chars || 0, raw: res.text };
     } catch (e) {
       return { ok: false, error: e.message, observation };
@@ -4416,6 +4492,11 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       cycle.decided_by = 'gemma-4-brain';
       cycle.outcome = [];
 
+      if (dec.fallback) {
+        socLog('soc', `⚠ BRAIN DEGRADED — upstream returned nothing usable ` +
+          `(${dec.fallback_reason || 'empty output'}). Doing nothing this ` +
+          `cycle. Check IGAgent.brainStatus().`);
+      }
       if (plan.mode === 'observe' && !plan.actions.length) {
         socLog('soc', `brain chose to do nothing — ${plan.skip_reason || 'no reason given'}`);
       }
@@ -4498,7 +4579,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         await wsRequest({
           type: 'save_social',
           social: {
-            schema_version: '9.0-social-brain-log',
+            schema_version: '10.0-brain-resilient-log',
             updated_at: new Date().toISOString(),
             config: {
               enabled: CFG.SOCIAL.ENABLED, dry_run: CFG.SOCIAL.DRY_RUN,
@@ -4519,7 +4600,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
   function saveSocialLocal() {
     try {
-      localStorage.setItem('ig_agent_social_v9', JSON.stringify({
+      localStorage.setItem('ig_agent_social_v10', JSON.stringify({
         seenPosts: [...SO.seenPosts].slice(-300),
         handledComments: [...SO.handledComments].slice(-300),
         actionLog: SO.actionLog.slice(-120),
@@ -4530,7 +4611,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
   function loadSocialLocal() {
     try {
-      const p = JSON.parse(localStorage.getItem('ig_agent_social_v9') || '{}');
+      const p = JSON.parse(localStorage.getItem('ig_agent_social_v10') || '{}');
       (p.seenPosts || []).forEach(x => SO.seenPosts.add(x));
       (p.handledComments || []).forEach(x => SO.handledComments.add(x));
       SO.actionLog = p.actionLog || [];
@@ -4847,7 +4928,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     ok &= await check('transcripts · bridge save roundtrip', async () => {
       if (!CFG.TRANSCRIPTS) return 'disabled';
       const r = await wsRequest({ type: 'save', transcript: {
-        schema_version: '9.0-social-brain',
+        schema_version: '10.0-brain-resilient',
         user: '_selftest', thread_fbid: '0', updated_at: new Date().toISOString(),
         persona: 'test', owner_bio: 'test', memory_profile: '',
         models: { answering_model: CFG.MODEL, brain_model: CFG.BRAIN_MODEL },
@@ -4930,6 +5011,62 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       }), { joined: 'bhai 10 min mein yaad dila dena assignment ka', trigger: 'incoming_burst', user: 'deeps20_' });
       if (!ok.reminder || ok.reminder.due_in_minutes !== 10) throw new Error('evidence-backed reminder was dropped');
       return `evidence gate works (score ${ok.reminder.evidence_score})`;
+    });
+    ok &= await check('v10 · brain owns the HUMAN PACING of the turn', async () => {
+      const base = { action: 'REPLY', mood: 'PLAYFUL_CHILL', bubble_count: 2,
+                     bubble_plan: ['one', 'two'] };
+      // 1 · the brain's numbers are honoured, clamped to human bounds
+      const d = parseDecisionJson(JSON.stringify(Object.assign({}, base, {
+        timing: { seen_delay_s: 12, typing_s: 9, bubble_gap_s: 3 },
+      })), { joined: 'bol na', trigger: 'incoming_burst', user: 'deeps20_' });
+      if (!d) throw new Error('decision not parsed');
+      if (d.timing.seen_delay_ms !== 12_000) throw new Error('seen delay: ' + d.timing.seen_delay_ms);
+      if (d.timing.typing_ms !== 9_000) throw new Error('typing: ' + d.timing.typing_ms);
+      if (d.timing.bubble_gap_ms !== 3_000) throw new Error('gap: ' + d.timing.bubble_gap_ms);
+      if (d.timing.source !== 'gemma-4-brain') throw new Error('source: ' + d.timing.source);
+
+      // 2 · absurd numbers are clamped, not trusted
+      const c = parseDecisionJson(JSON.stringify(Object.assign({}, base, {
+        timing: { seen_delay_s: 9999, typing_s: -4, bubble_gap_s: 0 },
+      })), { joined: 'bol na', trigger: 'incoming_burst', user: 'deeps20_' });
+      if (c.timing.seen_delay_ms > 45_000) throw new Error('seen not clamped: ' + c.timing.seen_delay_ms);
+      if (c.timing.typing_ms < 1_000) throw new Error('typing not clamped: ' + c.timing.typing_ms);
+      if (c.timing.bubble_gap_ms < 1_000) throw new Error('gap not clamped: ' + c.timing.bubble_gap_ms);
+
+      // 3 · no timing field at all → natural jitter, flagged as such
+      const n = parseDecisionJson(JSON.stringify(base),
+        { joined: 'bol na', trigger: 'incoming_burst', user: 'deeps20_' });
+      if (n.timing.source !== 'default-jitter') throw new Error('fallback source: ' + n.timing.source);
+      if (n.timing.seen_delay_ms <= 0) throw new Error('no jitter: ' + n.timing.seen_delay_ms);
+
+      // 4 · an ANGRY turn must be slower than a PLAYFUL one by default
+      let angry = 0, chill = 0;
+      for (let i = 0; i < 12; i++) {
+        angry += parseDecisionJson(JSON.stringify(Object.assign({}, base,
+          { mood: 'ANGRY_SAVAGE_ROAST' })),
+          { joined: 'x', trigger: 'incoming_burst', user: 'd' }).timing.seen_delay_ms;
+        chill += parseDecisionJson(JSON.stringify(base),
+          { joined: 'x', trigger: 'incoming_burst', user: 'd' }).timing.seen_delay_ms;
+      }
+      if (angry <= chill) throw new Error(`angry ${angry / 12}ms should exceed chill ${chill / 12}ms`);
+      return `brain timing honoured+clamped · angry ${Math.round(angry / 12)}ms vs chill ${Math.round(chill / 12)}ms`;
+    });
+    ok &= await check('v10 · a dead brain never leaves the person waiting', async () => {
+      // The bridge hands back a synthesized decision when every model is empty.
+      const raw = JSON.stringify({
+        action: 'REPLY', mood: 'PLAYFUL_CHILL', bubble_count: 1,
+        bubble_plan: ['reply naturally'], use_gossip: false, privacy_ok: true,
+        timing: { seen_delay_s: 2, typing_s: 4, bubble_gap_s: 2 },
+        _synthesized: true, _reason: 'empty brain output',
+      });
+      const d = parseDecisionJson(raw, { joined: 'bol na', trigger: 'incoming_burst', user: 'deeps20_' });
+      if (!d) throw new Error('synthesized decision was rejected');
+      if (d.action !== 'REPLY') throw new Error('must still reply: ' + d.action);
+      if (d.bubble_count !== 1) throw new Error('one bubble: ' + d.bubble_count);
+      if (d.reminder || d.cross_chat_mission) throw new Error('safe decision must not invent tasks');
+      if (d.privacy_ok !== true) throw new Error('safe decision must never leak');
+      if (!d.timing || d.timing.seen_delay_ms <= 0) throw new Error('safe decision needs human timing');
+      return 'synthesized decision parses → REPLY · 1 bubble · no invented tasks';
     });
     ok &= await check('v9 · social brain · story tray + notes tray readable', async () => {
       try {
@@ -5062,6 +5199,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
               socialStart, socialStop, saveSocialLocal, loadSocialLocal,
               SOCIAL_DECIDE_PROMPT,
               parseDecisionJson, normalizeReminder, normalizeMission,
+              normalizeTiming,
               localTaskExtraction, brainDecisionContext, evidenceScore, clip,
               onRealtimeSignal, nextPollDelayMs,
               MOODS, defaultMoodState, detectLocalMood, setMood,
@@ -5378,6 +5516,25 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         '(ON = the brain may decide to leave a burst on seen)');
       return CFG.BRAIN_ALLOW_SILENCE;
     },
+    /* One-glance brain health: is the decision brain actually answering? */
+    async brainStatus() {
+      const m = await wsRequest({ type: 'health' }, 8000);
+      const bs = m.brain_status || {};
+      const ok = bs.ok && !bs.degraded;
+      const line = `brain: ${ok ? 'ANSWERING' : 'DEGRADED'}` +
+        (bs.last_model ? ` · last model ${bs.last_model}` : '') +
+        (bs.decisions ? ` · ${bs.decisions} decision(s)` : '') +
+        (bs.last_ok_ago_s != null ? ` · last ok ${bs.last_ok_ago_s}s ago` : ' · never ok') +
+        (bs.last_error ? ` · ${bs.last_error}` : '');
+      log(ok ? C.ok : C.warn, 'brain', line);
+      return {
+        ok, degraded: !!bs.degraded, last_model: bs.last_model || '',
+        last_error: bs.last_error || '', decisions: bs.decisions || 0,
+        last_ok_ago_s: bs.last_ok_ago_s,
+        uptime_s: m.uptime_s, chain: m.chain || [],
+        brain_model: m.brain_model || CFG.BRAIN_MODEL,
+      };
+    },
     /* Ask the brain to decide this chat right now — no reply is sent. */
     async decide(user) {
       const q = cleanUsername(user);
@@ -5510,11 +5667,12 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
   loadState();
   window.IGAgent = api;
 
-  console.log('%cIGAgent v9 SOCIAL BRAIN loaded & ACTIVE ✅  (Gemma-4 decides everything · GLM-4.7-Flash writes · default targets: ' +
+  console.log('%cIGAgent v10 RESILIENT BRAIN loaded & ACTIVE ✅  (Gemma-4 decides everything · GLM-4.7-Flash writes · default targets: ' +
     (Array.isArray(CFG.TARGETS) ? CFG.TARGETS.join(', ') : CFG.TARGETS) + ')', C.ok,
     '\n• Auto-started LIVE with default targets: adarshu.io, deeps20_' +
-    '\n• THE BRAIN DECIDES: mood, bubbles, silence, reminders, pranks — all from the chat messages' +
+    '\n• THE BRAIN DECIDES: mood, bubbles, silence, reminders, pranks, PACING — all from the chat messages' +
     '\n• SOCIAL BRAIN (rare by design): stories · comments · replies · notes · out-of-the-blue DMs' +
+    '\n• IGAgent.brainStatus()        ← is the decision brain actually answering? (health check)' +
     '\n• IGAgent.Social.enable()     ← turn the social brain on (dry-run first)' +
     '\n• IGAgent.note("chai aur code ☕") ← put a nice NOTE up · IGAgent.notes() · IGAgent.deleteNote()' +
     '\n• IGAgent.why("user")         ← see the brain\'s last JSON decision + its evidence line' +

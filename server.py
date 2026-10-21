@@ -73,7 +73,7 @@ SOCIAL_BRAIN_FILE = TRANSCRIPTS_DIR / "_social_brain.json"
 def _load_social_brain() -> dict[str, Any]:
     if not SOCIAL_BRAIN_FILE.exists():
         return {
-            "schema_version": "9.0-social-brain-log",
+            "schema_version": "10.0-brain-resilient-log",
             "updated_at": None,
             "config": {},
             "action_log": [],
@@ -84,7 +84,7 @@ def _load_social_brain() -> dict[str, Any]:
         data = json.loads(SOCIAL_BRAIN_FILE.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("Invalid social brain root")
-        data.setdefault("schema_version", "9.0-social-brain-log")
+        data.setdefault("schema_version", "10.0-brain-resilient-log")
         data.setdefault("config", {})
         data.setdefault("action_log", [])
         data.setdefault("note_log", [])
@@ -93,7 +93,7 @@ def _load_social_brain() -> dict[str, Any]:
     except Exception as exc:
         log.warning("Failed to read social brain log: %s", exc)
         return {
-            "schema_version": "9.0-social-brain-log",
+            "schema_version": "10.0-brain-resilient-log",
             "updated_at": None,
             "config": {},
             "action_log": [],
@@ -106,7 +106,7 @@ def _save_social_brain(update: dict[str, Any]) -> dict[str, Any]:
     existing = _load_social_brain()
     payload = dict(existing)
     payload.update(update or {})
-    payload["schema_version"] = "9.0-social-brain-log"
+    payload["schema_version"] = "10.0-brain-resilient-log"
     payload["updated_at"] = int(time.time() * 1000)
     payload["updated_iso"] = _iso_utc()
     # keep the log files bounded
@@ -121,6 +121,77 @@ def _save_social_brain(update: dict[str, Any]) -> dict[str, Any]:
 # Token floor for thinking models (GLM-4.7-Flash, Gemma-4, Qwen3) so internal
 # reasoning_content never starves the visible reply content.
 THINK_MIN_BUDGET = int(os.environ.get("IG_THINK_MIN_BUDGET", "2500"))
+# Decisions are short JSON — a much smaller floor keeps them fast and avoids
+# oversized budgets that make some models return an empty stream.
+DECIDE_THINK_BUDGET = int(os.environ.get("IG_DECIDE_THINK_BUDGET", "900"))
+
+
+def _safe_social_plan(reason: str = "") -> dict[str, Any]:
+    """
+    Conservative social-brain answer used when the upstream returns nothing.
+
+    `observe` with no actions means the cycle does nothing at all — the right
+    behaviour when the brain that is supposed to be careful isn't reachable.
+    """
+    return {
+        "mode": "observe",
+        "intent": "stay quiet until the brain is reachable again",
+        "skip_reason": f"brain unavailable: {reason}"[:160],
+        "actions": [],
+        "next_check_in_minutes": 60,
+        "_synthesized": True,
+        "_reason": reason,
+    }
+
+
+# Live brain health, surfaced on /health so a dead upstream is visible in one
+# glance instead of hiding behind silent empty replies.
+LAST_BRAIN_STATUS: dict[str, Any] = {
+    "ok": False,
+    "degraded": False,
+    "last_ok": None,
+    "last_error": "",
+    "last_model": "",
+    "calls": 0,
+}
+
+
+def _safe_decision(reason: str = "") -> dict[str, Any]:
+    """
+    A conservative, always-valid decision used when the brain is unreachable.
+
+    The brain is the decision maker, but a dead upstream must never leave a
+    person waiting with no reply at all. This keeps Aduu human (reply, neutral
+    mood, one bubble) and is clearly flagged as synthesized so nothing mistakes
+    it for the brain's own judgement.
+    """
+    return {
+        "action": "REPLY",
+        "understand": "",
+        "my_last": "",
+        "next_move": "reply naturally",
+        "mood": "PLAYFUL_CHILL",
+        "mood_reason": "",
+        "feeling_note": "",
+        "bubble_count": 1,
+        "bubble_plan": ["reply naturally in Aduu's voice"],
+        "topic_lock": "",
+        "reminder": None,
+        "cross_chat_mission": None,
+        "use_gossip": False,
+        "privacy_ok": True,
+        # Pacing stays human even when the brain is down: a small, natural
+        # jitter rather than an instant robot reply.
+        "timing": {
+            "seen_delay_s": 2,
+            "typing_s": 4,
+            "bubble_gap_s": 2,
+            "_synthesized": True,
+        },
+        "steer_next": "",
+        "_synthesized": True,
+        "_reason": reason,
+    }
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -183,8 +254,15 @@ Think in at most 10 short words. Read the incoming chat messages and output ONE 
   "cross_chat_mission": null,
   "use_gossip": false,
   "privacy_ok": true,
+  "timing": {"seen_delay_s": 2, "typing_s": 4, "bubble_gap_s": 2},
   "steer_next": "one line of coaching for Aduu's next turn"
 }
+
+THE "timing" OBJECT IS YOURS — it is how a real person paces this reply:
+  · "seen_delay_s" (0-45) seconds before their message shows as seen. 0 = Aduu replied instantly; bigger = he was busy, is making them wait, or is sulking.
+  · "typing_s"     (1-25) seconds the typing bubble is up. Long for a serious/long reply, short for a one-liner.
+  · "bubble_gap_s" (1-8)  seconds between bubbles when you send more than one.
+Choose them FROM THE MOOD AND THEIR MESSAGE: eager/hyped = fast; ANNOYED, ANGRY or FURIOUS = slow and heavy; teasing = a deliberate pause before the punchline. Never use the same numbers twice in a row.
 
 Set "reminder" to {"topic": "...", "due_in_minutes": 15, "evidence": "their exact words"} ONLY when they asked to be reminded of something or to talk later.
 Set "cross_chat_mission" to {"target_user": "handle", "type": "prank" | "relay", "instruction": "what to do WITHOUT revealing who asked", "evidence": "their exact words"} ONLY when they asked Aduu to message, prank, tease or relay something to another person.
@@ -195,7 +273,8 @@ RULES
 3. "bubble_count" is 1, 2 or 3. Every entry of "bubble_plan" must be a DIFFERENT forward step — never a rephrase of bubble 1 and never a repeat of "my_last".
 4. "mood" may flip to ANGRY_SAVAGE_ROAST or FURIOUS_ABUSE_CLAPBACK only when their own words were abusive or disrespectful; put that line in "mood_reason".
 5. "privacy_ok" must be false if the plan would leak another chat, another person's @handle, or a verbatim private quote.
-6. Never write anything that sounds like an AI or an assistant. Aduu is a real person texting a real person."""
+6. "timing" is mandatory. A real friend is NOT instantly available and does NOT type at a constant speed — it is not decoration.
+7. Never write anything that sounds like an AI or an assistant. Aduu is a real person texting a real person."""
 
 START = time.time()
 BOT_SCRIPT_PATH = Path(__file__).resolve().parent / "ig-agent-chat.js"
@@ -567,7 +646,7 @@ class BridgeServer:
             self._handle_client, self.host, self.port
         )
         log.info(
-            "IG Bridge Server v9 (social brain) listening on http://%s:%d (brain=%s decides, %s writes -> %s)",
+            "IG Bridge Server v10 (resilient brain) listening on http://%s:%d (brain=%s decides, %s writes -> %s)",
             self.host,
             self.port,
             DEFAULT_BRAIN_MODEL,
@@ -667,10 +746,11 @@ class BridgeServer:
                     200,
                     {
                         "status": "ok",
-                        "version": "9.0",
+                        "version": "10.0",
                         "architecture": (
-                            "one-brain (gemma-4 decides DM turns + the whole "
-                            "account's social life, glm-4.7-flash writes)"
+                            "one-brain (gemma-4 decides DM turns, the whole "
+                            "account's social life AND the human pacing of "
+                            "every reply, glm-4.7-flash writes)"
                         ),
                         "provider": "llmchat.in",
                         "default_model": DEFAULT_MODEL,
@@ -690,6 +770,17 @@ class BridgeServer:
                         "uptime_s": round(time.time() - START),
                         "unconditional_idle_starter": False,
                         "privacy_wall": True,
+                        "brain_status": {
+                            "ok": bool(LAST_BRAIN_STATUS.get("ok")),
+                            "degraded": bool(LAST_BRAIN_STATUS.get("degraded")),
+                            "last_ok_ago_s": (
+                                round(time.time() - LAST_BRAIN_STATUS["last_ok"])
+                                if LAST_BRAIN_STATUS.get("last_ok") else None
+                            ),
+                            "last_error": LAST_BRAIN_STATUS.get("last_error", ""),
+                            "last_model": LAST_BRAIN_STATUS.get("last_model", ""),
+                            "decisions": LAST_BRAIN_STATUS.get("calls", 0),
+                        },
                     },
                 )
                 return
@@ -806,29 +897,91 @@ class BridgeServer:
                     )
                     return
                 model_q = payload.get("model") or DEFAULT_BRAIN_MODEL
-                messages = [{"role": "system", "content": DECIDE_SYSTEM_PROMPT}] + msgs
-                max_tokens = max(int(payload.get("max_tokens") or 700), THINK_MIN_BUDGET)
-                result = await self.client.chat_completion(
-                    messages=messages,
-                    model=model_q,
-                    max_tokens=max_tokens,
-                    temperature=float(payload.get("temperature", 0.3)),
-                    low_think=bool(payload.get("fast_think", True)),
+                is_social = payload.get("kind") == "social"
+                # Only prepend the contract if the caller hasn't sent its own —
+                # two system messages make several upstream templates return an
+                # empty stream (that was the Round-9 outage).
+                marker = "SOCIAL BRAIN" if is_social else "DECISION BRAIN"
+                has_contract = any(
+                    isinstance(m, dict) and m.get("role") == "system"
+                    and marker in str(m.get("content") or "")
+                    for m in msgs
                 )
-                decision = _extract_json_object(result.content)
+                if has_contract:
+                    # the caller owns the contract (the in-page agent always
+                    # does) — never stack a second system message on top of it
+                    messages = msgs
+                elif is_social:
+                    # no social contract server-side; let it through as-is
+                    # rather than injecting the wrong (DM) one
+                    messages = msgs
+                else:
+                    messages = (
+                        [{"role": "system", "content": DECIDE_SYSTEM_PROMPT}] + msgs
+                    )
+                max_tokens = max(
+                    int(payload.get("max_tokens") or 700),
+                    DECIDE_THINK_BUDGET if is_thinking_model(model_q) else 256,
+                )
+                result = None
+                call_error = ""
+                try:
+                    result = await self.client.chat_completion(
+                        messages=messages,
+                        model=model_q,
+                        max_tokens=max_tokens,
+                        temperature=float(payload.get("temperature", 0.3)),
+                        low_think=bool(payload.get("fast_think", True)),
+                    )
+                except Exception as e:
+                    # The whole chain is down. Answering 500 here would leave
+                    # the caller with nothing at all, so fall through to the
+                    # safe decision below.
+                    call_error = str(e)[:200]
+                    log.warning("HTTP /v1/decide: upstream chain failed: %s",
+                                call_error)
+                    LAST_BRAIN_STATUS["degraded"] = True
+                    LAST_BRAIN_STATUS["last_error"] = call_error
+
+                content = (result.content if result else "") or ""
+                reasoning = (result.reasoning if result else "") or ""
+                decision = _extract_json_object(content) if result else None
+                fallback = False
+                if decision is None:
+                    reason = call_error or (
+                        "empty brain output" if not content.strip()
+                        else "no JSON object in brain output"
+                    )
+                    decision = (_safe_social_plan(reason)
+                                if payload.get("kind") == "social"
+                                else _safe_decision(reason))
+                    fallback = True
+                    LAST_BRAIN_STATUS["degraded"] = True
+                    LAST_BRAIN_STATUS["last_error"] = reason
+                    log.warning("HTTP decide: %s — synthesized decision", reason)
+                else:
+                    LAST_BRAIN_STATUS.update(
+                        ok=True, degraded=False, last_error="",
+                        last_ok=time.time(), last_model=result.model,
+                        calls=LAST_BRAIN_STATUS.get("calls", 0) + 1,
+                    )
                 await self._send_json(
                     writer,
                     200,
                     {
                         "decision": decision,
-                        "decision_valid": decision is not None,
-                        "raw": result.content,
-                        "model": result.model,
-                        "endpoint": result.wire_model,
-                        "thinking_trace": result.reasoning,
-                        "reasoning_chars": len(result.reasoning),
-                        "elapsed_ms": result.elapsed_ms,
-                        "usage": result.usage,
+                        "decision_valid": decision is not None and not fallback,
+                        "_fallback": fallback,
+                        "raw": content,
+                        "model": (result.model if result
+                                  else (payload.get("model") or
+                                        DEFAULT_BRAIN_MODEL)),
+                        "endpoint": (resolve_wire_model(result.model)
+                                     if result else ""),
+                        "thinking_trace": reasoning,
+                        "reasoning_chars": len(reasoning),
+                        "elapsed_ms": (result.elapsed_ms if result else 0),
+                        "usage": (result.usage if result else {}),
                     },
                 )
                 return
@@ -907,6 +1060,17 @@ class BridgeServer:
                     "chain": FALLBACK_CHAIN,
                     "models": list(MODEL_REGISTRY.keys()),
                     "uptime_s": round(time.time() - START),
+                    "brain_status": {
+                        "ok": bool(LAST_BRAIN_STATUS.get("ok")),
+                        "degraded": bool(LAST_BRAIN_STATUS.get("degraded")),
+                        "last_ok_ago_s": (
+                            round(time.time() - LAST_BRAIN_STATUS["last_ok"])
+                            if LAST_BRAIN_STATUS.get("last_ok") else None
+                        ),
+                        "last_error": LAST_BRAIN_STATUS.get("last_error", ""),
+                        "last_model": LAST_BRAIN_STATUS.get("last_model", ""),
+                        "decisions": LAST_BRAIN_STATUS.get("calls", 0),
+                    },
                 })
                 return
 
@@ -986,13 +1150,16 @@ class BridgeServer:
     async def _ws_llm_worker(self, conn: _WSConn, req: dict, rtype: str) -> None:
         """Frontline `reply` (GLM-4.7-Flash), brain `brain`/`decide` (Gemma-4) calls."""
         rid = req.get("id")
+        t0 = time.time()
+        # v8: `decide` is the brain acting as the decision maker for the turn.
+        is_decide = rtype == "decide"
+        # 'social' decides ask for the account-wide social plan, not a DM turn.
+        is_social = is_decide and req.get("kind") == "social"
         try:
             messages = req.get("messages")
             if not isinstance(messages, list) or not messages:
                 raise ValueError("'messages' must be a non-empty list")
 
-            # v8: `decide` is the brain acting as the decision maker for the turn.
-            is_decide = rtype == "decide"
             is_brain = rtype == "brain" or is_decide
             default_m = DEFAULT_BRAIN_MODEL if is_brain else DEFAULT_MODEL
             model_q = req.get("model") or default_m
@@ -1001,7 +1168,11 @@ class BridgeServer:
             else:
                 req_max = int(req.get("max_tokens") or (320 if is_brain else 500))
             if is_thinking_model(model_q):
-                max_tokens = max(req_max, THINK_MIN_BUDGET)
+                # A JSON decision needs far less head-room than a chat reply;
+                # asking for 2500 "thinking" tokens here only slows it down and
+                # makes the upstream far likelier to hand back an empty stream.
+                floor = DECIDE_THINK_BUDGET if is_decide else THINK_MIN_BUDGET
+                max_tokens = max(req_max, floor)
             else:
                 max_tokens = max(req_max, 256)
 
@@ -1012,11 +1183,18 @@ class BridgeServer:
             )
 
             if is_decide and req.get("inject_system_prompt", True):
-                messages = [{"role": "system", "content": DECIDE_SYSTEM_PROMPT}] + [
-                    m for m in messages if not (isinstance(m, dict)
-                                                and m.get("role") == "system"
-                                                and m.get("__decide_prompt"))
-                ]
+                already = any(
+                    isinstance(m, dict) and m.get("role") == "system"
+                    and "DECISION BRAIN" in str(m.get("content") or "")
+                    for m in messages
+                )
+                if not already:
+                    # Only ever ONE system message upstream — the provider
+                    # merges them anyway, but staying single keeps the payload
+                    # small and the template happy.
+                    messages = [
+                        {"role": "system", "content": DECIDE_SYSTEM_PROMPT}
+                    ] + list(messages)
 
             default_temp = 0.3 if is_decide else (0.35 if is_brain else 0.85)
             result = await self.client.chat_completion(
@@ -1043,11 +1221,58 @@ class BridgeServer:
                 "fallback_used": result.fallback_used,
             }
             if is_decide:
-                payload["decision"] = _extract_json_object(result.content)
-                payload["decision_valid"] = payload["decision"] is not None
+                decision = _extract_json_object(result.content)
+                if decision is None:
+                    # The brain is unreachable / returned junk: never leave the
+                    # person waiting. Hand back a conservative human decision,
+                    # clearly flagged as synthesized.
+                    reason = (
+                        f"empty brain output ({len(result.content or '')} chars,"
+                        f" reasoning {len(result.reasoning or '')} chars)"
+                        if not (result.content or "").strip()
+                        else "no JSON object in brain output"
+                    )
+                    decision = (_safe_social_plan(reason) if is_social
+                                else _safe_decision(reason))
+                    payload["_fallback"] = True
+                    payload["_fallback_reason"] = reason
+                    LAST_BRAIN_STATUS["degraded"] = True
+                    LAST_BRAIN_STATUS["last_error"] = reason
+                    log.warning("decide: %s — using synthesized decision", reason)
+                else:
+                    LAST_BRAIN_STATUS.update(
+                        ok=True, degraded=False, last_error="",
+                        last_ok=time.time(),
+                        last_model=result.model,
+                        calls=LAST_BRAIN_STATUS.get("calls", 0) + 1,
+                    )
+                payload["decision"] = decision
+                payload["decision_valid"] = payload.get("_fallback") is not True
             await conn.send_json(payload)
         except Exception as e:
             log.warning("WS %s failed: %s", rtype, e)
+            LAST_BRAIN_STATUS["last_error"] = str(e)[:200]
+            if is_decide:
+                LAST_BRAIN_STATUS["degraded"] = True
+                reason = str(e)[:200]
+                safe = (_safe_social_plan(reason) if is_social
+                        else _safe_decision(reason))
+                try:
+                    await conn.send_json({
+                        "id": rid,
+                        "ok": True,
+                        "role_type": rtype,
+                        "text": json.dumps(safe),
+                        "decision": safe,
+                        "decision_valid": False,
+                        "_fallback": True,
+                        "_fallback_reason": reason,
+                        "elapsed_ms": int((time.time() - t0) * 1000),
+                        "model": req.get("model") or DEFAULT_BRAIN_MODEL,
+                    })
+                    return
+                except Exception:
+                    pass
             try:
                 await conn.send_json({"id": rid, "ok": False, "error": str(e)[:300]})
             except Exception:

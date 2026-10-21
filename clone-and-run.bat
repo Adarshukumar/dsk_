@@ -1,9 +1,9 @@
 @echo off
 setlocal EnableDelayedExpansion
-title IG-Agent v9 — Clone and Run (Gemma-4 Brain: DMs + stories + comments + notes)
+title IG-Agent v10 — Clone and Run (Gemma-4 Brain: DMs + social life + human pacing)
 
 echo ======================================================================
-echo   IG-Agent v9 SOCIAL BRAIN — Auto Clone, Setup and Start
+echo   IG-Agent v10 RESILIENT BRAIN — Auto Clone, Setup and Start
 echo   Default active targets: adarshu.io, deeps20_
 echo ======================================================================
 

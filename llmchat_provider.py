@@ -21,6 +21,7 @@ v7 Multi-Model Architecture (GLM-4.7-Flash + Gemma-4-26B Brain + Qwen3-30B):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -247,6 +248,7 @@ class LLMChatClient:
         self._session: AsyncSession | None = None
         self._session_lock = asyncio.Lock()
         self._loop = None          # event loop the cached session belongs to
+        self._last_empty_digest = ""  # dedupes identical empty-body logs
 
     async def _get_session(self) -> AsyncSession:
         loop = asyncio.get_running_loop()
@@ -306,6 +308,16 @@ class LLMChatClient:
                 continue
             if line.startswith("data:"):
                 data_str = line[5:].strip()
+            elif line.startswith("delta:"):
+                # GLM-4.7-Flash pitches some chunks with a bare `delta:` key
+                data_str = line[6:].strip()
+            elif line.startswith("event:"):
+                continue
+            elif line[0] in "{[":
+                # Some upstreams drop the SSE prefix entirely and stream raw
+                # JSON objects. Accepting them keeps the brain alive instead of
+                # silently returning ("", "").
+                data_str = line
             else:
                 continue
 
@@ -320,8 +332,23 @@ class LLMChatClient:
             if not isinstance(packet, dict):
                 continue
 
+            # An upstream that answers with an error object instead of a stream
+            # must say so loudly rather than looking like an empty completion.
+            if (packet.get("success") is False or packet.get("error")):
+                msg = packet.get("error") or packet.get("message") or "unknown"
+                if isinstance(msg, dict):
+                    msg = json.dumps(msg)[:200]
+                raise RuntimeError(f"upstream error packet: {str(msg)[:200]}")
+
             if isinstance(packet.get("usage"), dict) and packet["usage"]:
                 usage = packet["usage"]
+
+            # An upstream error object must not look like an empty completion.
+            if packet.get("success") is False or packet.get("error"):
+                msg = packet.get("error") or packet.get("message") or "unknown"
+                if isinstance(msg, dict):
+                    msg = json.dumps(msg)[:200]
+                raise RuntimeError(f"upstream error packet: {str(msg)[:200]}")
 
             choices = packet.get("choices")
             if isinstance(choices, list) and choices:
@@ -345,6 +372,43 @@ class LLMChatClient:
                     c = msg.get("content")
                     if isinstance(c, str) and c:
                         content_parts.append(c)
+                    rc = msg.get("reasoning_content") or msg.get("reasoning")
+                    if isinstance(rc, str) and rc:
+                        reasoning_parts.append(rc)
+            elif isinstance(packet.get("delta"), dict):
+                # Chunk-level delta arriving at the top of the packet rather
+                # than inside choices[].
+                d = packet["delta"]
+                rc = d.get("reasoning_content")
+                if rc is None:
+                    rc = d.get("reasoning")
+                if isinstance(rc, str) and rc:
+                    reasoning_parts.append(rc)
+                c = d.get("content")
+                if isinstance(c, str) and c:
+                    content_parts.append(c)
+            elif ("content" in packet or "reasoning_content" in packet
+                  or "reasoning" in packet):
+                # The frame IS the delta (some upstreams stream the raw delta
+                # object with no `choices` wrapper at all).
+                d = packet
+                rc = d.get("reasoning_content")
+                if rc is None:
+                    rc = d.get("reasoning")
+                if isinstance(rc, str) and rc:
+                    reasoning_parts.append(rc)
+                c = d.get("content")
+                if isinstance(c, str) and c:
+                    content_parts.append(c)
+            elif isinstance(packet.get("message"), dict):
+                msg = packet["message"]
+                c = msg.get("content")
+                if isinstance(c, str) and c:
+                    content_parts.append(c)
+            elif isinstance(packet.get("text"), str) and packet["text"]:
+                content_parts.append(packet["text"])
+            elif isinstance(packet.get("output_text"), str) and packet["output_text"]:
+                content_parts.append(packet["output_text"])
             elif "response" in packet and isinstance(packet["response"], str):
                 # Only use top-level "response" when "choices" is absent or empty
                 if packet["response"]:
@@ -364,6 +428,49 @@ class LLMChatClient:
 
         return content.strip(), reasoning.strip(), usage
 
+    @staticmethod
+    def _merge_system_messages(
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """
+        Collapse every leading/consecutive run of `system` messages into ONE.
+
+        Why: Cloudflare's chat template (what llmchat.in proxies to) silently
+        drops or mangles prompts that carry more than one system message — the
+        model then returns an empty stream with reasoning=0. The brain's
+        `decide` path was the only caller that produced two system messages
+        (its own contract + the injected one), which is exactly why only that
+        call kept coming back empty.
+        """
+        out: list[dict[str, str]] = []
+        pending: list[str] = []
+
+        def flush() -> None:
+            if pending:
+                merged = "\n\n".join(p for p in pending if p)
+                out.append({"role": "system", "content": merged})
+                pending.clear()
+
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content") or ""
+            if role == "system":
+                pending.append(str(content))
+                continue
+            flush()
+            out.append(dict(m))
+        flush()
+        # never leave a system-only or empty request behind
+        if not out:
+            out = [{"role": "user", "content": "hello"}]
+        if all(m.get("role") == "system" for m in out):
+            last = out[-1]
+            out.append({"role": "user",
+                        "content": str(last.get("content") or "Continue.")[:4000]})
+        return out
+
     async def _request_once(
         self,
         messages: list[dict[str, str]],
@@ -374,7 +481,7 @@ class LLMChatClient:
     ) -> tuple[str, str, dict[str, Any]]:
         session = await self._get_session()
 
-        prepared_messages = [dict(m) for m in messages]
+        prepared_messages = self._merge_system_messages(messages)
         if low_think and prepared_messages:
             # GLM-4.7-Flash: inject minimal-thinking directive so it doesn't write
             # a 7-step markdown outline in reasoning_content
@@ -420,7 +527,32 @@ class LLMChatClient:
                 f"llmchat.in HTTP {resp.status_code} for {wire_model}: {body_preview}"
             )
 
-        return self._parse_sse(resp.text or "")
+        raw = resp.text or ""
+        content, reasoning, usage = self._parse_sse(raw)
+        if not content.strip():
+            # Surface WHY the stream was empty instead of silently burning
+            # every model in the chain (rate limits, template rejects, 429s…).
+            # The raw body is the whole point: it is the only thing that tells
+            # you what the upstream actually changed.
+            digest = hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:8]
+            if digest == self._last_empty_digest:
+                log.warning(
+                    "empty stream from %s (max_tokens=%d, msgs=%d) — same raw "
+                    "body as before [sha %s, %d chars]",
+                    wire_model, max_tokens, len(prepared_messages),
+                    digest, len(raw),
+                )
+            else:
+                self._last_empty_digest = digest
+                log.warning(
+                    "empty stream from %s (max_tokens=%d, temp=%.2f, msgs=%d, "
+                    "ct=%s) — raw[%d chars, sha %s]: %r",
+                    wire_model, max_tokens, temperature, len(prepared_messages),
+                    (resp.headers.get("content-type", "") if hasattr(resp, "headers")
+                     else ""),
+                    len(raw), digest, raw[:600],
+                )
+        return content, reasoning, usage
 
     async def chat_completion(
         self,
@@ -449,8 +581,20 @@ class LLMChatClient:
         last_error: Exception | None = None
         last_reasoning: str = ""
 
+        # Retries get more head-room, but bounded RELATIVE TO WHAT WAS ASKED.
+        # A 900-token decision must not creep up to a 4096-token one just
+        # because the chain kept failing — that only makes it slower.
+        base_max_tokens = max_tokens
+        retry_ceiling = min(max(int(base_max_tokens * 2.0) + 400, 1200), 4096)
+
         for idx, cand_short in enumerate(candidate_models):
             wire_model = resolve_wire_model(cand_short)
+            if idx > 0:
+                # Breathe before switching models — most upstream empties are
+                # rate limits and hammering the next model makes it worse.
+                # Kept small (capped) so a fully dead chain still fails fast
+                # instead of leaving the person staring at a silent chat.
+                await asyncio.sleep(min(0.4 * idx, 1.0))
             for attempt in range(retries_per_model):
                 try:
                     content, reasoning, usage = await self._request_once(
@@ -491,7 +635,11 @@ class LLMChatClient:
                             len(reasoning),
                             attempt + 1,
                         )
-                    max_tokens = max(max_tokens, 2500)
+                    # Give the retry more room — but proportionally, and never
+                    # more than the upstream can actually emit. (The old fixed
+                    # floor of 2500 turned a 900-token decision into a slow
+                    # 2500-token one, which only made empties more likely.)
+                    max_tokens = min(int(max_tokens * 1.5) + 400, retry_ceiling)
                 except Exception as exc:
                     last_error = exc
                     log.warning(

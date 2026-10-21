@@ -1,4 +1,4 @@
-# IG Agent — Aduu, the Autonomous Social Brain on Instagram (v9)
+# IG Agent — Aduu, the Autonomous Social Brain on Instagram (v10)
 
 An autonomous Instagram agent. People message the account and **Aduu** responds
 how a real person responds in reality — and the same brain also runs the whole
@@ -6,11 +6,17 @@ account's social life: it watches the story tray, reacts to a story when one
 deserves it, comments on a post, answers a comment on Aduu's own post, sends a
 DM out of the blue, and writes the **Instagram NOTE**.
 
-> **v9 — one brain, the whole account.**
+> **v10 — one brain, the whole account, and it never goes silently dead.**
 > The Gemma-4 brain is the single decision maker. For every DM turn it returns a
-> strict JSON decision that owns that turn. On a slow social cycle it returns a
-> strict JSON plan that owns the account. GLM-4.7-Flash only **writes** what the
-> brain decided.
+> strict JSON decision that owns that turn — **including the human pacing of the
+> reply**. On a slow social cycle it returns a strict JSON plan that owns the
+> account. GLM-4.7-Flash only **writes** what the brain decided.
+>
+> **Resilient by design.** v9 died silently when llmchat.in changed: every model
+> returned empty content and nobody could tell why. v10 fixes the root cause
+> (see [What changed in v10](#what-changed-in-v10)), makes every failure
+> diagnosable in the log, and — if the whole upstream really is down — still
+> answers like a human instead of leaving the person hanging.
 >
 > **Rare by design.** A real person scrolls past almost everything. The social
 > brain observes every 45–120 minutes, and the runtime lets at most **one**
@@ -25,6 +31,55 @@ DM out of the blue, and writes the **Instagram NOTE**.
 > **Version archives:** [`v5/`](./v5) and [`v6/`](./v6) hold the previous
 > generations. The story/comment/notes primitives were ported in from the
 > experimental `arena/71d3f44b-dsk` branch and rebuilt brain-first here.
+
+---
+
+## What changed in v10
+
+This is the **outage fix** release. Symptom in production:
+
+```
+14:10:01 [WARNING] Model @cf/google/gemma-4-26b-a4b-it returned empty content (reasoning=0 chars) on attempt 1
+14:10:12 [WARNING] ... attempt 2
+14:10:23 [WARNING] Model @cf/zai-org/glm-4.7-flash returned empty content (reasoning=0 chars) on attempt 1
+14:10:32 [WARNING] ... attempt 2
+```
+
+`reasoning=0 chars` on **every** model meant the upstream was answering with a
+`200` whose body yielded neither content nor reasoning — and two things made it
+unrecoverable.
+
+| Root cause / gap | v10 |
+|---|---|
+| **The `decide` path sent TWO `system` messages** — the page's own contract *and* the server-injected one. It was the only call in the whole system that did this, and it was the only one that kept coming back empty. Cloudflare-style chat templates silently drop multi-system prompts. | `_merge_system_messages()` collapses **every** run of `system` messages into exactly one, in the provider, before anything goes on the wire. The server also no longer stacks its contract on top of the page's. |
+| **The failure was invisible.** `chat_completion()` never logged the status code, content-type, or the raw body — so nobody could see *what* had changed. | Every empty stream now logs the model, `max_tokens`, temperature, message count, **content-type** and the **first 600 chars of the raw body**, with a SHA so repeat bodies are collapsed to one line. |
+| A wire-format change turned into `("", "")` — indistinguishable from a slow model. | `_parse_sse()` now also reads bare-JSON frames (no `data:` prefix), `delta:` keys, top-level `message` / `delta` / `text` / `output_text` objects, and **raises** on `{"success": false, "error": …}` instead of masquerading as empty. |
+| The whole chain dead ⇒ **nothing happened** and the person waited forever. | A dead brain returns a **safe synthesized decision** (`REPLY`, neutral mood, 1 bubble, human pacing, `privacy_ok`, no invented tasks) — and a dead *social* brain returns `observe` with **zero actions**. Never a blind DM or comment. |
+| A 700-token decision asked for a 2500-token think budget, and retries inflated it to 4096. | Decisions use `DECIDE_THINK_BUDGET` (900); retries grow proportionally and are capped relative to what was asked. |
+| No way to see whether the brain was healthy. | `/health` and `IGAgent.brainStatus()` report `brain_status`: `ok`, `degraded`, `last_error`, `decisions`, `last_ok_ago_s`. |
+| **Timing was still hard-coded** — seen delay, typing duration and bubble gaps were random constants. | The brain owns the pacing: `"timing": {"seen_delay_s", "typing_s", "bubble_gap_s"}`, clamped to human bounds, chosen from the mood. |
+
+### Diagnosing the next upstream change
+
+```bash
+python probe_llmchat.py                 # probe every model, print status + raw body
+python probe_llmchat.py --raw out.txt   # also dump the raw bodies to a file
+python probe_llmchat.py glm-4.7-flash   # one model only
+```
+
+For each model it prints HTTP status, content-type, SSE line count, parsed
+content/reasoning lengths, and the raw response. **Paste the raw body and the
+wire-format problem is obvious.**
+
+You can also reproduce every failure mode locally with the offline mock:
+
+```bash
+python tests/mock_llmchat.py --port 8899 --silent-all     # every model empty
+python tests/mock_llmchat.py --port 8899 --challenge      # HTML interstitial
+python tests/mock_llmchat.py --port 8899 --error-packet   # {"success":false}
+python tests/mock_llmchat.py --port 8899 --bare-json      # no `data:` prefix
+LLMCHAT_BASE_URL=http://127.0.0.1:8899 python server.py
+```
 
 ---
 
@@ -50,7 +105,7 @@ task-driven reminders, secret cross-chat pranks, the privacy wall, logical
 ```
  instagram.com tab                     your machine                            internet
 ┌──────────────────────────┐  WebSocket ┌─────────────────────────┐   SSE   ┌──────────────────────────────┐
-│ ig-agent-chat.js (v9)    │ ─────────► │ server.py :8787         │ ──────► │ llmchat.in (no API key)      │
+│ ig-agent-chat.js (v10)   │ ─────────► │ server.py :8787         │ ──────► │ llmchat.in (no API key)      │
 │                          │ ws://local │ + llmchat_provider.py   │  stream │ • @cf/google/gemma-4-26b     │
 │  ONE BRAIN, TWO LOOPS    │            │ • /v1/decide  (brain)   │         │   THE DECISION MAKER         │
 │                          │            │ • /v1/chat/completions  │ ◄────── │ • @cf/zai-org/glm-4.7-flash  │
@@ -65,12 +120,12 @@ task-driven reminders, secret cross-chat pranks, the privacy wall, logical
 └──────────────────────────┘
    │ Instagram surface: GraphQL DM + notes tray + comments,
    │ private REST: story tray · user feed · media comments
-   └─ transcripts/<user>.json (9.0-social-brain) + _social_brain.json (diary)
+   └─ transcripts/<user>.json (10.0-brain-resilient) + _social_brain.json (diary)
 ```
 
 ---
 
-## A · The DM turn decision (v8, unchanged contract)
+## A · The DM turn decision (+ v10 `timing`)
 
 ```jsonc
 {
@@ -90,9 +145,25 @@ task-driven reminders, secret cross-chat pranks, the privacy wall, logical
                                  "instruction": "…", "evidence": "adarshu.io ko bol do"},
   "use_gossip": false,
   "privacy_ok": true,
+  "timing": {"seen_delay_s": 2, "typing_s": 4, "bubble_gap_s": 2},
   "steer_next": "one line of coaching for Aduu's next turn"
 }
 ```
+
+**v10 · the brain owns the pacing.** A real friend is not instantly available
+and does not type at a constant speed, so `timing` is decided from the mood and
+their message — eager/hyped is fast, ANNOYED/ANGRY/FURIOUS is slow and heavy,
+teasing leaves a deliberate pause before the punchline.
+
+| field | range | what it controls |
+|---|---|---|
+| `seen_delay_s` | 0–45 | seconds before their message shows as seen. `0` = replied instantly; bigger = Aduu was busy, is making them wait, or is sulking. |
+| `typing_s` | 1–25 | seconds the typing bubble is up. Long for a serious reply, short for a one-liner. |
+| `bubble_gap_s` | 1–8 | seconds between bubbles when more than one is sent. |
+
+Values are clamped to those bounds (absurd numbers are not trusted), and when
+the field is missing the runtime falls back to a natural random jitter — with
+heavy moods waiting longer than light ones by default.
 
 The **evidence gate**: a reminder or secret prank is accepted only when it
 quotes a line the person actually sent (`evidenceScore ≥ 0.4`). Decisions the
@@ -100,7 +171,7 @@ chat does not support are thrown away — the messages are what make Aduu act.
 
 ---
 
-## B · The social brain (v9)
+## B · The social brain (v9, unchanged)
 
 ### The loop it designed for itself
 
@@ -266,24 +337,26 @@ With no reminder and no mission queued, Aduu **stays quiet on purpose** —
 
 ---
 
-## Repo layout (flat — this folder *is* the v9 project)
+## Repo layout (flat — this folder *is* the v10 project)
 
 | Path | What it is |
 |---|---|
 | `llmchat_provider.py` | Async llmchat.in client — GLM-4.7-Flash / Gemma-4 / Qwen3 SSE parsing, minimal-think injection, glitch guard, auto fallback |
-| `server.py` | v9 bridge — HTTP (`/health`, `/v1/models`, `/v1/chat/completions`, `/inference/stream`, `/v1/decide`, **`/social-brain`**, `/transcripts`, `/global-memory`) **and** WebSocket (`/ws` with `reply` / `brain` / `decide` / **`save_social`** / **`get_social`**) |
+| `server.py` | v10 bridge — HTTP (`/health`, `/v1/models`, `/v1/chat/completions`, `/inference/stream`, `/v1/decide`, **`/social-brain`**, `/transcripts`, `/global-memory`) **and** WebSocket (`/ws` with `reply` / `brain` / `decide` / **`save_social`** / **`get_social`**) |
 | `ig-agent-chat.js` | The in-page agent — one Gemma-4 brain (DM turns + social loop), GLM writer, isolation engine, mood engine, reminder scheduler, mission runner, notes |
 | `v5/`, `v6/` | Full archives of the previous generations |
 | `clone-and-run.bat` | Windows one-click: clone → install → copy to clipboard → start |
 | `clone-and-run.sh` | Linux / macOS / Git Bash one-command launcher |
 | `run.py` | Cross-platform Python starter (keeps the bridge running non-stop) |
-| `tests/mock_llmchat.py` | Offline mock of GLM-4.7-Flash / Gemma-4 / Qwen3 SSE + the decision brain |
+| `probe_llmchat.py` | **v10** · hits the real llmchat.in and prints each model's HTTP status, content-type and RAW body — use it when the upstream changes |
+| `tests/mock_llmchat.py` | Offline mock of GLM-4.7-Flash / Gemma-4 / Qwen3 SSE + the decision brain, plus the v10 outage modes (`--silent-all`, `--challenge`, `--error-packet`, `--bare-json`, `--delta-key`, `--message-obj`) |
 | `tests/test_pipeline.py` | Provider + bridge + WebSocket + `/v1/decide` + social-brain diary (offline) |
+| `tests/test_resilience.py` | **v10** · the outage suite — single-system-message rule, parser format changes, dead-brain fallbacks, brain health |
 | `tests/test_bot_flow.js` | Full page pipeline: brain decisions, isolation, rarity gates, notes, stories, moods, reminders, missions |
 | `tests/test_humanize.js` | Humanizer, persona, config, state migration, engine units |
 | `tests/live_check.py` | Live llmchat.in check (`--decide` for the brain) |
 | `vendor/ig-human/` | MIT lexicon from jakeschincariol/instagram-agent-skill |
-| `transcripts/` | Per-contact `9.0-social-brain` JSON + `_global_memory.json` + **`_social_brain.json`** |
+| `transcripts/` | Per-contact `10.0-brain-resilient` JSON + `_global_memory.json` + **`_social_brain.json`** |
 | `requirements.txt` | `curl_cffi` — the only runtime dependency |
 
 ---
@@ -341,6 +414,8 @@ IGAgent.notes() · IGAgent.deleteNote() · IGAgent.noteNow()
 /* ── v8 · BRAIN ── */
 IGAgent.why('deeps20_')          // the brain's last JSON decision + its evidence line
 IGAgent.decide('deeps20_')       // ask the brain to decide that chat right now
+IGAgent.brainStatus()            // v10 · is the decision brain actually answering?
+                                 //   → {ok, degraded, last_error, decisions, last_ok_ago_s, ...}
 IGAgent.brainMode(false)         // fall back to the old local rules
 IGAgent.brainSilence(false)      // never let the brain leave a burst unanswered
 
@@ -386,11 +461,11 @@ IGAgent.linkFriends('adarshu.io', 'deeps20_') · IGAgent.addGossip('…')
 
 ## Saved format
 
-### `transcripts/<user>.json` — schema `9.0-social-brain`
+### `transcripts/<user>.json` — schema `10.0-brain-resilient`
 
 ```jsonc
 {
-  "schema_version": "9.0-social-brain",
+  "schema_version": "10.0-brain-resilient",
   "models": { "answering_model": "@cf/zai-org/glm-4.7-flash",
               "brain_model": "@cf/google/gemma-4-26b-a4b-it" },
   "agent_state": { "relationship_stage": "flirty-banter", "proactive_streak": 0, … },
@@ -407,11 +482,11 @@ IGAgent.linkFriends('adarshu.io', 'deeps20_') · IGAgent.addGossip('…')
 }
 ```
 
-### `transcripts/_social_brain.json` — schema `9.0-social-brain-log`
+### `transcripts/_social_brain.json` — schema `10.0-brain-resilient-log`
 
 ```jsonc
 {
-  "schema_version": "9.0-social-brain-log",
+  "schema_version": "10.0-brain-resilient-log",
   "updated_at": "2026-10-21T…",
   "config": { "enabled": true, "dry_run": false, "notes_mode": "agentic",
               "watch": ["deeps20_"], "comment_targets": [], "story_targets": ["deeps20_"] },
@@ -434,13 +509,41 @@ IGAgent.linkFriends('adarshu.io', 'deeps20_') · IGAgent.addGossip('…')
 ## Tests
 
 ```bash
-node tests/test_humanize.js     # 32 passed
-node tests/test_bot_flow.js     # 51 passed
-python tests/test_pipeline.py   # 5 passed   (needs curl_cffi)
+node tests/test_humanize.js        #  32 passed
+node tests/test_bot_flow.js        #  56 passed
+python tests/test_pipeline.py      #   5 passed   (needs curl_cffi)
+python tests/test_resilience.py    #  12 passed   ← the v10 outage suite
 ```
 
-All suites run fully offline against `tests/mock_llmchat.py`, which also
+**105 tests, fully offline** against `tests/mock_llmchat.py`, which also
 impersonates the decision brain.
+
+`tests/test_resilience.py` exists so the v10 outage can never come back
+silently. It asserts, at the wire level, that:
+
+- N `system` messages collapse to exactly **1** before any upstream call
+- the server never double-injects the decide contract
+- the parser survives bare-JSON, `delta:` keys, `message` objects and HTML
+- an upstream `{"success": false}` **raises** instead of looking empty
+- an empty stream logs the model + content-type + raw body
+- a totally dead brain still returns a usable DM decision
+- a totally dead social brain observes and does **nothing**
+- a healthy brain carries **no** fallback flags
+- decisions ask for a small think budget, replies keep the big one
+- an HTML interstitial fails fast
+- the 500/glitch fallback chain still works
+
+### Reproducing the outage locally
+
+```bash
+python tests/mock_llmchat.py --port 8899 --silent-all
+LLMCHAT_BASE_URL=http://127.0.0.1:8899 IG_BRIDGE_PORT=8787 python server.py
+# then paste ig-agent-chat.js into Instagram, or:
+curl -X POST localhost:8787/v1/decide -H 'Content-Type: application/json' \
+     -d '{"messages":[{"role":"user","content":"bol na"}]}'
+# → {"decision":{"action":"REPLY", ...}, "_fallback": true, ...}
+#   and /health reports brain_status.degraded = true
+```
 
 ---
 
@@ -456,5 +559,12 @@ impersonates the decision brain.
   line the person actually sent.
 * **Isolation gate** — no handle, no quote, no private line ever crosses chats.
 * **Rarity gate** — the social brain is capped, cooled down and quiet at night.
+* **One-system-message rule** — no request ever puts two `system` messages on
+  the wire, so a template that drops them cannot silently kill the brain.
+* **Dead-brain gate** — if every upstream model returns nothing, the reply is
+  still human (or the social cycle does nothing at all). **Never** a blind DM,
+  comment or note, and **never** an invented reminder or prank.
+* **Diagnosable failures** — every empty stream is logged with the model, the
+  content-type and the raw body, and `/health` carries `brain_status`.
 * Zero AI mention, ever: Aduu never breaks character.
 * Errors are swallowed and retried, never surfaced — it runs non-stop.

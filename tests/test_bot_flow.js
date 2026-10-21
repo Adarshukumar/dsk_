@@ -686,6 +686,76 @@ const check = (name, fn) => {
     assert(w.decision, 'decision JSON missing');
   });
 
+  /* ═════════════════════ v10 · THE BRAIN OWNS THE PACING ═════════════════
+     Mood, words, silence, reminders and pranks were already the brain's. The
+     one thing still hard-coded was TIME: how long before their message shows
+     as seen, how long the typing bubble is up, and the gap between bubbles.
+     A real friend is not instantly available and does not type at a constant
+     speed, so the brain decides those too.
+     ══════════════════════════════════════════════════════════════════════ */
+  const PD = api._debug.parseDecisionJson;
+  const baseDec = { action: 'REPLY', mood: 'PLAYFUL_CHILL', bubble_count: 2,
+                    bubble_plan: ['one', 'two'] };
+  const decTiming = (extra, mood) => PD(JSON.stringify(Object.assign({}, baseDec, extra)),
+    { joined: 'bol na kya scene hai', trigger: 'incoming_burst', user: 'deeps20_' });
+
+  check('v10 · brain timing is honoured exactly', () => {
+    const d = decTiming({ timing: { seen_delay_s: 12, typing_s: 9, bubble_gap_s: 3 } });
+    assert(d, 'decision not parsed');
+    assert.strictEqual(d.timing.seen_delay_ms, 12_000, d.timing.seen_delay_ms);
+    assert.strictEqual(d.timing.typing_ms, 9_000, d.timing.typing_ms);
+    assert.strictEqual(d.timing.bubble_gap_ms, 3_000, d.timing.bubble_gap_ms);
+    assert.strictEqual(d.timing.source, 'gemma-4-brain', d.timing.source);
+  });
+
+  check('v10 · absurd timings are clamped to human bounds', () => {
+    const c = decTiming({ timing: { seen_delay_s: 9999, typing_s: -4, bubble_gap_s: 0 } });
+    assert(c.timing.seen_delay_ms <= 45_000, 'seen not clamped: ' + c.timing.seen_delay_ms);
+    assert(c.timing.seen_delay_ms >= 0, 'seen went negative');
+    assert(c.timing.typing_ms >= 1_000, 'typing not clamped: ' + c.timing.typing_ms);
+    assert(c.timing.typing_ms <= 25_000, 'typing too long: ' + c.timing.typing_ms);
+    assert(c.timing.bubble_gap_ms >= 1_000, 'gap not clamped: ' + c.timing.bubble_gap_ms);
+    assert(c.timing.bubble_gap_ms <= 8_000, 'gap too long: ' + c.timing.bubble_gap_ms);
+  });
+
+  check('v10 · missing timing falls back to natural jitter (flagged)', () => {
+    const n = decTiming({});
+    assert.strictEqual(n.timing.source, 'default-jitter', n.timing.source);
+    assert(n.timing.seen_delay_ms > 0, 'no jitter: ' + n.timing.seen_delay_ms);
+    assert(n.timing.typing_ms >= 1_500, 'typing too short: ' + n.timing.typing_ms);
+    // jitter must actually vary, not be a constant
+    const seen = new Set();
+    for (let i = 0; i < 25; i++) seen.add(decTiming({}).timing.seen_delay_ms);
+    assert(seen.size > 5, `jitter is constant (${seen.size} distinct values)`);
+  });
+
+  check('v10 · heavy moods wait longer than light ones by default', () => {
+    let angry = 0, chill = 0;
+    for (let i = 0; i < 20; i++) {
+      angry += decTiming({ mood: 'ANGRY_SAVAGE_ROAST' }).timing.seen_delay_ms;
+      chill += decTiming({}).timing.seen_delay_ms;
+    }
+    assert(angry / 20 > chill / 20,
+      `angry ${Math.round(angry / 20)}ms should exceed chill ${Math.round(chill / 20)}ms`);
+  });
+
+  check('v10 · a synthesized (dead-brain) decision is safe and still replies', () => {
+    // exactly what the bridge returns when every upstream model is empty
+    const d = PD(JSON.stringify({
+      action: 'REPLY', mood: 'PLAYFUL_CHILL', bubble_count: 1,
+      bubble_plan: ['reply naturally'], use_gossip: false, privacy_ok: true,
+      timing: { seen_delay_s: 2, typing_s: 4, bubble_gap_s: 2 },
+      _synthesized: true, _reason: 'empty brain output',
+    }), { joined: 'bol na', trigger: 'incoming_burst', user: 'deeps20_' });
+    assert(d, 'synthesized decision was rejected');
+    assert.strictEqual(d.action, 'REPLY', d.action);
+    assert.strictEqual(d.bubble_count, 1, d.bubble_count);
+    assert(!d.reminder, 'safe decision must not invent a reminder');
+    assert(!d.cross_chat_mission, 'safe decision must not invent a mission');
+    assert.strictEqual(d.privacy_ok, true, 'safe decision must never leak');
+    assert(d.timing && d.timing.seen_delay_ms > 0, 'safe decision needs human timing');
+  });
+
   /* ═════════════════════ v9 · SOCIAL BRAIN ═════════════════════
      The same Gemma-4 brain runs stories, comments, comment replies,
      out-of-the-blue DMs and the Instagram NOTE — rarely, and with a hard
@@ -869,7 +939,7 @@ const check = (name, fn) => {
   check('social · the cycle is mirrored to the bridge for _social_brain.json', () => {
     assert(SOCIAL_SAVES.length >= 1, 'social brain log never saved');
     const last = SOCIAL_SAVES[SOCIAL_SAVES.length - 1];
-    assert.strictEqual(last.schema_version, '9.0-social-brain-log');
+    assert.strictEqual(last.schema_version, '10.0-brain-resilient-log');
     assert(Array.isArray(last.cycles) && last.cycles.length >= 1);
     assert(Array.isArray(last.action_log));
   });

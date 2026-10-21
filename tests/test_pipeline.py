@@ -331,7 +331,7 @@ def test_server_bridge(mock):
 
             # v7 transcript save (mood_state + reminders + missions + process_log)
             send({"id": "s1", "type": "save", "transcript": {
-                "schema_version": "9.0-social-brain",
+                "schema_version": "10.0-brain-resilient",
                 "user": "_pipeline_test", "thread_fbid": "0",
                 "models": {"answering_model": "zai-org/glm-4.7-flash",
                            "brain_model": "google/gemma-4-26b-a4b-it"},
@@ -359,7 +359,7 @@ def test_server_bridge(mock):
 
             # v9: the social brain's diary over the WebSocket
             send({"id": "sb1", "type": "save_social", "social": {
-                "schema_version": "9.0-social-brain-log",
+                "schema_version": "10.0-brain-resilient-log",
                 "config": {"enabled": True, "dry_run": True, "notes_mode": "agentic"},
                 "action_log": [{"kind": "note", "target": "", "text": "chai aur code"}],
                 "note_log": [{"text": "chai aur code", "reason": "calm evening"}],

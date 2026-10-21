@@ -50,7 +50,7 @@ check('config · Gemma-4 brain decides + GLM-4.7-Flash writes', () => {
   assert.strictEqual(api.config.PRIVACY_WALL, true);
   assert.strictEqual(api.config.HUMANIZE, true);
   assert.strictEqual(api.config.MAX_REPLY_CHARS, 300);
-  assert.strictEqual(api.config.PERSONA_VERSION, 9);
+  assert.strictEqual(api.config.PERSONA_VERSION, 10);
 });
 
 check('config · v9 SOCIAL BRAIN is off, dry-run, rare and note-aware', () => {
