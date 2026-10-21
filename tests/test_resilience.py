@@ -55,6 +55,8 @@ from mock_llmchat import (                                # noqa: E402
     build_silent_stream, build_challenge_page, build_error_packet_stream,
     build_bare_json_stream, build_delta_key_stream,
     build_top_level_message_stream, count_system_messages,
+    build_live_envelope_stream, build_live_plain_stream,
+    build_live_double_envelope_stream, build_live_sse_envelope_stream,
 )
 from test_pipeline import (                               # noqa: E402
     check, make_client, run, http_json, wait_http, ws_session, PASS, FAIL,
@@ -86,6 +88,166 @@ def _stop(proc):
 
 
 # ═══════════════════════════ A · single system message ══════════════════════
+
+# ══════════════ AA · the `{"result": …}` envelope (the REAL outage) ═══════════
+
+# Verbatim from the production log, 2026-10 · 17:27:54:
+#   empty stream from @cf/google/gemma-4-26b-a4b-it … raw[2420 chars, sha
+#   bc37dbbc]: '{"result":{"choices":[{"finish_reason":"stop","index":0,
+#   "logprobs":null,"message":{"annotations":null,"audio":null,"content":
+#   "{\"action\": \"REPLY\"…}'  →  "returned empty content (reasoning=0 chars)"
+#
+# The brain was answering PERFECTLY. The parser just could not see past the
+# envelope, so every model was reported empty and the whole chain burned.
+LIVE_RAW = (
+    '{"result":{"choices":[{"finish_reason":"stop","index":0,"logprobs":null,'
+    '"message":{"annotations":null,"audio":null,'
+    '"content":"{\\"action\\": \\"REPLY\\", \\"understand\\": '
+    '\\"she is teasing\\", \\"mood\\": \\"PLAYFUL_CHILL\\"}",'
+    '"function_call":null,"reasoning":null,"refusal":null,'
+    '"role":"assistant"}}],"created":1792508047,"id":"chatcmpl-x",'
+    '"model":"@cf/google/gemma-4-26b-a4b-it","object":"chat.completion",'
+    '"usage":{"completion_tokens":250,"prompt_tokens":385,'
+    '"total_tokens":635}}}'
+)
+
+
+def test_result_envelope_is_unwrapped():
+    """THE bug: {"result":{"choices":[{"message":{"content":…}}]}}."""
+    P = llmchat_provider.LLMChatClient._parse_sse
+    c, r, u = P(LIVE_RAW)
+    assert c.strip().startswith('{"action": "REPLY"'), f"content={c!r}"
+    assert "PLAYFUL_CHILL" in c, c
+    assert u.get("completion_tokens") == 250, u
+    return "the exact production body now parses → JSON decision recovered"
+
+
+def test_every_known_wire_shape_parses():
+    """One assertion per upstream shape — past, present and defensive."""
+    P = llmchat_provider.LLMChatClient._parse_sse
+    cases = {
+        "result envelope (current)": build_live_envelope_stream(),
+        "plain completion object": build_live_plain_stream(),
+        "double envelope": build_live_double_envelope_stream(),
+        "envelope over SSE": build_live_sse_envelope_stream(),
+        "bare json (no data: prefix)": build_bare_json_stream(),
+        "delta: key": build_delta_key_stream(),
+        "top-level message object": build_top_level_message_stream(),
+    }
+    for name, body in cases.items():
+        c, _, _ = P(body.decode())
+        assert c.strip(), f"{name} parsed to nothing"
+        assert c.strip() == CONTENT.strip() or c.strip().startswith("{"), \
+            f"{name} parsed to {c!r}"
+
+    # reasoning travels inside the message object too
+    c2, r2, _ = P(build_live_envelope_stream(CONTENT, "short think").decode())
+    assert c2.strip() == CONTENT.strip(), c2
+    assert r2.strip() == "short think", r2
+    return f"{len(cases)} wire shapes all parse (incl. reasoning in the envelope)"
+
+
+def test_unrecognised_format_is_not_reported_as_empty():
+    """
+    The whole outage hinged on this confusion: the upstream answered, the
+    parser did not recognise the shape, and ("", "") was logged as
+    "the model returned empty content". Every model then looked dead.
+    An unrecognised FORMAT must be shouted as a parser bug instead.
+    """
+    import logging
+    buf = []
+
+    class Cap(logging.Handler):
+        def emit(self, record):
+            buf.append(record.getMessage())
+
+    cap = Cap(level=logging.DEBUG)
+    lg = logging.getLogger("llmchat_provider")
+    lg.addHandler(cap)
+    lg.setLevel(logging.DEBUG)
+    try:
+        P = llmchat_provider.LLMChatClient._parse_sse
+        P('{"result":{"deep":{"deeper":{"content":"lost in there"}}}}')
+        # a shape with no text at all must stay quiet (no false alarm)
+        P('{"ping":123,"ok":true}')
+    finally:
+        lg.removeHandler(cap)
+
+    msgs = "\n".join(buf)
+    assert "UNRECOGNISED RESPONSE FORMAT" in msgs, f"silent failure:\n{msgs}"
+    assert "_parse_sse" in msgs, "log must point at the parser"
+    assert "not an empty model" in msgs, "log must say it is not the model"
+    # …and it must NOT fire for a body that genuinely carries no text
+    assert msgs.count("UNRECOGNISED RESPONSE FORMAT") == 1, \
+        f"false alarm on a text-free body:\n{msgs}"
+    return "unrecognised shape → loud parser-bug log, no false alarms"
+
+
+def test_no_shape_silently_becomes_empty():
+    """
+    The invariant that broke: a body carrying text must NEVER parse to ''.
+
+    Guards against the next envelope rename — if the upstream starts wrapping
+    in something new this fails loudly, instead of looking like a slow model.
+    """
+    P = llmchat_provider.LLMChatClient._parse_sse
+    bodies = [
+        build_live_envelope_stream(),
+        build_live_plain_stream(),
+        build_live_double_envelope_stream(),
+        build_live_sse_envelope_stream(),
+        build_bare_json_stream(),
+        build_delta_key_stream(),
+        build_top_level_message_stream(),
+    ]
+    empties = [i for i, b in enumerate(bodies) if not P(b.decode())[0].strip()]
+    assert not empties, f"these carried text but parsed empty: {empties}"
+
+    # …but a genuinely empty body must STILL be reported as empty
+    c, r, _ = P(build_silent_stream().decode())
+    assert c == "" and r == "", "silent stream must stay empty (no false ok)"
+    return f"{len(bodies)} text-bearing bodies all non-empty · silent stays empty"
+
+
+def test_envelope_end_to_end_through_the_bridge():
+    """Full decide + reply round-trip against the CURRENT upstream format."""
+    import shutil
+    tmpdir = Path(tempfile.mkdtemp(prefix="ig_env_"))
+    with MockLLM(live=True) as mock:
+        proc = _boot(mock, tmpdir)
+        try:
+            wait_http(f"http://127.0.0.1:{PORT}/health")
+
+            status, d = http_json(f"http://127.0.0.1:{PORT}/v1/decide", {
+                "messages": [{"role": "user",
+                              "content": "THEIR NEW MESSAGES: bol na"}],
+            })
+            assert status == 200, d
+            assert d.get("_fallback") is not True, f"brain still blind: {d}"
+            assert d["decision_valid"] is True, d
+            assert d["decision"]["action"] == "REPLY", d["decision"]
+
+            # the writer path (a plain reply, not a decision)
+            send, recv, close = ws_session(int(PORT))
+            try:
+                send({"id": "r1", "type": "reply",
+                      "messages": [{"role": "user", "content": "hi"}],
+                      "model": "zai-org/glm-4.7-flash"})
+                m = recv()
+                assert m.get("ok") is True, m
+                assert m["text"].strip() == CONTENT.strip(), m
+            finally:
+                close()
+
+            # brain health must be clean, not degraded
+            _, h = http_json(f"http://127.0.0.1:{PORT}/health")
+            assert h["brain_status"]["degraded"] is not True, h["brain_status"]
+        finally:
+            _stop(proc)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    return "decide + reply both work against the live `result` envelope"
+
+
 
 def test_merge_system_messages():
     C = llmchat_provider.LLMChatClient
@@ -439,6 +601,54 @@ def test_challenge_page_does_not_hang():
     return f"interstitial → {outcome} in {elapsed:.1f}s"
 
 
+def test_chain_never_stalls_past_its_budget():
+    """
+    Production: one decide took 231 SECONDS (14 calls x ~50s curl timeouts).
+    The chain must now respect a hard wall-clock budget and give up early so
+    the caller's safe fallback can answer instead of making the person wait.
+    """
+    import shutil
+    tmpdir = Path(tempfile.mkdtemp(prefix="ig_budget_"))
+
+    class SlowMock(MockLLM):
+        """Answers like the real upstream but only after a long delay."""
+
+        def __init__(self, port=0, delay=3.0):
+            super().__init__(port=port)
+            self.delay = delay
+
+    # Drive the provider directly against a deliberately slow-but-valid mock
+    # so we measure the chain, not the HTTP layer.
+    with MockLLM() as mock:
+        client = llmchat_provider.LLMChatClient(
+            inference_url=mock.url, chain_budget_s=1.0)
+
+        # Patch the transport to be slow, forcing the budget to bind.
+        real = client._request_once
+
+        async def slow(*a, **kw):
+            await asyncio.sleep(2.0)
+            return ("", "", {})
+
+        client._request_once = slow
+        t0 = time.time()
+        try:
+            run(client.chat_completion(
+                messages=[{"role": "user", "content": "hi"}],
+                model="zai-org/glm-4.7-flash", allow_fallback=True,
+                retries_per_model=2))
+            raised = False
+        except RuntimeError:
+            raised = True
+        elapsed = time.time() - t0
+        client._request_once = real
+
+    assert elapsed < 25, f"chain took {elapsed:.1f}s — budget is not binding"
+    assert raised, "expected the exhausted chain to raise so fallback kicks in"
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    return f"a hopeless chain gives up in {elapsed:.1f}s, not 231s"
+
+
 def test_fallback_chain_still_works():
     """The outage fix must not break the existing 500/glitch fallback."""
     with MockLLM(fail_models=("glm-4.7-flash",),
@@ -458,8 +668,20 @@ def test_fallback_chain_still_works():
 # ═══════════════════════════════════ runner ═════════════════════════════════
 
 def main():
-    print("\nIG-Agent v9.1 · brain-resilience suite (offline, mock llmchat.in)\n")
-    print(" A · single system message (the Round-9 root cause)")
+    print("\nIG-Agent v10.1 · brain-resilience suite (offline, mock llmchat.in)\n")
+    print(" AA · the {\"result\": …} envelope — the real outage")
+    check("envelope · the exact production body now parses")(
+        test_result_envelope_is_unwrapped)
+    check("envelope · every known wire shape parses")(
+        test_every_known_wire_shape_parses)
+    check("envelope · no text-bearing body ever parses to empty")(
+        test_no_shape_silently_becomes_empty)
+    check("diagnostics · an unrecognised shape is logged as a parser bug")(
+        test_unrecognised_format_is_not_reported_as_empty)
+    check("envelope · decide + reply end-to-end against the live format")(
+        test_envelope_end_to_end_through_the_bridge)
+
+    print("\n A · single system message (hardening)")
     check("provider · N system messages collapse to exactly 1")(
         test_merge_system_messages)
     check("wire · decide sends ONE system message upstream")(
@@ -487,6 +709,8 @@ def main():
     check("outage · HTML interstitial fails fast")(test_challenge_page_does_not_hang)
     check("regression · 500/glitch fallback chain still works")(
         test_fallback_chain_still_works)
+    check("latency · a hopeless chain respects its wall-clock budget")(
+        test_chain_never_stalls_past_its_budget)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed\n")
     if FAIL:

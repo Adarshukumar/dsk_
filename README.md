@@ -34,9 +34,87 @@ DM out of the blue, and writes the **Instagram NOTE**.
 
 ---
 
+## What changed in v10.1 — the actual outage fix
+
+> **Correction:** in v10 I blamed the two-`system`-message payload. **That
+> diagnosis was wrong.** It was a plausible theory (the `decide` path really
+> was the only caller sending two system messages, and the hardening is still
+> worth keeping) but it was not the cause — v10.0 shipped and production was
+> *still* 100% empty. The real cause is below, and it is visible in the log
+> v10's new raw-body diagnostic captured.
+
+### Root cause: llmchat.in wraps every response in `{"result": …}`
+
+The upstream changed its wire format. It still sends
+`Content-Type: text/event-stream`, but the body is now a single
+**non-streaming** completion object inside an envelope:
+
+```jsonc
+// OLD — what the parser was written for
+data: {"choices":[{"delta":{"content":"hi"}}],"usage":{…}}
+data: [DONE]
+
+// NEW — what actually arrives
+{"result":{"choices":[{"finish_reason":"stop","index":0,"logprobs":null,
+  "message":{"annotations":null,"audio":null,"content":"hi",
+  "function_call":null,"reasoning":null,"refusal":null,"role":"assistant"}}],
+  "created":1792508047,"id":"chatcmpl-x","model":"@cf/google/gemma-4-26b-a4b-it",
+  "object":"chat.completion","usage":{…}}}
+```
+
+Two changes at once: everything is under `result`, and it is a `message`
+object (non-streaming) rather than a `delta` stream. `packet.get("choices")`
+returned `None` because `choices` had moved one level down, every branch fell
+through, and the parser handed back `("", "", {})`.
+
+**The models were never broken.** They were returning perfect JSON decisions
+and natural Hinglish replies the whole time. We simply could not read them,
+and reported it as *"returned empty content (reasoning=0 chars)"* — which then
+burned all 7 models in the fallback chain for every single message.
+
+| | v10.1 |
+|---|---|
+| `{"result": …}` envelope | `_unwrap_envelope()` peels `result` / `data` / `output` / `completion` / `body` / `payload` / `response`, recursively, until the real object is found. |
+| Non-streaming `message` object | Extracted from `choices[].message` as well as `choices[].delta`. |
+| A future format change would look identical to a dead model | If a body carries text but nothing is extracted, the bridge logs **"UNRECOGNISED RESPONSE FORMAT … This is a PARSER bug, not an empty model: fix `_parse_sse()`"** with the body. Never again will a parser gap be mistaken for a slow model. |
+| One `decide` took **231 seconds** (14 calls × a ~50 s curl timeout) | Hard wall-clock budget on the whole chain (`IG_CHAIN_BUDGET_S`, default 40 s). When it expires the chain stops and the safe fallback answers. Per-request timeout is now `IG_HTTP_TIMEOUT_S` (default 30 s). |
+| Latency getting worse as the chain burned | Retry token growth is capped **relative to what was asked** — a 900-token decision can no longer creep to 4096. |
+
+### v10.1 · the backlog gate — history is never answered again
+
+Chat history gets lost constantly: cleared browser storage, a deleted or
+trimmed transcript, or the handled-set hitting its 2000-id cap. The messages
+refetch, and **every old inbound message looks brand new** — Aduu would
+suddenly answer a conversation from two days ago, which no real person does.
+
+Two independent guards, both persisted:
+
+1. **High-water mark** — `S.highWater[tid]` is the newest inbound timestamp
+   already absorbed (answered, skipped, or seen on first contact). Anything at
+   or below it is history, *whatever happened to the handled-set*. One number
+   per thread, saved to `localStorage` and into each transcript, and
+   deliberately not gated on the targets version.
+2. **Freshness on first contact** — the very first time a thread is seen, a
+   message older than `MAX_BACKLOG_AGE_MS` (45 min, tunable via
+   `IGAgent.backlogWindow(n)`) is read as history and absorbed silently.
+
+The gate lives **only** in the branch that answers messages — never in the
+proactive branch, so reminders and secret cross-chat missions still fire. It
+is bypassed by manual turns (`IGAgent.say()`, `forceProactive`).
+
+```
+[backlog] @testuser: absorbed 4 existing message(s) — first contact · newest
+          message is 1291 min old (history, not a new message)
+[backlog] @testuser: absorbed 4 existing message(s) — already read up to 2:54:07 PM
+```
+
+---
+
 ## What changed in v10
 
-This is the **outage fix** release. Symptom in production:
+This is the **outage triage** release — everything below is real hardening,
+but note the root cause turned out to be the envelope above, not the payload
+shape. Symptom in production:
 
 ```
 14:10:01 [WARNING] Model @cf/google/gemma-4-26b-a4b-it returned empty content (reasoning=0 chars) on attempt 1
@@ -51,7 +129,7 @@ unrecoverable.
 
 | Root cause / gap | v10 |
 |---|---|
-| **The `decide` path sent TWO `system` messages** — the page's own contract *and* the server-injected one. It was the only call in the whole system that did this, and it was the only one that kept coming back empty. Cloudflare-style chat templates silently drop multi-system prompts. | `_merge_system_messages()` collapses **every** run of `system` messages into exactly one, in the provider, before anything goes on the wire. The server also no longer stacks its contract on top of the page's. |
+| The `decide` path sent TWO `system` messages — the page's own contract *and* the server-injected one. It was the only call in the system that did this. (Not the root cause, as v10.0 proved — but two system messages are genuinely fragile with some chat templates, so the hardening stays.) | `_merge_system_messages()` collapses **every** run of `system` messages into exactly one, in the provider, before anything goes on the wire. The server also no longer stacks its contract on top of the page's. |
 | **The failure was invisible.** `chat_completion()` never logged the status code, content-type, or the raw body — so nobody could see *what* had changed. | Every empty stream now logs the model, `max_tokens`, temperature, message count, **content-type** and the **first 600 chars of the raw body**, with a SHA so repeat bodies are collapsed to one line. |
 | A wire-format change turned into `("", "")` — indistinguishable from a slow model. | `_parse_sse()` now also reads bare-JSON frames (no `data:` prefix), `delta:` keys, top-level `message` / `delta` / `text` / `output_text` objects, and **raises** on `{"success": false, "error": …}` instead of masquerading as empty. |
 | The whole chain dead ⇒ **nothing happened** and the person waited forever. | A dead brain returns a **safe synthesized decision** (`REPLY`, neutral mood, 1 bubble, human pacing, `privacy_ok`, no invented tasks) — and a dead *social* brain returns `observe` with **zero actions**. Never a blind DM or comment. |
@@ -351,7 +429,7 @@ With no reminder and no mission queued, Aduu **stays quiet on purpose** —
 | `probe_llmchat.py` | **v10** · hits the real llmchat.in and prints each model's HTTP status, content-type and RAW body — use it when the upstream changes |
 | `tests/mock_llmchat.py` | Offline mock of GLM-4.7-Flash / Gemma-4 / Qwen3 SSE + the decision brain, plus the v10 outage modes (`--silent-all`, `--challenge`, `--error-packet`, `--bare-json`, `--delta-key`, `--message-obj`) |
 | `tests/test_pipeline.py` | Provider + bridge + WebSocket + `/v1/decide` + social-brain diary (offline) |
-| `tests/test_resilience.py` | **v10** · the outage suite — single-system-message rule, parser format changes, dead-brain fallbacks, brain health |
+| `tests/test_resilience.py` | **v10.1** · the outage suite — the `result` envelope, every wire shape, unrecognised-format detection, single-system-message rule, chain latency budget, dead-brain fallbacks, brain health |
 | `tests/test_bot_flow.js` | Full page pipeline: brain decisions, isolation, rarity gates, notes, stories, moods, reminders, missions |
 | `tests/test_humanize.js` | Humanizer, persona, config, state migration, engine units |
 | `tests/live_check.py` | Live llmchat.in check (`--decide` for the brain) |
@@ -414,6 +492,8 @@ IGAgent.notes() · IGAgent.deleteNote() · IGAgent.noteNow()
 /* ── v8 · BRAIN ── */
 IGAgent.why('deeps20_')          // the brain's last JSON decision + its evidence line
 IGAgent.decide('deeps20_')       // ask the brain to decide that chat right now
+IGAgent.backlogWindow(45)         // v10.1 · first-contact freshness window (min)
+IGAgent.resetBacklog('deeps20_')  // v10.1 · forget how far we read that thread
 IGAgent.brainStatus()            // v10 · is the decision brain actually answering?
                                  //   → {ok, degraded, last_error, decisions, last_ok_ago_s, ...}
 IGAgent.brainMode(false)         // fall back to the old local rules
@@ -510,19 +590,23 @@ IGAgent.linkFriends('adarshu.io', 'deeps20_') · IGAgent.addGossip('…')
 
 ```bash
 node tests/test_humanize.js        #  32 passed
-node tests/test_bot_flow.js        #  56 passed
+node tests/test_bot_flow.js        #  60 passed
 python tests/test_pipeline.py      #   5 passed   (needs curl_cffi)
-python tests/test_resilience.py    #  12 passed   ← the v10 outage suite
+python tests/test_resilience.py    #  18 passed   ← the outage suite
 ```
 
-**105 tests, fully offline** against `tests/mock_llmchat.py`, which also
+**115 tests, fully offline** against `tests/mock_llmchat.py`, which also
 impersonates the decision brain.
 
 `tests/test_resilience.py` exists so the v10 outage can never come back
 silently. It asserts, at the wire level, that:
 
+- **the exact production `{"result": …}` body parses** (byte-for-byte fixture)
+- every known wire shape parses, and no text-bearing body ever parses to empty
+- an unrecognised shape is logged as a **parser bug**, never as an empty model
 - N `system` messages collapse to exactly **1** before any upstream call
 - the server never double-injects the decide contract
+- a hopeless chain respects its wall-clock budget (was 231 s, now bounded)
 - the parser survives bare-JSON, `delta:` keys, `message` objects and HTML
 - an upstream `{"success": false}` **raises** instead of looking empty
 - an empty stream logs the model + content-type + raw body
@@ -536,7 +620,12 @@ silently. It asserts, at the wire level, that:
 ### Reproducing the outage locally
 
 ```bash
+# the CURRENT upstream format (what production really sends)
+python tests/mock_llmchat.py --port 8899 --live
+
+# a totally dead upstream
 python tests/mock_llmchat.py --port 8899 --silent-all
+
 LLMCHAT_BASE_URL=http://127.0.0.1:8899 IG_BRIDGE_PORT=8787 python server.py
 # then paste ig-agent-chat.js into Instagram, or:
 curl -X POST localhost:8787/v1/decide -H 'Content-Type: application/json' \
@@ -558,6 +647,9 @@ curl -X POST localhost:8787/v1/decide -H 'Content-Type: application/json' \
 * **Evidence gate** — the brain's reminders and pranks must be traceable to a
   line the person actually sent.
 * **Isolation gate** — no handle, no quote, no private line ever crosses chats.
+* **Backlog gate** — lost chat history is re-read, never re-answered. A
+  per-thread high-water mark plus a first-contact freshness window mean Aduu
+  cannot resurrect a conversation from days ago.
 * **Rarity gate** — the social brain is capped, cooled down and quiet at night.
 * **One-system-message rule** — no request ever puts two `system` messages on
   the wire, so a template that drops them cannot silently kill the brain.

@@ -997,6 +997,83 @@ const check = (name, fn) => {
     assert.strictEqual(T_saroj.moodState.feeling_note, 'genuinely pissed off');
   });
 
+
+  /* ═════════════════════ v10.1 · BACKLOG GATE ══════════════════════════
+     Chat history gets lost constantly: cleared browser storage, a deleted
+     thread, a trimmed transcript, or the handled-set hitting its 2000-id cap.
+     The messages refetch — and without a guard every old inbound line looks
+     brand new, so Aduu suddenly answers a conversation from days ago.
+     Two guards: a per-thread HIGH-WATER MARK (newest inbound ts absorbed)
+     and a FRESHNESS rule for the very first sight of a thread.
+     ═══════════════════════════════════════════════════════════════════════ */
+  const OLD_TS = 1792508047000;                 // ~2 days ago
+  IG.byThread = IG.byThread || {};
+  IG.byThread.T_HIST = [];
+  IG.threads.push({
+    thread_fbid: 'T_HIST', is_group: false,
+    users: [{ username: 'histuser' }],
+    last_activity_timestamp_ms: OLD_TS + 3,
+  });
+  for (let i = 1; i <= 3; i++) {
+    IG.byThread.T_HIST.push({
+      message_id: 'hist_old' + i, timestamp_ms: OLD_TS + i, sender_fbid: 'THEM',
+      content_type: 'TEXT',
+      content: { __typename: 'SlideMessageText', text_body: 'purani baat ' + i },
+    });
+  }
+  // add histuser WITHOUT disturbing the target list the earlier tests rely on
+  api.addTargets('histuser');
+
+  const sentBeforeHist = IG.sent.length;
+  await api._debug.processThread('T_HIST', 'histuser');
+  await new Promise(r => setTimeout(r, 400));
+
+  check('v10.1 · a refetched backlog is absorbed, never answered', () => {
+    assert.strictEqual(IG.sent.length, sentBeforeHist,
+      'answered history: ' + JSON.stringify(IG.sent.slice(sentBeforeHist)));
+    assert(S.highWater.T_HIST, 'no high-water mark recorded');
+    assert.strictEqual(S.highWater.T_HIST, OLD_TS + 3);
+  });
+
+  // now wipe the handled-set — the classic "history deleted" scenario
+  S.handled.clear();
+  await api._debug.processThread('T_HIST', 'histuser');
+  await new Promise(r => setTimeout(r, 400));
+
+  check('v10.1 · lost handled-set still cannot trigger a re-answer', () => {
+    assert.strictEqual(IG.sent.length, sentBeforeHist,
+      're-answered after the handled-set was wiped');
+  });
+
+  // …but a genuinely NEW message must still get a reply
+  const NEW_TS = Date.now();
+  IG.byThread.T_HIST.push({
+    message_id: 'hist_new', timestamp_ms: NEW_TS, sender_fbid: 'THEM',
+    content_type: 'TEXT',
+    content: { __typename: 'SlideMessageText', text_body: 'abe sun na, kya kar raha hai' },
+  });
+  IG.threads.find(t => t.thread_fbid === 'T_HIST').last_activity_timestamp_ms = NEW_TS;
+
+  await api._debug.processThread('T_HIST', 'histuser');
+  await new Promise(r => setTimeout(r, 600));
+
+  check('v10.1 · a genuinely new message is still answered', () => {
+    assert.strictEqual(IG.sent.length, sentBeforeHist + 1,
+      'a real new message was ignored — the gate is too aggressive');
+    assert(S.highWater.T_HIST >= NEW_TS, 'high-water did not advance');
+  });
+
+  // and the same message must never be answered twice
+  const afterFirst = IG.sent.length;
+  S.handled.clear();
+  await api._debug.processThread('T_HIST', 'histuser');
+  await new Promise(r => setTimeout(r, 400));
+
+  check('v10.1 · a message already answered is never answered again', () => {
+    assert.strictEqual(IG.sent.length, afterFirst,
+      'answered the same message twice after a refetch');
+  });
+
   api.stop();
   const failed = results.filter(r => !r[0]);
   console.log(`\n${results.length - failed.length} passed, ${failed.length} failed\n`);

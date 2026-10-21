@@ -97,6 +97,25 @@
     WS_URL: 'ws://localhost:8787/ws',
 
     DEFAULT_TARGETS: ['adarshu.io', 'deeps20_'],
+
+    /* v10.1 · BACKLOG GATE
+       Chat history gets lost all the time: cleared browser storage, a deleted
+       or trimmed transcript, a fresh machine, or the handled-set hitting its
+       2000-id cap. When that happens the backlog refetches and every old
+       inbound message looks brand new — Aduu would suddenly answer a
+       conversation from days ago, which no real person ever does.
+       Two guards, both needed:
+         · HIGH-WATER MARK — never answer at or below the newest inbound
+           timestamp already absorbed. Immune to a lost handled-set.
+         · FRESHNESS — on the very first sight of a thread, only answer if the
+           newest inbound message actually just arrived; otherwise absorb it
+           silently, exactly like a person scrolling through old chat. */
+    // On a truly FRESH install (no high-water saved) a message older than this
+    // is treated as history. Deliberately generous: it must cover the gap
+    // while the bridge was restarting, otherwise a message that arrived during
+    // downtime would be silently swallowed. Once a high-water mark exists for
+    // a thread it takes over and this window is never consulted again.
+    MAX_BACKLOG_AGE_MS: 45 * 60_000,
     TARGETS: ['adarshu.io', 'deeps20_'], // active by default (use .addTargets(...) or .allTargets())
     TARGETS_VERSION: 2,           // ensures default targets + live mode activate cleanly
     DRY_RUN: false,               // live sending active by default
@@ -449,6 +468,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     usernameCache: new Map(),    // threadFbid -> username
     lastActivity: {},            // threadFbid -> last_activity_timestamp_ms seen
     handled: new Set(),          // message_ids already answered/considered
+    highWater: {},           // v10.1 · threadFbid -> newest inbound ts absorbed
     cooldownUntil: {},
     sentHour: [], sentDay: [],
     startedAt: null, lastPollAt: null,
@@ -539,6 +559,15 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         p.handled.forEach(x => S.handled.add(x));
       }
       if (p.lastActivity) S.lastActivity = p.lastActivity;
+      // v10.1 · backlog high-water marks. Deliberately NOT gated on the
+      // targets version: knowing how far we have read a thread stays true
+      // even after the target list or the persona changes.
+      if (p.highWater && typeof p.highWater === 'object') {
+        for (const [k, v] of Object.entries(p.highWater)) {
+          const n = Number(v);
+          if (k && Number.isFinite(n) && n > 0) S.highWater[k] = n;
+        }
+      }
       if (p.brainModel) CFG.BRAIN_MODEL = p.brainModel;
       if (typeof p.proactiveEnabled === 'boolean') CFG.PROACTIVE_ENABLED = p.proactiveEnabled;
       if (typeof p.unconditionalIdleStarter === 'boolean') CFG.UNCONDITIONAL_IDLE_STARTER = p.unconditionalIdleStarter;
@@ -598,6 +627,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
         privacyWall: CFG.PRIVACY_WALL,
         pendingMissions: (S.pendingMissions || []).filter(m => m.status === 'pending'),
         handled, lastActivity: S.lastActivity,
+        highWater: S.highWater,          // v10.1 · survives a wiped handled-set
       }));
     } catch (_) {}
   }
@@ -1486,7 +1516,8 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
               brain_model: CFG.BRAIN_MODEL,
               fallback_chain: [CFG.MODEL, CFG.BRAIN_MODEL, '@cf/qwen/qwen3-30b-a3b-fp8'],
             },
-            agent_state: T.agentState || {},
+            agent_state: Object.assign({}, T.agentState || {},
+              { high_water_ts: S.highWater[tid] || 0 }),
             mood_state: T.moodState || {},
             reminders: T.reminders || [],
             missions: T.missions || [],
@@ -3169,6 +3200,39 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
     }, Math.max(150, ms));
   }
 
+  /* ── v10.1 · BACKLOG GATE ───────────────────────────────────────────────
+     `S.highWater[tid]` is the newest INBOUND timestamp we have already
+     absorbed — answered, deliberately skipped, or seen on first contact. It is
+     tiny (one number per thread) and survives everything that wipes the
+     handled-set, so a refetched history can never be answered twice. */
+
+  function newestInboundTs(msgs) {
+    let hi = 0;
+    for (const m of msgs || []) {
+      if (m && !m.mine && Number(m.ts) > hi) hi = Number(m.ts);
+    }
+    return hi;
+  }
+
+  function advanceHighWater(tid, ts) {
+    const t = Number(ts || 0);
+    if (!t) return;
+    if (t > (S.highWater[tid] || 0)) {
+      S.highWater[tid] = t;
+      saveState();
+    }
+  }
+
+  /* Absorb a whole thread quietly: remember how far we have read, mark it
+     handled, and say nothing. This is what a real person does with history. */
+  function absorbBacklog(tid, user, msgs, ts, why) {
+    (msgs || []).forEach(m => { if (m && m.id) S.handled.add(m.id); });
+    advanceHighWater(tid, ts);
+    scheduleTranscriptSave(tid, 5_000);
+    log(C.dim, 'backlog',
+      `@${user}: absorbed ${(msgs || []).length} existing message(s) — ${why}`);
+  }
+
   async function processThread(tid, user, opts = {}) {
     if (S.busy[tid]) { S.recheckAfterBusy[tid] = true; return; }
     if (S.pending[tid]) {
@@ -3212,6 +3276,11 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       if (!newest && !(opts && opts.forceProactive)) {
         return log(C.dim, 'skip', `@${user}: empty thread`);
       }
+      /* v10.1 · how far we have already read this thread (see the backlog
+         gate below). `hw` = high-water ts, 0 when we have never seen it. */
+      const inTs = newestInboundTs(msgs);
+      const hw = Number(S.highWater[tid] || 0);
+
       if (newest && newest.ts && newest.ts > (S.lastActivity[tid] || 0)) {
         S.lastActivity[tid] = newest.ts;
       }
@@ -3223,6 +3292,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       if (!newest || newest.mine) {
         if (newest) syncGlobalMemory(tid, user, msgs, null, newest.text || '');
         msgs.forEach(m => m.id && S.handled.add(m.id));
+        advanceHighWater(tid, inTs);
         saveState();
         const pro = shouldStartProactiveConvo(tid, user, msgs, !!(opts && opts.forceProactive));
         if (!pro.ok) {
@@ -3244,14 +3314,50 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       let turnReminders = [];
       let turnMissions = [];
       if (!isProactiveTurn) {
+        /* ── v10.1 BACKLOG GATE ────────────────────────────────────────────
+           Never ANSWER history. It lives inside this branch on purpose: the
+           proactive branch above (Aduu starting a chat because a reminder or
+           a secret mission came due) must never be blocked by it.
+           Two independent guards:
+             1. high-water — anything at/below the newest inbound ts already
+                absorbed is old, whatever happened to the handled-set
+             2. freshness — the first time we ever see a thread, only answer
+                if the newest inbound message genuinely just arrived
+           Manual turns (IGAgent.say / forceProactive) bypass both. */
+        if (inTs && !(opts && opts.forceProactive)) {
+          if (hw && inTs <= hw) {
+            absorbBacklog(tid, user, msgs, inTs,
+              `already read up to ${new Date(hw).toLocaleTimeString()}`);
+            return;
+          }
+          // Freshness applies on FIRST sight only, and only when the
+          // timestamp is a plausible ms epoch. If Instagram ever hands back a
+          // junk / second-precision value we must NOT let that silence Aduu —
+          // the high-water mark is still on duty, so skip the age test.
+          if (!hw && inTs > 1e12) {
+            const ageMs = now() - inTs;
+            if (ageMs > CFG.MAX_BACKLOG_AGE_MS) {
+              absorbBacklog(tid, user, msgs, inTs,
+                `first contact · newest message is ` +
+                `${Math.max(1, Math.round(ageMs / 60000))} min old ` +
+                `(history, not a new message)`);
+              return;
+            }
+          }
+        }
         let lastOwnIdx = -1;
         msgs.forEach((m, i) => { if (m.mine) lastOwnIdx = i; });
+        // v10.1: the high-water mark is the second line of defence — a message
+        // at or below it is history even if its id fell out of `handled`.
+        const hwNow = Number(S.highWater[tid] || 0);
         unanswered = msgs.slice(lastOwnIdx + 1)
           .filter(m => !m.mine && m.id && !S.handled.has(m.id) &&
+                       (!hwNow || Number(m.ts || 0) > hwNow) &&
                        !(CFG.DRY_RUN && S.dryHandled.has(m.id)));
         if (!unanswered.length) {
           if (!CFG.DRY_RUN) {
             msgs.forEach(m => m.id && S.handled.add(m.id));
+            advanceHighWater(tid, inTs);
             saveState();
           }
           if (S.lastGateLogId[tid] !== newest.id) {
@@ -3267,7 +3373,8 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
 
         const lastC = newest;
         if (lastC.kind !== 'text') {
-          msgs.forEach(m => m.id && S.handled.add(m.id)); saveState();
+          msgs.forEach(m => m.id && S.handled.add(m.id));
+          advanceHighWater(tid, inTs); saveState();
           scheduleTranscriptSave(tid, 5_000);
           return log(C.dim, 'media', `@${user}: newest is ${lastC.label} — detected, NOT replying`);
         }
@@ -3316,6 +3423,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       if (decision.action === 'BRAIN_STAY_SILENT' && CFG.BRAIN_ALLOW_SILENCE &&
           !isProactiveTurn && !(opts && opts.forceProactive)) {
         msgs.forEach(m => m.id && S.handled.add(m.id));
+        advanceHighWater(tid, inTs);
         saveState();
         scheduleTranscriptSave(tid, 5_000);
         log(C.dim, 'brain', `@${user}: brain chose STAY_SILENT — ${decision.reason}`);
@@ -3562,6 +3670,7 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
             `@${user} ← [${model}] "${bubbles[i]}" (${String(sent.message_id).slice(0, 24)}…)`);
         }
         msgs.forEach(m => m.id && S.handled.add(m.id));
+        advanceHighWater(tid, inTs);        // v10.1: this burst is consumed
         if (isProactiveTurn) {
           T.agentState.proactive_streak = (T.agentState.proactive_streak || 0) + 1;
           T.agentState.last_proactive_at = now();
@@ -5515,6 +5624,32 @@ them: "hmm" → you: "hmm mat bol yaar, wahi to problem hai 😂 kuch dhang ka b
       log(C.ok, 'brain', 'BRAIN_ALLOW_SILENCE =', CFG.BRAIN_ALLOW_SILENCE,
         '(ON = the brain may decide to leave a burst on seen)');
       return CFG.BRAIN_ALLOW_SILENCE;
+    },
+    /* v10.1 · how old a message may be on FIRST contact before it counts as
+       history instead of something to answer. Only consulted for a thread we
+       have never seen before — after that the high-water mark takes over. */
+    backlogWindow(minutes) {
+      if (minutes !== undefined) {
+        const m = Number(minutes);
+        if (!Number.isFinite(m) || m < 0) throw new Error('minutes must be >= 0');
+        CFG.MAX_BACKLOG_AGE_MS = Math.round(m * 60_000);
+      }
+      log(C.ok, 'backlog',
+        `MAX_BACKLOG_AGE = ${Math.round(CFG.MAX_BACKLOG_AGE_MS / 60_000)} min ` +
+        `(first contact only: older than this is read as history)`);
+      return CFG.MAX_BACKLOG_AGE_MS / 60_000;
+    },
+    /* Forget how far we have read a thread (forces a re-read next poll). */
+    resetBacklog(user) {
+      const q = cleanUsername(user);
+      const entry = Object.values(S.transcripts)
+        .find(T => cleanUsername(T.user) === q);
+      if (!entry) throw new Error(`no transcript for @${q}`);
+      delete S.highWater[entry.threadFbid];
+      saveState();
+      log(C.warn, 'backlog',
+        `@${q}: high-water cleared — history will be re-absorbed next poll`);
+      return true;
     },
     /* One-glance brain health: is the decision brain actually answering? */
     async brainStatus() {

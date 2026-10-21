@@ -313,6 +313,85 @@ def count_system_messages(body: dict) -> int:
                if isinstance(m, dict) and m.get("role") == "system")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  THE CURRENT WIRE FORMAT (captured live 2026-10, from a production log)
+#
+#  llmchat.in now answers with ONE non-streaming object wrapped in a
+#  {"result": …} envelope — even though it still sends
+#  Content-Type: text/event-stream. It is NOT SSE any more.
+#
+#  Old (what the parser was written for):
+#      data: {"choices":[{"delta":{"content":"hi"}}],"usage":{…}}
+#      data: [DONE]
+#
+#  New (what actually arrives):
+#      {"result":{"choices":[{"finish_reason":"stop","index":0,"logprobs":null,
+#        "message":{"annotations":null,"audio":null,"content":"hi",
+#        "function_call":null,"reasoning":null,"refusal":null,
+#        "role":"assistant"}}],
+#        "created":…,"id":"chatcmpl-x","model":"…",
+#        "object":"chat.completion","usage":{…}}}
+#
+#  Because `choices` sits under `result`, the old parser found nothing and
+#  returned ("", "") → "returned empty content (reasoning=0 chars)" for every
+#  model, even though the models were answering perfectly.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _live_message_obj(content: str, reasoning=None, model=MODEL_WIRE,
+                      finish="stop") -> dict:
+    return {
+        "created": 1792508047,
+        "id": "chatcmpl-live-" + str(abs(hash(content)) % 10**8),
+        "model": model,
+        "object": "chat.completion",
+        "choices": [{
+            "finish_reason": finish,
+            "index": 0,
+            "logprobs": None,
+            "message": {
+                "annotations": None,
+                "audio": None,
+                "content": content,
+                "function_call": None,
+                "reasoning": reasoning,
+                "refusal": None,
+                "role": "assistant",
+            },
+        }],
+        "usage": _usage(385, max(1, len(content) // 4), 5.21),
+    }
+
+
+def build_live_envelope_stream(content: str = CONTENT,
+                               reasoning: str | None = None,
+                               model: str = MODEL_WIRE) -> bytes:
+    """The CURRENT format: one JSON object wrapped in {"result": …}."""
+    return (json.dumps({"result": _live_message_obj(content, reasoning, model)},
+                       separators=(",", ":")) + "\n").encode()
+
+
+def build_live_plain_stream(content: str = CONTENT,
+                            reasoning: str | None = None,
+                            model: str = MODEL_WIRE) -> bytes:
+    """Same object, un-wrapped — in case the envelope is dropped again."""
+    return (json.dumps(_live_message_obj(content, reasoning, model),
+                       separators=(",", ":")) + "\n").encode()
+
+
+def build_live_double_envelope_stream(content: str = CONTENT) -> bytes:
+    """Envelope inside an envelope (defensive — peel until content found)."""
+    return (json.dumps(
+        {"data": {"result": _live_message_obj(content)}},
+        separators=(",", ":")) + "\n").encode()
+
+
+def build_live_sse_envelope_stream(content: str = CONTENT) -> bytes:
+    """Envelope delivered the SSE way, in case streaming comes back."""
+    return ("data: " + json.dumps({"result": _live_message_obj(content)},
+                                  separators=(",", ":")) + "\n\n"
+            + "data: [DONE]\n\n").encode()
+
+
 def build_stream(model: str = "") -> bytes:
     m = (model or "").lower()
     if "gemma" in m:
@@ -338,6 +417,7 @@ class MockLLM:
     bare_json     → SSE frames with no `data:` prefix (wire-format change)
     delta_key     → `delta:` key instead of `data:` (wire-format change)
     message_obj   → one non-streaming `message` object (wire-format change)
+    live          → THE CURRENT FORMAT: {"result":{"choices":[{"message":…}]}}
     """
 
     def __init__(self, port: int = 0, fail_models: tuple[str, ...] = (),
@@ -348,7 +428,8 @@ class MockLLM:
                  error_packet: bool = False,
                  bare_json: bool = False,
                  delta_key: bool = False,
-                 message_obj: bool = False):
+                 message_obj: bool = False,
+                 live: bool = False):
         self.fail_models = tuple(fail_models)
         self.glitch_models = tuple(glitch_models)
         self.empty_models = tuple(empty_models)
@@ -358,6 +439,7 @@ class MockLLM:
         self.bare_json = bare_json
         self.delta_key = delta_key
         self.message_obj = message_obj
+        self.live = live
         self.requests: list[dict] = []
         self.lock = threading.Lock()
         outer = self
@@ -384,8 +466,17 @@ class MockLLM:
                     return self._json(404, {"error": "unknown path"})
                 if any(part in model for part in outer.fail_models):
                     return self._json(500, {"error": "mock upstream failure"})
-                # ── Round-9 outage modes take priority over everything ──
-                if outer.challenge:
+                # ── outage / format modes take priority over everything ──
+                if outer.live:
+                    data = (build_live_envelope_stream(CONTENT)
+                            if not is_social_decide_request(body)
+                            else build_live_envelope_stream(
+                                json.dumps(OBSERVE_PLAN, separators=(", ", ": "))))
+                    if is_decide_request(body) and not is_social_decide_request(body):
+                        data = build_live_envelope_stream(
+                            json.dumps(DECISION_JSON, separators=(", ", ": ")))
+                    ctype = "text/event-stream"
+                elif outer.challenge:
                     data = build_challenge_page()
                     ctype = "text/html; charset=utf-8"
                 elif outer.error_packet:
@@ -488,14 +579,18 @@ def main():
     ap.add_argument("--bare-json", action="store_true")
     ap.add_argument("--delta-key", action="store_true")
     ap.add_argument("--message-obj", action="store_true")
+    ap.add_argument("--live", action="store_true",
+                    help="THE CURRENT upstream format: "
+                         '{"result":{"choices":[{"message":{"content":...}}]}}')
     args = ap.parse_args()
     fails = tuple(x.strip() for x in args.fail.split(",") if x.strip())
     with MockLLM(args.port, fail_models=fails, silent_all=args.silent_all,
                  challenge=args.challenge, error_packet=args.error_packet,
                  bare_json=args.bare_json, delta_key=args.delta_key,
-                 message_obj=args.message_obj) as mock:
+                 message_obj=args.message_obj,
+                 live=args.live) as mock:
         modes = [k for k in ("silent_all", "challenge", "error_packet",
-                             "bare_json", "delta_key", "message_obj")
+                             "bare_json", "delta_key", "message_obj", "live")
                  if getattr(args, k)]
         print(f"mock llmchat stream → {mock.url}")
         print(f"frontline {MODEL_WIRE} · brain {BRAIN_MODEL_WIRE} · "

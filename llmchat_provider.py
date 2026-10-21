@@ -238,12 +238,17 @@ class LLMChatClient:
         self,
         inference_url: str = INFERENCE_URL,
         impersonate: str = "chrome131",
-        timeout: float = 45.0,
+        timeout: float = float(os.environ.get("IG_HTTP_TIMEOUT_S", "30") or 30),
         max_concurrency: int = 8,
+        chain_budget_s: float = 40.0,
     ) -> None:
         self.inference_url = inference_url
         self.impersonate = impersonate
         self.timeout = timeout
+        # Total wall-clock budget for one chat_completion across every model
+        # in the fallback chain. Env-tunable; 0 disables the deadline.
+        self.chain_budget_s = float(
+            os.environ.get("IG_CHAIN_BUDGET_S", chain_budget_s) or 0)
         self._sem = asyncio.Semaphore(max_concurrency)
         self._session: AsyncSession | None = None
         self._session_lock = asyncio.Lock()
@@ -282,21 +287,65 @@ class LLMChatClient:
             self._session = None
             self._loop = None
 
-    @staticmethod
-    def _parse_sse(raw: str) -> tuple[str, str, dict[str, Any]]:
+    # Envelope keys the upstream may wrap the real payload in. llmchat.in
+    # started wrapping EVERY response in {"result": {...}} (Oct 2026) — the
+    # payload survived but `choices` was no longer at the top level, so the
+    # parser silently returned ("", "") and every model looked "empty".
+    _ENVELOPE_KEYS = ("result", "data", "output", "completion", "body",
+                      "payload", "response")
+
+    @classmethod
+    def _unwrap_envelope(cls, packet: Any) -> Any:
+        """Peel `{"result": {...}}` (and friends) until the real object shows.
+
+        Only descends into dict/list values, so the legacy Cloudflare shape
+        `{"response": "some text"}` is left alone and still parsed as content.
         """
-        Parse raw SSE stream text from llmchat.in into (content, reasoning, usage).
-        Supports:
-          - GLM-4.7-Flash format:
-              chunk 1: `delta: {"role":"assistant","content":"","reasoning_content":null}`
-              reasoning: `delta: {"reasoning":"<t>","reasoning_content":"<t>"}`
-              content: `delta: {"content":"<t>","reasoning_content":null}`
-              final: `{"response":"","usage":{...}}` + `data: [DONE]`
-          - Qwen3 / Gemma-4 / Llama OpenAI chunks:
-              `choices[0].delta.{content, reasoning_content}`
-              (ignores duplicate top-level `"response"` when `choices` is present)
-          - Legacy Cloudflare Workers AI `{"response": "..."}` chunks
-          - Inline `<think>...</think>` blocks inside content
+        for _ in range(6):
+            if not isinstance(packet, dict):
+                break
+            for key in cls._ENVELOPE_KEYS:
+                val = packet.get(key)
+                if isinstance(val, (dict, list)):
+                    packet = val
+                    break
+            else:
+                break
+        return packet
+
+    @staticmethod
+    def _take_text(obj: Any, keys: tuple[str, ...]) -> tuple[str, str]:
+        """Pull (content, reasoning) out of any delta/message-shaped dict."""
+        if not isinstance(obj, dict):
+            return "", ""
+        rc = obj.get("reasoning_content")
+        if rc is None:
+            rc = obj.get("reasoning")
+        c = obj.get("content")
+        # `content` may legitimately be None (tool/role-only chunks)
+        return (c if isinstance(c, str) else "",
+                rc if isinstance(rc, str) else "")
+
+    @classmethod
+    def _parse_sse(cls, raw: str) -> tuple[str, str, dict[str, Any]]:
+        """
+        Parse a raw llmchat.in response body into (content, reasoning, usage).
+
+        Tolerates every shape this upstream has ever sent:
+
+          - CURRENT (Oct 2026) — a single non-streaming object wrapped in an
+            envelope, despite the `text/event-stream` content-type:
+                `{"result":{"choices":[{"message":{"content":"…"}}],
+                  "usage":{…}}}`
+          - OpenAI streaming chunks:
+                `data: {"choices":[{"delta":{"content":"…",
+                                             "reasoning_content":"…"}}]}`
+          - GLM-4.7-Flash bare `delta:` lines
+          - Legacy Workers AI `{"response": "…"}` chunks
+          - Bare JSON lines with no `data:` prefix at all
+          - Inline `<think>…</think>` blocks inside content
+
+        The rule: never return ("", "") for a body that actually carried text.
         """
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -309,14 +358,11 @@ class LLMChatClient:
             if line.startswith("data:"):
                 data_str = line[5:].strip()
             elif line.startswith("delta:"):
-                # GLM-4.7-Flash pitches some chunks with a bare `delta:` key
                 data_str = line[6:].strip()
             elif line.startswith("event:"):
                 continue
             elif line[0] in "{[":
-                # Some upstreams drop the SSE prefix entirely and stream raw
-                # JSON objects. Accepting them keeps the brain alive instead of
-                # silently returning ("", "").
+                # No SSE prefix — the body is plain JSON (current behaviour).
                 data_str = line
             else:
                 continue
@@ -328,13 +374,16 @@ class LLMChatClient:
                 packet = json.loads(data_str)
             except json.JSONDecodeError:
                 continue
-
             if not isinstance(packet, dict):
                 continue
 
-            # An upstream that answers with an error object instead of a stream
-            # must say so loudly rather than looking like an empty completion.
-            if (packet.get("success") is False or packet.get("error")):
+            packet = cls._unwrap_envelope(packet)
+            if not isinstance(packet, dict):
+                continue
+
+            # An upstream error object must raise, never look like an empty
+            # completion — otherwise the whole chain burns for nothing.
+            if packet.get("success") is False or packet.get("error"):
                 msg = packet.get("error") or packet.get("message") or "unknown"
                 if isinstance(msg, dict):
                     msg = json.dumps(msg)[:200]
@@ -343,79 +392,78 @@ class LLMChatClient:
             if isinstance(packet.get("usage"), dict) and packet["usage"]:
                 usage = packet["usage"]
 
-            # An upstream error object must not look like an empty completion.
-            if packet.get("success") is False or packet.get("error"):
-                msg = packet.get("error") or packet.get("message") or "unknown"
-                if isinstance(msg, dict):
-                    msg = json.dumps(msg)[:200]
-                raise RuntimeError(f"upstream error packet: {str(msg)[:200]}")
-
             choices = packet.get("choices")
             if isinstance(choices, list) and choices:
-                first = choices[0] if isinstance(choices[0], dict) else {}
-                delta = first.get("delta")
-                if isinstance(delta, dict):
-                    # Note: GLM-4.7-Flash sends BOTH "reasoning" and "reasoning_content"
-                    # with the exact same token string. Pick "reasoning_content" first
-                    # and only fall back to "reasoning" when "reasoning_content" is None.
-                    rc = delta.get("reasoning_content")
-                    if rc is None:
-                        rc = delta.get("reasoning")
-                    if isinstance(rc, str) and rc:
-                        reasoning_parts.append(rc)
+                for entry in choices:
+                    if not isinstance(entry, dict):
+                        continue
+                    # non-streaming completion → `message`; streaming → `delta`
+                    for key in ("delta", "message"):
+                        c, rc = cls._take_text(entry.get(key),
+                                               ("content", "reasoning"))
+                        if rc:
+                            reasoning_parts.append(rc)
+                        if c:
+                            content_parts.append(c)
+                    # some gateways put text straight on the choice
+                    if not entry.get("delta") and not entry.get("message"):
+                        c, rc = cls._take_text(entry, ("content", "reasoning"))
+                        if rc:
+                            reasoning_parts.append(rc)
+                        if c:
+                            content_parts.append(c)
+                continue
 
-                    c = delta.get("content")
-                    if isinstance(c, str) and c:
-                        content_parts.append(c)
-                elif isinstance(first.get("message"), dict):
-                    msg = first["message"]
-                    c = msg.get("content")
-                    if isinstance(c, str) and c:
-                        content_parts.append(c)
-                    rc = msg.get("reasoning_content") or msg.get("reasoning")
-                    if isinstance(rc, str) and rc:
-                        reasoning_parts.append(rc)
-            elif isinstance(packet.get("delta"), dict):
-                # Chunk-level delta arriving at the top of the packet rather
-                # than inside choices[].
-                d = packet["delta"]
-                rc = d.get("reasoning_content")
-                if rc is None:
-                    rc = d.get("reasoning")
-                if isinstance(rc, str) and rc:
+            # No `choices` wrapper at all — the packet itself is the payload.
+            c, rc = cls._take_text(packet, ("content", "reasoning"))
+            if rc:
+                reasoning_parts.append(rc)
+            if c:
+                content_parts.append(c)
+                continue
+
+            for key in ("delta", "message"):
+                c, rc = cls._take_text(packet.get(key),
+                                       ("content", "reasoning"))
+                if rc:
                     reasoning_parts.append(rc)
-                c = d.get("content")
-                if isinstance(c, str) and c:
+                if c:
                     content_parts.append(c)
-            elif ("content" in packet or "reasoning_content" in packet
-                  or "reasoning" in packet):
-                # The frame IS the delta (some upstreams stream the raw delta
-                # object with no `choices` wrapper at all).
-                d = packet
-                rc = d.get("reasoning_content")
-                if rc is None:
-                    rc = d.get("reasoning")
-                if isinstance(rc, str) and rc:
-                    reasoning_parts.append(rc)
-                c = d.get("content")
-                if isinstance(c, str) and c:
-                    content_parts.append(c)
-            elif isinstance(packet.get("message"), dict):
-                msg = packet["message"]
-                c = msg.get("content")
-                if isinstance(c, str) and c:
-                    content_parts.append(c)
-            elif isinstance(packet.get("text"), str) and packet["text"]:
-                content_parts.append(packet["text"])
-            elif isinstance(packet.get("output_text"), str) and packet["output_text"]:
-                content_parts.append(packet["output_text"])
-            elif "response" in packet and isinstance(packet["response"], str):
-                # Only use top-level "response" when "choices" is absent or empty
-                if packet["response"]:
-                    content_parts.append(packet["response"])
+                    break
+            else:
+                for key in ("text", "output_text") :
+                    val = packet.get(key)
+                    if isinstance(val, str) and val:
+                        content_parts.append(val)
+                        break
+                else:
+                    val = packet.get("response")
+                    if isinstance(val, str) and val:
+                        content_parts.append(val)
 
         content = "".join(content_parts)
         reasoning = "".join(reasoning_parts)
+
+        # ── LAST LINE OF DEFENCE ──────────────────────────────────────────
+        # The whole October-2026 outage was this: the upstream kept answering
+        # perfectly, the parser just did not recognise the new envelope, and
+        # ("", "") was reported as "the model returned empty content". Every
+        # model then looked dead and the entire chain burned for nothing.
+        # If a body clearly carries text but nothing was extracted, say so
+        # loudly — an unrecognised FORMAT must never masquerade as an empty
+        # MODEL. Whoever reads the log should know to fix the parser, not to
+        # go hunting for a slow model.
+        if not content.strip() and not reasoning.strip() and raw.strip():
+            smells_like_text = any(
+                tok in raw for tok in ('"content"', '"text"', '"message"',
+                                       '"choices"', '"response"', '"result"'))
+            if smells_like_text:
+                log.error(
+                    "UNRECOGNISED RESPONSE FORMAT — the body carries text but "
+                    "nothing was extracted (%d chars). This is a PARSER bug, "
+                    "not an empty model: fix _parse_sse(). Body: %r",
+                    len(raw), raw[:900],
+                )
 
         # Strip inline <think>...</think> blocks if any model embeds them in content
         if "<think>" in content:
@@ -581,6 +629,15 @@ class LLMChatClient:
         last_error: Exception | None = None
         last_reasoning: str = ""
 
+        # HARD DEADLINE on the whole chain.
+        # Seen in production: a sick upstream made one decide take 231 SECONDS
+        # (14 calls × a ~50s curl timeout each). The person just sat there.
+        # Once the budget is gone we stop trying and let the caller hand back
+        # its safe fallback — a late reply is worse than a fallback reply.
+        budget_s = float(
+            os.environ.get("IG_CHAIN_BUDGET_S", self.chain_budget_s) or 0) or None
+        deadline = (time.monotonic() + budget_s) if budget_s else None
+
         # Retries get more head-room, but bounded RELATIVE TO WHAT WAS ASKED.
         # A 900-token decision must not creep up to a 4096-token one just
         # because the chain kept failing — that only makes it slower.
@@ -589,6 +646,17 @@ class LLMChatClient:
 
         for idx, cand_short in enumerate(candidate_models):
             wire_model = resolve_wire_model(cand_short)
+
+            # Out of time — stop burning models and report honestly.
+            if deadline is not None and time.monotonic() >= deadline:
+                log.warning(
+                    "chain budget of %.0fs exhausted after %d model(s); "
+                    "stopping before %s", budget_s, idx, wire_model,
+                )
+                last_error = last_error or RuntimeError(
+                    f"chain budget of {budget_s:.0f}s exhausted")
+                break
+
             if idx > 0:
                 # Breathe before switching models — most upstream empties are
                 # rate limits and hammering the next model makes it worse.
@@ -596,13 +664,22 @@ class LLMChatClient:
                 # instead of leaving the person staring at a silent chat.
                 await asyncio.sleep(min(0.4 * idx, 1.0))
             for attempt in range(retries_per_model):
+                # Don't start a request that cannot finish inside the budget.
+                if deadline is not None:
+                    left = deadline - time.monotonic()
+                    if left <= 0.5:
+                        break
                 try:
-                    content, reasoning, usage = await self._request_once(
-                        messages=messages,
-                        wire_model=wire_model,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        low_think=low_think,
+                    content, reasoning, usage = await asyncio.wait_for(
+                        self._request_once(
+                            messages=messages,
+                            wire_model=wire_model,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            low_think=low_think,
+                        ),
+                        timeout=(min(self.timeout, deadline - time.monotonic())
+                                 if deadline is not None else self.timeout),
                     )
                     if reasoning:
                         last_reasoning = reasoning
