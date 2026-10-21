@@ -84,7 +84,7 @@ def main() -> None:
     copied = try_copy_clipboard(os.path.join(repo_dir, "ig-agent-chat.js"))
 
     print("=" * 70)
-    print("  IG-Agent v5 — Ready & Active")
+    print("  IG-Agent v9 SOCIAL BRAIN — Ready & Active")
     print("  Default targets (auto-started live): adarshu.io, deeps20_")
     print("=" * 70)
     if copied:
@@ -96,6 +96,12 @@ def main() -> None:
     print('    IGAgent.addTargets("user1, user2, user3")  <- add a group at once')
     print('    IGAgent.targets("user1, user2, user3")     <- set target group at once')
     print("    IGAgent.allTargets()                       <- reply to everyone in DMs")
+    print("\n  v9 social brain (off until you ask for it):")
+    print("    IGAgent.Social.enable()                    <- turn it on (dry-run first)")
+    print("    IGAgent.Social.watch('deeps20_', 'adarshu.io')")
+    print("    IGAgent.Social.plan()                      <- what would the brain do?")
+    print("    IGAgent.Social.dryRun(false)               <- only when you trust it")
+    print("    IGAgent.note('chai, code aur thodi si shanti')  <- put a NOTE up")
     print("=" * 70)
 
     while True:
